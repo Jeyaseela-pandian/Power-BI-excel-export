@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NeenOpal Export for Power BI</title>
+
+  <!-- Microsoft sign-in (MSAL) -->
+  <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.28.1/lib/msal-browser.min.js"></script>
+  <!-- Power BI JavaScript SDK -->
+  <script src="https://cdn.jsdelivr.net/npm/powerbi-client@2.25.0/dist/powerbi.min.js"></script>
+  <!-- Excel file generation (same library as the Tableau product) -->
+  <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
+
+  <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+  <!-- ── Top bar ─────────────────────────────────────────────────────── -->
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="2" y="2" width="20" height="20" rx="5" fill="currentColor" />
+        <path d="M8 7l4 5-4 5M13 17h4" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+      </svg>
+      <span class="brand-name" id="productName">NeenOpal Export</span>
+    </div>
+    <div class="topbar-right" id="userArea" hidden>
+      <span class="badge" id="editionBadge"></span>
+      <button class="icon-btn" id="openSettings" title="Branding & settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" /></svg>
+      </button>
+      <div class="user">
+        <span class="avatar" id="avatar"></span>
+        <span class="user-name" id="userName"></span>
+      </div>
+      <button class="btn btn-ghost btn-sm" id="signOut">Sign out</button>
+    </div>
+  </header>
+
+  <!-- ── Signed-out landing ──────────────────────────────────────────── -->
+  <main class="landing" id="landing">
+    <section class="hero">
+      <p class="eyebrow">For Power BI</p>
+      <h1>Export a full report page to Excel in one click</h1>
+      <p class="lead">Every chart, table, KPI and active filter, laid out like your report, formatted and ready to filter, sort and share.</p>
+      <button class="btn btn-primary btn-lg" id="signIn">
+        <svg viewBox="0 0 21 21" aria-hidden="true" class="ms-logo"><rect x="1" y="1" width="9" height="9" fill="#f25022" /><rect x="11" y="1" width="9" height="9" fill="#7fba00" /><rect x="1" y="11" width="9" height="9" fill="#00a4ef" /><rect x="11" y="11" width="9" height="9" fill="#ffb900" /></svg>
+        Sign in with Microsoft
+      </button>
+      <p class="privacy">Read-only access. Your report data goes straight from Power BI to your browser and never reaches our servers.</p>
+      <p class="startup-message" id="startupMessage" hidden></p>
+    </section>
+    <section class="features">
+      <article class="feature">
+        <h3>Whole page, one file</h3>
+        <p>Export the current page or every page of a report. Each page becomes a sheet laid out like the report.</p>
+      </article>
+      <article class="feature">
+        <h3>Real Excel tables</h3>
+        <p>Numbers stay numbers, with formats. Every visual is an Excel table with its own filter and sort buttons.</p>
+      </article>
+      <article class="feature">
+        <h3>Filters on record</h3>
+        <p>Slicer selections and report filters are written at the top of each sheet, so everyone knows what the numbers show.</p>
+      </article>
+    </section>
+  </main>
+
+  <!-- ── Signed-in app ───────────────────────────────────────────────── -->
+  <div class="app-shell" id="appShell" hidden>
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-section">
+        <label class="field-label" for="workspaceSelect">Workspace</label>
+        <select id="workspaceSelect"></select>
+      </div>
+      <div class="sidebar-section">
+        <label class="field-label" for="reportSearch">Reports</label>
+        <input id="reportSearch" type="search" placeholder="Search reports" autocomplete="off">
+      </div>
+      <ul class="report-list" id="reportList" aria-label="Reports"></ul>
+      <form class="sidebar-section link-form" id="linkForm">
+        <label class="field-label" for="reportLink">Open from link</label>
+        <div class="input-row">
+          <input id="reportLink" type="url" placeholder="Paste a Power BI report link">
+          <button class="btn btn-secondary btn-sm" type="submit">Open</button>
+        </div>
+      </form>
+    </aside>
+
+    <section class="main">
+      <div class="actionbar">
+        <button class="icon-btn" id="toggleSidebar" title="Show or hide the report list" aria-label="Toggle report list">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
+        </button>
+        <div class="report-meta">
+          <div class="report-title" id="reportTitle">No report open</div>
+          <div class="page-title" id="pageTitle"></div>
+        </div>
+        <div class="split-btn">
+          <button class="btn btn-primary" id="exportBtn" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0-4-4m4 4 4-4M5 19h14" /></svg>
+            Export to Excel
+          </button>
+          <button class="btn btn-primary caret" id="exportOptionsBtn" disabled title="Export options" aria-label="Export options">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+          </button>
+        </div>
+      </div>
+      <div class="report-host">
+        <div class="empty-state" id="emptyState">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h18v18H3zM3 9h18M9 21V9" /></svg>
+          <h2>Choose a report</h2>
+          <p>Pick a report from the list, or paste a Power BI report link, then click <strong>Export to Excel</strong>.</p>
+        </div>
+        <div class="report-frame" id="report"></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ── Export options drawer ───────────────────────────────────────── -->
+  <div class="scrim" id="scrim" hidden></div>
+  <aside class="drawer" id="optionsDrawer" aria-label="Export options" hidden>
+    <div class="drawer-head">
+      <h2>Export options</h2>
+      <button class="icon-btn" data-close-drawer aria-label="Close"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg></button>
+    </div>
+    <div class="drawer-body">
+      <fieldset>
+        <legend>Pages</legend>
+        <label class="choice"><input type="radio" name="optPages" value="current"> <span>Current page</span></label>
+        <label class="choice"><input type="radio" name="optPages" value="all"> <span>All visible pages</span></label>
+        <label class="choice"><input type="radio" name="optPages" value="choose"> <span>Choose pages</span></label>
+        <div class="checklist" id="pageChecklist" hidden></div>
+      </fieldset>
+
+      <fieldset id="visualsFieldset">
+        <legend>Visuals on this page</legend>
+        <div class="checklist-actions">
+          <button type="button" class="link" id="visualsAll">Select all</button>
+          <button type="button" class="link" id="visualsNone">Clear</button>
+        </div>
+        <div class="checklist" id="visualChecklist"></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Layout</legend>
+        <label class="choice"><input type="radio" name="optLayout" value="report">
+          <span>Like the report<small>Visuals keep their positions: left, right, above, below.</small></span></label>
+        <label class="choice"><input type="radio" name="optLayout" value="stacked">
+          <span>Stacked<small>One visual under another. Best when you will filter the tables.</small></span></label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Long tables</legend>
+        <label class="choice"><input type="checkbox" id="optCollapse">
+          <span>Collapse extra rows behind [+]</span></label>
+        <label class="inline-field">Rows always visible
+          <input type="number" id="optVisibleRows" min="1" max="1000" step="1"></label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Include</legend>
+        <label class="choice"><input type="checkbox" id="optFilters"> <span>Active filters and slicer selections</span></label>
+        <label class="choice"><input type="checkbox" id="optNotes"> <span>Export notes (skipped or failed visuals)</span></label>
+      </fieldset>
+
+      <p class="muted">Logo, colours and footer are set in <button type="button" class="link" id="drawerOpenSettings">branding settings</button>.</p>
+    </div>
+    <div class="drawer-foot">
+      <button class="btn btn-ghost" data-close-drawer>Close</button>
+      <button class="btn btn-primary" id="drawerExport">Export</button>
+    </div>
+  </aside>
+
+  <!-- ── Branding settings ───────────────────────────────────────────── -->
+  <dialog class="dialog" id="settingsDialog">
+    <form method="dialog" id="settingsForm">
+      <h2>Branding</h2>
+      <p class="muted">Applied to every Excel file you export from this browser.</p>
+      <label class="field">Company name
+        <input id="brandCompany" placeholder="e.g. Contoso Ltd"></label>
+      <div class="field">Logo <span class="muted">(PNG or JPG, up to 500 KB)</span>
+        <div class="logo-row">
+          <img id="brandLogoPreview" alt="Logo preview" hidden>
+          <input type="file" id="brandLogo" accept="image/png,image/jpeg">
+          <button type="button" class="link" id="brandLogoRemove" hidden>Remove</button>
+        </div>
+      </div>
+      <div class="field-row">
+        <label class="field">Accent colour
+          <input type="color" id="brandAccent"></label>
+        <label class="field">Table style
+          <select id="brandTableStyle">
+            <option value="TableStyleMedium2">Blue</option>
+            <option value="TableStyleMedium7">Green</option>
+            <option value="TableStyleMedium3">Orange</option>
+            <option value="TableStyleMedium4">Gray</option>
+            <option value="TableStyleLight9">Light blue</option>
+          </select></label>
+      </div>
+      <label class="field">Footer text
+        <input id="brandFooter" placeholder="e.g. Confidential – internal use only"></label>
+      <p class="muted" id="footerEditionNote"></p>
+      <div class="dialog-actions">
+        <button type="button" class="link" id="openDiagnostics">Diagnostics</button>
+        <span class="spacer"></span>
+        <button class="btn btn-ghost" value="cancel" formnovalidate>Cancel</button>
+        <button class="btn btn-primary" value="save" id="settingsSave">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- ── Export progress ─────────────────────────────────────────────── -->
+  <dialog class="dialog dialog-sm" id="progressDialog">
+    <h2>Exporting to Excel</h2>
+    <p class="progress-label" id="progressLabel">Preparing…</p>
+    <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
+    <p class="muted" id="progressDetail"></p>
+    <div class="dialog-actions">
+      <span class="spacer"></span>
+      <button class="btn btn-ghost" id="progressCancel">Cancel</button>
+    </div>
+  </dialog>
+
+  <!-- ── Diagnostics (support) ───────────────────────────────────────── -->
+  <dialog class="dialog dialog-lg" id="diagDialog">
+    <h2>Diagnostics</h2>
+    <p class="muted">Checks every visual on the current page: export, position, visibility and slicer state. Share the result with support if an export looks wrong.</p>
+    <div class="dialog-actions">
+      <button class="btn btn-secondary" id="diagRun">Run checks on current page</button>
+      <span class="diag-summary" id="diagSummary"></span>
+      <span class="spacer"></span>
+      <button class="btn btn-ghost" id="diagClose">Close</button>
+    </div>
+    <div class="table-wrap">
+      <table class="diag-table" id="diagResults" hidden>
+        <thead>
+          <tr><th>#</th><th>Visual</th><th>Type</th><th>Position (x, y, w, h)</th><th>Visible</th><th>Export</th><th>Detail</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <details class="activity">
+      <summary>Activity log</summary>
+      <pre id="log"></pre>
+    </details>
+  </dialog>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+  <script src="export.js"></script>
+  <script src="ui.js"></script>
+</body>
+
+</html>
