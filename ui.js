@@ -90,9 +90,6 @@ function showSignedIn(account) {
   const name = account.name || account.username || "";
   $("avatar").textContent = name.split(/[\s@.]+/).filter(Boolean).slice(0, 2).map((p) => p[0].toUpperCase()).join("");
   $("avatar").title = name;
-  const badge = $("editionBadge");
-  badge.textContent = cfg.edition === "pro" ? "Pro" : "Trial";
-  badge.classList.toggle("pro", cfg.edition === "pro");
 }
 
 /* ── Export options drawer ────────────────────────────────────────────── */
@@ -206,9 +203,6 @@ function openSettings() {
   $("brandLogo").value = "";
   pendingLogo = { logo: branding.logo, logoWidth: branding.logoWidth, logoHeight: branding.logoHeight };
   showLogoPreview();
-  $("footerEditionNote").textContent = cfg.edition === "pro"
-    ? "Pro edition: only your footer text is added."
-    : `Trial edition: every sheet also ends with "${TRIAL_FOOTER}". The Pro edition removes it.`;
   $("settingsDialog").showModal();
 }
 

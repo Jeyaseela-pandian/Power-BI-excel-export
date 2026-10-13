@@ -26,7 +26,7 @@ const KPI_TYPES = ["card", "multiRowCard", "kpi", "cardVisual", "gauge"];
 const PX_PER_COL = 110;        // Power BI page pixels per Excel column (for x alignment)
 const PX_TOLERANCE = 10;       // overlap smaller than this does not count as overlapping
 const PAGE_RENDER_TIMEOUT_MS = 20000;
-const TRIAL_FOOTER = "Created with NeenOpal Export for Power BI";
+
 
 const COLORS = {
   kpiLabel: "FFF5F5F5",
@@ -34,6 +34,13 @@ const COLORS = {
 };
 const THIN = { style: "thin", color: { argb: "FFD0D0D0" } };
 const BORDER = { top: THIN, left: THIN, bottom: THIN, right: THIN };
+const TABLE_STYLE_COLORS = {
+  TableStyleMedium2: { header: "FF4472C4", stripe: "FFD9E1F2" },  // Blue
+  TableStyleMedium7: { header: "FF70AD47", stripe: "FFE2EFDA" },  // Green
+  TableStyleMedium3: { header: "FFED7D31", stripe: "FFFCE4D6" },  // Orange
+  TableStyleMedium4: { header: "FFA5A5A5", stripe: "FFEDEDED" },  // Gray
+  TableStyleLight9:  { header: "FF4472C4", stripe: "FFDDEBF7" },  // Light blue
+};
 
 /* "#1a73e8" → "FF1A73E8" */
 function toArgb(hex) {
@@ -184,18 +191,20 @@ function blockSize(item, options) {
 /* KPI / card: title, then one label / value pair per field. */
 function writeKpiBlock(ws, row, col, item, widths, style) {
   const [header, values = []] = item.rows;
+  const colors = TABLE_STYLE_COLORS[style.tableStyle] || TABLE_STYLE_COLORS.TableStyleMedium2;
   styleTitle(ws.getCell(row, col), item.title, style.accent);
   header.forEach((label, i) => {
     const l = ws.getCell(row + 1 + i, col);
     l.value = label;
-    l.font = { bold: true };
-    l.fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLORS.kpiLabel } };
+    l.font = { bold: true, color: { argb: "FFFFFFFF" } };
+    l.fill = { type: "pattern", pattern: "solid", fgColor: { argb: colors.header } };
     l.border = BORDER;
     const v = ws.getCell(row + 1 + i, col + 1);
     const { value, numFmt } = toCellValue(values[i]);
     v.value = value;
     if (numFmt) v.numFmt = numFmt;
     v.font = { bold: true, size: 12 };
+    v.fill = { type: "pattern", pattern: "solid", fgColor: { argb: colors.stripe } };
     v.alignment = { horizontal: "right" };
     v.border = BORDER;
     widths.note(col, label);
@@ -275,22 +284,54 @@ function collapsibleRange(p, threshold) {
   return [p.r + 2 + threshold, end];
 }
 
+/* Rows of a planned block that must always stay visible: title, header and the first
+   rows of a table, or the whole block for cards and short tables */
+function topRange(p, threshold) {
+  if (p.item.isKpi) return [p.r, p.r + p.size.height - 1];
+  const n = p.item.rows.length - 1;
+  return [p.r, p.r + 1 + Math.min(n, threshold)];
+}
+
+/* Moves a block, and everything below it in the same stack, down by `delta` rows */
+function shiftStack(plan, p, delta) {
+  const from = p.r;
+  for (const q of plan) {
+    if (q.stackIndex === p.stackIndex && q.r >= from) {
+      q.r += delta;
+      if (q.noteRow) q.noteRow += delta;
+    }
+  }
+}
+
 /*
- * Excel hides whole rows. If a table's note row would fall inside a neighbour's
- * collapsible rows, it would stop that neighbour from collapsing and split it.
- * Move such note rows down to just below the neighbour's collapsible rows (so both
- * notes end up on the same row and share one [+] / [-] button), and move the
- * visuals below it in the same stack down by the same amount.
+ * Excel hides whole rows, so side-by-side blocks must not get in each other's way:
+ *  1. A table's collapsible rows must not sit next to a neighbour's visible rows,
+ *     otherwise those rows can't be hidden and the table shows too many rows.
+ *     The table is moved down so its collapsing starts after the neighbour's
+ *     visible rows (side-by-side tables end up starting on the same row).
+ *  2. A table's note row must not sit inside a neighbour's collapsible rows,
+ *     otherwise it splits the neighbour. The note moves down below them, so both
+ *     notes share one row and one [+] / [-] button.
  */
 function alignNoteRows(plan, threshold) {
-  for (let guard = 0; guard < 100; guard++) {
+  for (let guard = 0; guard < 200; guard++) {
     let moved = false;
     for (const p of plan) {
-      if (!p.noteRow) continue;
+      const myRange = collapsibleRange(p, threshold);
       for (const o of plan) {
-        if (o === p) continue;
+        if (o === p || o.stackIndex === p.stackIndex) continue;
+
+        // 1. My collapsible rows next to a neighbour's visible rows: move me down
+        const top = topRange(o, threshold);
+        if (myRange && myRange[0] <= top[1] && top[0] <= myRange[1]) {
+          shiftStack(plan, p, top[1] + 1 - myRange[0]);
+          moved = true;
+          break;
+        }
+
+        // 2. My note row inside a neighbour's collapsible rows: move my note down
         const range = collapsibleRange(o, threshold);
-        if (range && p.noteRow >= range[0] && p.noteRow <= range[1]) {
+        if (p.noteRow && range && p.noteRow >= range[0] && p.noteRow <= range[1]) {
           const delta = range[1] + 1 - p.noteRow;
           p.noteRow += delta;
           p.size.height += delta;
@@ -301,13 +342,14 @@ function alignNoteRows(plan, threshold) {
             }
           }
           moved = true;
+          break;
         }
       }
+      if (moved) break;
     }
     if (!moved) break;
   }
 }
-
 /*
  * Writes every visual starting at `startRow`. Returns the first free row below the
  * layout, the number of tables written and whether any rows were collapsed.
@@ -577,8 +619,8 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
     row++;
   }
 
-  // Footer: trial edition always carries the product line; custom text is optional
-  const footer = [branding.footer, cfg.edition === "pro" ? "" : TRIAL_FOOTER].filter(Boolean);
+  // Footer: only the user's own footer text from branding settings (optional)
+  const footer = [branding.footer].filter(Boolean);
   footer.forEach((text) => {
     const c = ws.getCell(row++, 1);
     c.value = text;
