@@ -10,13 +10,10 @@
   <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.28.1/lib/msal-browser.min.js"></script>
   <!-- Power BI JavaScript SDK -->
   <script src="https://cdn.jsdelivr.net/npm/powerbi-client@2.25.0/dist/powerbi.min.js"></script>
-  <!-- Report authoring extension: lets the export tell a matrix's row fields from its column fields -->
-  <script src="https://cdn.jsdelivr.net/npm/powerbi-report-authoring@3.0.0/dist/powerbi-report-authoring.min.js"></script>
   <!-- Excel file generation (same library as the Tableau product) -->
   <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
 
-  <!-- ?v= forces browsers to fetch fresh copies: change it whenever app files change -->
-  <link rel="stylesheet" href="styles.css?v=2026-10-13">
+  <link rel="stylesheet" href="styles.css">
 </head>
 
 <body>
@@ -163,22 +160,6 @@
       </fieldset>
 
       <fieldset>
-        <legend>Data</legend>
-        <label class="choice"><input type="checkbox" id="optTotals">
-          <span>Totals row under each table<small>Sums, or averages for rates and percentages. Follows Excel filters.</small></span></label>
-        <label class="choice"><input type="checkbox" id="optCrossTab">
-          <span>Matrices as rows × columns<small>Rebuilds a matrix's grid instead of one long list.</small></span></label>
-        <label class="choice"><input type="checkbox" id="optHideEmpty">
-          <span>Leave out rows with no values<small>For example months outside a date slicer.</small></span></label>
-        <label class="inline-field inline-field-flush">Highlight numbers
-          <select id="optConditional">
-            <option value="none">No highlighting</option>
-            <option value="colorScale">Colour scale</option>
-            <option value="dataBar">Data bars</option>
-          </select></label>
-      </fieldset>
-
-      <fieldset>
         <legend>Include</legend>
         <label class="choice"><input type="checkbox" id="optFilters"> <span>Active filters and slicer selections</span></label>
         <label class="choice"><input type="checkbox" id="optNotes"> <span>Export notes (skipped or failed visuals)</span></label>
@@ -267,10 +248,10 @@
 
   <div class="toasts" id="toasts" aria-live="polite"></div>
 
-  <script src="config.js?v=2026-10-13"></script>
-  <script src="app.js?v=2026-10-13"></script>
-  <script src="export.js?v=2026-10-13"></script>
-  <script src="ui.js?v=2026-10-13"></script>
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+  <script src="export.js"></script>
+  <script src="ui.js"></script>
 </body>
 
 </html>

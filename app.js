@@ -32,10 +32,6 @@ let currentReport = null;
 let currentReportName = "Report";
 let reports = [];
 
-// The embedded report keeps the token it was given; tokens last about an hour
-const TOKEN_REFRESH_MS = 10 * 60 * 1000;
-let tokenTimer = null;
-
 const $ = (id) => document.getElementById(id);
 
 /* Activity log – shown in the Diagnostics dialog for support */
@@ -78,20 +74,6 @@ async function getToken() {
       await msalApp.acquireTokenRedirect({ scopes: PBI_SCOPES, account });
     }
     throw e;
-  }
-}
-
-/*
- * Gives the embedded report a current token. MSAL renews the token silently when it is
- * within 5 minutes of expiry, so calling this every few minutes (and before each
- * export) keeps long sessions working without a page reload.
- */
-async function refreshEmbedToken() {
-  if (!embeddedReport) return;
-  try {
-    await embeddedReport.setAccessToken(await getToken());
-  } catch (e) {
-    log("Token refresh failed: " + errorText(e));
   }
 }
 
@@ -192,116 +174,21 @@ async function openReportById(groupId, reportId, pageName) {
 
 /*
  * Deep link (used by the "Export to Excel" button inside a Power BI report):
- *   http://localhost:5500/?groupId=<workspaceId>&reportId=<reportId>&pageName=<pageName>&filter=<filters>
- * (omit groupId for My workspace; filter is optional, see parseUrlFilters)
+ *   http://localhost:5500/?groupId=<workspaceId>&reportId=<reportId>&pageName=<pageName>
+ * (omit groupId for My workspace)
  */
 async function openFromUrl() {
   const params = new URLSearchParams(window.location.search);
   const reportId = params.get("reportId");
   if (!reportId) return;
   log(`Opening from link: report ${reportId}, page ${params.get("pageName") || "(default)"}`);
-
-  let filters = [];
-  const filterText = params.get("filter");
-  if (filterText) {
-    try {
-      filters = parseUrlFilters(filterText);
-      log(`Filters from link: ${describeFilters(filters)}`);
-    } catch (e) {
-      toast("Some filters in the link were ignored", errorText(e), "error");
-    }
-  }
-  const report = await pbiGet(params.get("groupId") ? `/groups/${params.get("groupId")}/reports/${reportId}` : `/reports/${reportId}`);
-  await openReport(report, params.get("pageName"), filters);
-  if (filters.length) toast("Opened with the filters from your report", describeFilters(filters), "info");
-}
-
-/* ── Filters passed in a link ─────────────────────────────────────────── */
-/*
- * Same syntax as Power BI's own URL filters, so a report button can build the link
- * with a DAX measure from the user's current selections:
- *   Table/Column eq 'Value'             Table/Column in ('A', 'B')
- *   Table/Column ge 100                 Table/Date ge datetime'2024-06-01T00:00:00'
- *   clauses joined with " and "         spaces in names may be written as _x0020_
- * eq / in become basic filters; ne, gt, ge, lt, le become advanced filters (up to two
- * conditions per column). Throws with a readable message when a clause can't be read.
- */
-const URL_FILTER_OPERATORS = { eq: "Is", ne: "IsNot", gt: "GreaterThan", ge: "GreaterThanOrEqual", lt: "LessThan", le: "LessThanOrEqual" };
-
-function decodeFieldName(s) {
-  return s.replace(/_x([0-9a-f]{4})_/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-}
-
-/* Splits `text` on `separator` (a regex matching at a position), ignoring quoted text and parentheses */
-function splitOutside(text, separator) {
-  const parts = [];
-  let depth = 0, quoted = false, start = 0;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (c === "'") quoted = !quoted;
-    else if (!quoted && c === "(") depth++;
-    else if (!quoted && c === ")") depth--;
-    else if (!quoted && depth === 0) {
-      const m = text.slice(i).match(separator);
-      if (m) {
-        parts.push(text.slice(start, i));
-        i += m[0].length - 1;
-        start = i + 1;
-      }
-    }
-  }
-  parts.push(text.slice(start));
-  return parts.map((p) => p.trim()).filter(Boolean);
-}
-
-function parseFilterValue(raw) {
-  const s = raw.trim();
-  let m;
-  if ((m = s.match(/^datetime'([^']+)'$/i))) return new Date(m[1]).toISOString();
-  if ((m = s.match(/^'((?:[^']|'')*)'$/))) return m[1].replace(/''/g, "'");
-  if (/^-?\d+(\.\d+)?$/.test(s)) return Number(s);
-  if (/^(true|false)$/i.test(s)) return s.toLowerCase() === "true";
-  throw new Error(`Can't read the value ${s} – put text in single quotes, e.g. 'East'`);
-}
-
-function parseUrlFilters(text) {
-  const basic = new Map(), advanced = new Map();
-  for (const clause of splitOutside(text, /^\s+and\s+/i)) {
-    const m = clause.match(/^([^/\s]+)\/(\S+)\s+(eq|ne|gt|ge|lt|le|in)\s+(.+)$/i);
-    if (!m) throw new Error(`Can't read the filter "${clause}" – expected e.g. Sales/Region eq 'East'`);
-    const target = { table: decodeFieldName(m[1]), column: decodeFieldName(m[2]) };
-    const key = `${target.table}/${target.column}`;
-    const op = m[3].toLowerCase();
-
-    if (op === "in" || op === "eq") {
-      const list = op === "in" ? splitOutside(m[4].trim().replace(/^\(|\)$/g, ""), /^,/) : [m[4]];
-      const entry = basic.get(key) || { target, values: [] };
-      entry.values.push(...list.map(parseFilterValue));
-      basic.set(key, entry);
-    } else {
-      const entry = advanced.get(key) || { target, conditions: [] };
-      entry.conditions.push({ operator: URL_FILTER_OPERATORS[op], value: parseFilterValue(m[4]) });
-      if (entry.conditions.length > 2) throw new Error(`Power BI allows at most two conditions on ${key}`);
-      advanced.set(key, entry);
-    }
-  }
-  return [
-    ...[...basic.values()].map(({ target, values }) => ({
-      $schema: "http://powerbi.com/product/schema#basic",
-      target, operator: "In", values, filterType: models.FilterType.Basic,
-    })),
-    ...[...advanced.values()].map(({ target, conditions }) => ({
-      $schema: "http://powerbi.com/product/schema#advanced",
-      target, logicalOperator: "And", conditions, filterType: models.FilterType.Advanced,
-    })),
-  ];
+  await openReportById(params.get("groupId"), reportId, params.get("pageName"));
 }
 
 /* ── Embedding ─────────────────────────────────────────────────────────── */
-async function openReport(report, pageName, filters) {
+async function openReport(report, pageName) {
   const container = $("report");
   powerbi.reset(container);
-  clearInterval(tokenTimer);
   currentReport = report;
   currentReportName = report.name;
   setExportEnabled(false);
@@ -319,10 +206,8 @@ async function openReport(report, pageName, filters) {
     settings: { panes: { filters: { visible: true } } },
   };
   if (pageName) config.pageName = pageName;
-  if (filters && filters.length) config.filters = filters;
 
   embeddedReport = powerbi.embed(container, config);
-  tokenTimer = setInterval(refreshEmbedToken, TOKEN_REFRESH_MS);
   embeddedReport.on("loaded", async () => {
     log(`Report "${report.name}" loaded`);
     setExportEnabled(true);
@@ -333,18 +218,9 @@ async function openReport(report, pageName, filters) {
   });
   embeddedReport.on("error", (e) => {
     log("Embed error: " + errorText(e.detail));
-    if (/token/i.test(errorText(e.detail))) {
-      refreshEmbedToken();
-      return;
-    }
     toast("Power BI reported a problem", friendlyError(e.detail), "error");
   });
 }
-
-// A laptop waking from sleep may have missed several timer ticks
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") refreshEmbedToken();
-});
 
 async function showActivePage() {
   try {
@@ -389,32 +265,12 @@ function describeConditions(f) {
     .join(f.logicalOperator === "Or" ? " or " : " and ");
 }
 
-/* "CalendarMonths" → "calendar months" */
-function splitWords(name) {
-  return String(name).replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
-}
-
-/* Top N and relative date / time filters, common as visual-level filters */
-function describeSpecialFilter(f) {
-  if ((f.operator === "Top" || f.operator === "Bottom") && f.itemCount !== undefined) {
-    const by = f.orderBy ? (f.orderBy.measure || f.orderBy.column || "") : "";
-    return `${f.operator} ${f.itemCount}${by ? " by " + by : ""}`;
-  }
-  if (f.timeUnitType !== undefined && f.timeUnitsCount !== undefined) {
-    const when = ["In the last", "In this", "In the next"][f.operator] || "In";
-    const unit = models.RelativeDateFilterTimeUnit ? models.RelativeDateFilterTimeUnit[f.timeUnitType] : null;
-    const units = unit ? splitWords(unit) : "periods";
-    return `${when}${f.operator === 1 ? "" : " " + f.timeUnitsCount} ${f.operator === 1 ? units.replace(/s$/, "") : units}`;
-  }
-  return null;
-}
-
 function describeFilters(filters) {
   if (!filters || filters.length === 0) return "none";
   return filters.map((f) => {
     const field = f.target ? (f.target.column || f.target.measure || f.target.hierarchyLevel || "?") : "?";
     const values = f.values ? f.values.map(formatFilterValue).join(", ")
-      : f.conditions ? describeConditions(f) : describeSpecialFilter(f) || "";
+      : f.conditions ? describeConditions(f) : "";
     return `${field}${values ? ": " + values : ""}`;
   }).join(" | ");
 }
