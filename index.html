@@ -10,8 +10,10 @@
   <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.28.1/lib/msal-browser.min.js"></script>
   <!-- Power BI JavaScript SDK -->
   <script src="https://cdn.jsdelivr.net/npm/powerbi-client@2.25.0/dist/powerbi.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/powerbi-report-authoring@3.0.0/dist/powerbi-report-authoring.min.js"></script>
   <!-- Excel file generation (same library as the Tableau product) -->
   <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
+   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -197,6 +199,7 @@
             <option value="TableStyleMedium3">Orange</option>
             <option value="TableStyleMedium4">Gray</option>
             <option value="TableStyleLight9">Light blue</option>
+            <option value="report">Same colours as the report</option>
           </select></label>
       </div>
       <label class="field">Footer text
@@ -250,6 +253,7 @@
 
   <script src="config.js"></script>
   <script src="app.js"></script>
+  <script src="colors.js"></script>
   <script src="export.js"></script>
   <script src="ui.js"></script>
 </body>

@@ -191,7 +191,7 @@ function blockSize(item, options) {
 /* KPI / card: title, then one label / value pair per field. */
 function writeKpiBlock(ws, row, col, item, widths, style) {
   const [header, values = []] = item.rows;
-  const colors = TABLE_STYLE_COLORS[style.tableStyle] || TABLE_STYLE_COLORS.TableStyleMedium2;
+   const colors = style.kpiColors || TABLE_STYLE_COLORS[style.tableStyle] || TABLE_STYLE_COLORS.TableStyleMedium2;
   styleTitle(ws.getCell(row, col), item.title, style.accent);
   header.forEach((label, i) => {
     const l = ws.getCell(row + 1 + i, col);
@@ -232,7 +232,8 @@ function writeDataTable(ws, row, col, item, tableName, widths, style) {
   data.forEach((r, ri) => r.forEach((c, ci) => {
     if (c.numFmt) ws.getCell(row + 2 + ri, col + ci).numFmt = c.numFmt;
   }));
-
+  
+  if (style.reportColors) applyReportColors(ws, row, col, item, header, style.reportColors);
   header.forEach((h, ci) => widths.note(col + ci, h));
   item.rows.slice(1).forEach((r) => r.forEach((v, ci) => widths.note(col + ci, v)));
 }
@@ -547,7 +548,7 @@ async function collectPage(page, options, onProgress, isCancelled) {
         }
         continue;
       }
-      items.push({ title, type: v.type, layout: v.layout, rows, isKpi });
+      items.push({ title, name: v.name, type: v.type, layout: v.layout, rows, isKpi });
       log(`Exported "${title}" (${rows.length - 1} rows)`);
     } catch (e) {
       if (NON_DATA_TYPES.includes(v.type)) continue;
@@ -562,7 +563,15 @@ async function collectPage(page, options, onProgress, isCancelled) {
 function writePageSheet(wb, sheetName, page, data, options, branding, logo, nameTable) {
   const ws = wb.addWorksheet(sheetName, { views: [{ showGridLines: false }] });
   const widths = makeWidthTracker();
-  const style = { accent: toArgb(branding.accent), tableStyle: branding.tableStyle || "TableStyleMedium2" };
+   // "Same colours as the report": neutral Excel table style, report colours painted on top
+  const reportColors = branding.tableStyle === "report" ? data.reportColors : null;
+  const style = {
+    accent: toArgb(branding.accent),
+    tableStyle: reportColors ? "TableStyleLight1"
+      : (branding.tableStyle && branding.tableStyle !== "report" ? branding.tableStyle : "TableStyleMedium2"),
+    reportColors,
+    kpiColors: reportColors ? reportColors.kpi : null,
+  };
   let row = 1;
 
   // Logo across the first rows, then the text header below it
@@ -656,7 +665,20 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
       await activatePage(original).catch(() => {});
     }
   }
-
+  
+  // Report colours (Branding → Table style → "Same colours as the report")
+  let reportColors = null;
+  if (branding.tableStyle === "report") {
+    try {
+      reportColors = await loadReportColors(currentReport);
+    } catch (e) {
+      const message = reportColorsMessage(e);
+      log(`${message} (${errorText(e)})`);
+      if (collected[0]) collected[0].data.notes.unshift(message);
+    }
+  }
+  collected.forEach(({ data }) => { data.reportColors = reportColors; });
+  
   const wb = new ExcelJS.Workbook();
   wb.creator = cfg.productName || "NeenOpal Export for Power BI";
   let logo = null;

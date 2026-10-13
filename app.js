@@ -10,6 +10,7 @@
 const PBI_SCOPES = [
   "https://analysis.windows.net/powerbi/api/Report.Read.All",
   "https://analysis.windows.net/powerbi/api/Workspace.Read.All",
+  "https://analysis.windows.net/powerbi/api/Dataset.Read.All",
 ];
 const PBI_API = "https://api.powerbi.com/v1.0/myorg";
 const models = window["powerbi-client"].models;
