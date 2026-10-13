@@ -18,6 +18,10 @@ const DEFAULT_OPTIONS = {
   visibleRows: 8,
   includeFilters: true,
   includeNotes: true,
+  totalsRow: true,
+  crossTab: true,
+  hideEmptyRows: false,
+  conditionalFormat: "none", // "none" | "colorScale" | "dataBar"
 };
 const DEFAULT_BRANDING = {
   companyName: "",
@@ -108,6 +112,10 @@ async function openOptionsDrawer() {
   $("optVisibleRows").disabled = !exportOptions.collapse;
   $("optFilters").checked = exportOptions.includeFilters;
   $("optNotes").checked = exportOptions.includeNotes;
+  $("optTotals").checked = exportOptions.totalsRow;
+  $("optCrossTab").checked = exportOptions.crossTab;
+  $("optHideEmpty").checked = exportOptions.hideEmptyRows;
+  $("optConditional").value = exportOptions.conditionalFormat;
 
   await renderPageChecklist();
   await renderVisualChecklist();
@@ -188,6 +196,10 @@ function readDrawerOptions() {
     visibleRows: visibleRows > 0 ? Math.min(visibleRows, 1000) : DEFAULT_OPTIONS.visibleRows,
     includeFilters: $("optFilters").checked,
     includeNotes: $("optNotes").checked,
+    totalsRow: $("optTotals").checked,
+    crossTab: $("optCrossTab").checked,
+    hideEmptyRows: $("optHideEmpty").checked,
+    conditionalFormat: $("optConditional").value,
   };
   saveJson(OPTIONS_KEY, exportOptions);
 }
