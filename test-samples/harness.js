@@ -5,7 +5,10 @@
  *   const run = await __run([0], {}, {});      // pages by index, branding, options
  *   await __check(run);                        // structural assertions
  *   __render(run.wb.worksheets[0]);            // draws the sheet into the page
- * Fixtures are shaped like the test report in test-samples/README.md.
+ *   __colors(run.wb.worksheets[0]);            // each table's header / cell / gutter colours
+ * Fixtures are shaped like the test report in test-samples/README.md. The report file
+ * for exact colours is stubbed: opts.__design = "pbix" (test sample.pbix, PBIR format),
+ * "legacy" (a generated classic-format file), "noaccess", or omitted (no permission).
  */
 (() => {
   const months = Array.from({ length: 24 }, (_, i) => new Date(2024, i, 1).toLocaleString("en-US", { month: "short", year: "numeric" }));
@@ -32,8 +35,11 @@
     getSlicerState: async () => ({ filters: filters || [], targets: [{ column: "Segment" }] }),
   });
 
+  // Page changes fire "rendered" like Power BI does, so activatePage doesn't wait for its timeout
+  const rendered = new Set();
+  const setActive = async () => { setTimeout(() => [...rendered].forEach((fn) => fn()), 0); };
   const pages = () => [
-    { name: "p1", displayName: "Colour test", visibility: 0, getFilters: async () => [], setActive: async () => {},
+    { name: "p1", displayName: "Colour test", visibility: 0, getFilters: async () => [], setActive,
       getVisuals: async () => [
         mkV("s1", "Slicer", "slicer", 900, 0, 200, 80, "Region\nNorth", [{ target: { column: "Region" }, values: ["North"] }]),
         mkV("s2", "Slicer", "slicer", 1120, 0, 200, 80, "Date\nx", [{ target: { column: "Date" }, logicalOperator: "And", conditions: [{ operator: "GreaterThanOrEqual", value: "2024-05-31T18:30:00.000Z" }, { operator: "LessThan", value: "2025-08-31T18:30:00.000Z" }] }]),
@@ -49,25 +55,115 @@
         mkV("m1", "", "pivotTable", 620, 760, 400, 200, fx.matrix),
         mkV("x1", "Text box", "textbox", 0, 0, 100, 30, null),
       ] },
-    { name: "p2", displayName: "Long table", visibility: 0, getFilters: async () => [], setActive: async () => {},
+    { name: "p2", displayName: "Long table", visibility: 0, getFilters: async () => [], setActive,
       getVisuals: async () => [mkV("a1", "All rows", "tableEx", 0, 0, 800, 600, fx.long), mkV("a2", "Category totals", "tableEx", 820, 0, 400, 200, fx.tree)] },
-    { name: "p3", displayName: "O'Brien", visibility: 0, getFilters: async () => [], setActive: async () => {},
+    { name: "p3", displayName: "O'Brien", visibility: 0, getFilters: async () => [], setActive,
       getVisuals: async () => [mkV("o1", "Orders by category", "clusteredColumnChart", 0, 0, 600, 300, fx.tree)] },
+    // The "Colour test" page of test-samples/test sample.pbix: same visual names and positions,
+    // so the colours read from that PBIR file apply (pass { __design: "pbix" })
+    { name: "e25f46948c1a0a8e9564", displayName: "Colour test (pbix)", visibility: 0, getFilters: async () => [], setActive,
+      getVisuals: async () => [
+        mkV("ff7e126096feeb677190", "Card", "cardVisual", 0, 0, 216, 168, fx.card),
+        mkV("56a2092fd1f3fab4ebcf", "Sales and cost by month", "lineChart", 216, 0, 408, 456, fx.line),
+        mkV("915cd3320ac20ff8360c", "Sales by segment", "clusteredColumnChart", 624, 0, 696, 456, fx.seg),
+        mkV("a1e5436cc4b9b7d45203", "Sales by category (custom colour)", "clusteredBarChart", 1320, 0, 600, 456, fx.tree),
+        mkV("062e0c7ae2af004ddb40", "Deneb", "deneb7E15AEF80B9E4D4F8E12924291ECE89A", 0, 456, 1920, 624, fx.deneb),
+      ] },
+    // Classic-format report (pass { __design: "legacy" }): colours set per slice, per measure, per funnel bar
+    { name: "lg", displayName: "Legacy format", visibility: 0, getFilters: async () => [], setActive,
+      getVisuals: async () => [
+        mkV("lp1", "Sales by category pie", "pieChart", 0, 0, 400, 300, fx.tree),
+        mkV("ll1", "Sales and cost", "lineChart", 420, 0, 600, 300, fx.line),
+        mkV("lf1", "Funnel", "funnel", 0, 320, 400, 300, fx.tree),
+      ] },
   ];
+
+  // Layout edge case: a pie with row tabs snaps under a bar chart with none, so its tab
+  // column is the bar chart's (wide) first column – tabs must become swatches, not blocks
+  const extraPages = () => [
+    { name: "edge", displayName: "Layout edge", visibility: 0, getFilters: async () => [], setActive,
+      getVisuals: async () => [
+        mkV("e1", "Sales and cost", "lineChart", 0, 0, 560, 300, fx.line),
+        mkV("e2", "Sales by category bars", "clusteredBarChart", 600, 0, 500, 300, fx.tree),
+        mkV("e3", "Category summary", "tableEx", 0, 320, 560, 300, fx.table),
+        mkV("e4", "Sales by category pie", "pieChart", 600, 320, 500, 300, fx.tree),
+      ] },
+  ];
+
+  /* A classic-format design file: Report/Layout (UTF-16) and a base theme */
+  const legacyDesign = async () => {
+    const theme = { name: "CY24SU10", dataColors: ["#118DFF", "#12239E", "#E66C37", "#6B007B", "#E044A7", "#744EC2", "#D9B300", "#D64550"], background: "#FFFFFF", foreground: "#252423" };
+    const col = (p) => ({ Column: { Expression: { SourceRef: { Entity: "Sales" } }, Property: p } });
+    const item = (v, color) => ({ properties: { fill: { solid: { color: { expr: color } } } },
+      selector: { data: [{ scopeId: { Comparison: { ComparisonKind: 0, Left: col("Category"), Right: { Literal: { Value: `'${v}'` } } } } }] } });
+    const vc = (name, visualType, projections, dataPoint) => ({ config: JSON.stringify({ name, singleVisual: { visualType, projections, objects: dataPoint ? { dataPoint } : {} } }) });
+    const layout = {
+      config: JSON.stringify({ themeCollection: { baseTheme: { name: "CY24SU10" } } }),
+      sections: [{ displayName: "Legacy format", visualContainers: [
+        vc("lp1", "pieChart", { Category: [{ queryRef: "Sales.Category" }], Y: [{ queryRef: "Sales.Total Sales" }] },
+          [item("Furniture", { Literal: { Value: "'#123456'" } })]),
+        vc("ll1", "lineChart", { Category: [{ queryRef: "Sales.Month" }], Y: [{ queryRef: "Sales.Total Sales" }, { queryRef: "Sales.Total Cost" }] },
+          [{ properties: { fill: { solid: { color: { expr: { ThemeDataColor: { ColorId: 5, Percent: -0.25 } } } } } }, selector: { metadata: "Sales.Total Cost" } }]),
+        vc("lf1", "funnel", { Category: [{ queryRef: "Sales.Category" }], Y: [{ queryRef: "Sales.Total Sales" }] },
+          [item("Electronics", { Literal: { Value: "'#FF00AA'" } })]),
+      ] }],
+    };
+    const text = JSON.stringify(layout);
+    const utf16 = new Uint8Array(text.length * 2);
+    for (let i = 0; i < text.length; i++) { const c = text.charCodeAt(i); utf16[2 * i] = c & 255; utf16[2 * i + 1] = c >> 8; }
+    const zip = new JSZip();
+    zip.file("Report/Layout", utf16);
+    zip.file("Report/StaticResources/SharedResources/BaseThemes/CY24SU10.json", JSON.stringify(theme));
+    return zip.generateAsync({ type: "arraybuffer" });
+  };
+
+  /* Where the report file comes from: the sample pbix, a classic-format file, or a refusal */
+  const stubDesign = async (mode) => {
+    reportColorCache.clear();
+    if (mode === "pbix") {
+      const buf = await (await fetch("test-samples/test%20sample.pbix", { cache: "reload" })).arrayBuffer();
+      downloadDesignFile = async () => buf;
+    } else if (mode === "legacy") {
+      const buf = await legacyDesign();
+      downloadDesignFile = async () => buf;
+    } else {
+      downloadDesignFile = async () => { throw new Error(mode === "noaccess" ? "NO_ACCESS" : "NO_PERMISSION"); };
+    }
+  };
+
+  /* Per table: header fills, first data row fills (and text colours), gutter fill, CF rule count */
+  window.__colors = (ws) => Object.values(ws.tables || {}).map((x) => {
+    const t = x.table, m = t.tableRef.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
+    const r0 = +m[2], c0 = colN(m[1]);
+    const fillOf = (cell) => (cell.fill && cell.fill.fgColor ? "#" + cell.fill.fgColor.argb.slice(2) : "-");
+    const fontOf = (cell) => (cell.font && cell.font.color ? "#" + cell.font.color.argb.slice(2) : "-");
+    const cf = (ws.conditionalFormattings || []).find((f) => f.ref.startsWith(ws.getColumn(c0 - 1).letter + (r0 + 1)));
+    return {
+      table: t.name,
+      header: t.columns.map((c, i) => `${c.name}=${fillOf(ws.getCell(r0, c0 + i))}`).join(" | "),
+      rows: [1, 2, 3].map((k) => t.columns.map((c, i) => `${fillOf(ws.getCell(r0 + k, c0 + i))}/${fontOf(ws.getCell(r0 + k, c0 + i))}`).join(" | ")),
+      gutter: [1, 2, 3].map((k) => fillOf(ws.getCell(r0 + k, c0 - 1))).join(" "),
+      cfRules: cf ? cf.rules.length : 0,
+    };
+  });
 
   /* Runs exportToExcel against the fixtures and reads the file back */
   window.__run = async (pageIdx, branding = {}, opts = {}) => {
-    const all = pages();
+    const all = [...pages(), ...extraPages()];
+    const { __design, ...rest } = opts;
+    opts = rest;
+    await stubDesign(__design);
+    currentReport = { id: "harness", embedUrl: "https://app.powerbi.com/reportEmbed?reportId=harness&groupId=g1" };
     embeddedReport = {
       getActivePage: async () => all[0], getPages: async () => all, getFilters: async () => [],
       getTheme: async () => ({ themeJson: { dataColors: ["#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00", "#A65628", "#F781BF", "#999999"] } }),
-      on() {}, off() {},
+      on(event, fn) { if (event === "rendered") rendered.add(fn); }, off(event, fn) { rendered.delete(fn); },
     };
     currentReportName = "Export colour test";
     let href, name;
     const original = HTMLAnchorElement.prototype.click;
     HTMLAnchorElement.prototype.click = function () { href = this.href; name = this.download; };
-    const options = { pages: "current", layout: "report", collapse: true, visibleRows: 8, includeFilters: true, includeNotes: true, matchColors: true, exhibitNumbers: false, ...opts };
+    const options = { pages: "current", layout: "report", collapse: true, visibleRows: 8, includeFilters: true, includeNotes: true, matchColors: true, colorCells: true, exhibitNumbers: false, ...opts };
     try {
       const res = await exportToExcel(pageIdx.map((i) => all[i]), options,
         { companyName: "", accent: "#0B7F56", tableStyle: "Executive", titleFont: "Calibri Light", footer: "", ...branding }, () => {}, () => false);
@@ -133,7 +229,7 @@
         row.eachCell((cell, c) => {
           if (cell.value == null) return;
           const inTable = ranges.some((g) => r > g.r0 && r <= g.r1 && c >= g.c0 && c <= g.c1);
-          if (!inTable && cell.value !== "●") errors.push(`${ws.name}: hidden row ${r} col ${c} holds "${textOf(cell.value).slice(0, 40)}"`);
+          if (!inTable && cell.value !== "●" && cell.value !== "■") errors.push(`${ws.name}: hidden row ${r} col ${c} holds "${textOf(cell.value).slice(0, 40)}"`);
         });
       });
     }

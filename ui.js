@@ -19,6 +19,7 @@ const DEFAULT_OPTIONS = {
   includeFilters: true,
   includeNotes: true,
   matchColors: true,
+  colorCells: true,        // fill value cells with the chart colour (else keys only)
   exhibitNumbers: false,   // "01  Title" numbering of visuals
 };
 const DEFAULT_BRANDING = {
@@ -53,7 +54,8 @@ function saveJson(key, value) {
 }
 
 let exportOptions = loadJson(OPTIONS_KEY, DEFAULT_OPTIONS);
-let branding = migrateBranding(loadJson(BRANDING_KEY, DEFAULT_BRANDING));
+// Saved settings without a version are v1: the defaults' v2 must not hide them from migrateBranding
+let branding = migrateBranding(loadJson(BRANDING_KEY, { ...DEFAULT_BRANDING, v: 1 }));
 
 /*
  * Settings saved before the Boardroom design (v < 2): the old default blue accent
@@ -67,6 +69,7 @@ function migrateBranding(b) {
     TableStyleMedium7: "TableStyleMedium4",   // was labelled "Green"
     TableStyleMedium3: "TableStyleMedium7",   // was labelled "Orange"
     TableStyleMedium4: "TableStyleMedium1",   // was labelled "Gray"
+    report: "Executive",                      // "Same colours as the report": now the Colours option
   };
   const migrated = {
     ...b,
@@ -137,12 +140,38 @@ async function openOptionsDrawer() {
   $("optFilters").checked = exportOptions.includeFilters;
   $("optNotes").checked = exportOptions.includeNotes;
   $("optMatchColors").checked = exportOptions.matchColors;
+  $("optColorCells").checked = exportOptions.colorCells;
+  $("optColorCells").disabled = !exportOptions.matchColors;
   $("optExhibitNumbers").checked = exportOptions.exhibitNumbers;
+  showExactColorsHint();
 
   await renderPageChecklist();
   await renderVisualChecklist();
   updateDrawerVisibility();
   $("drawerExport").focus();
+}
+
+/* "Allow exact colours" shows only while Dataset.Read.All hasn't been granted */
+async function showExactColorsHint() {
+  const hint = $("exactColorsHint");
+  hint.hidden = true;
+  if (!$("optMatchColors").checked) return;
+  hint.hidden = !!(await getDesignToken({ quiet: true }));
+}
+
+/* Consent for Dataset.Read.All. Microsoft's sign-in page reopens this report, on this page, afterwards. */
+async function allowExactColors() {
+  readDrawerOptions();
+  const back = new URL(cfg.redirectUri);
+  const groupId = new URL(currentReport.embedUrl).searchParams.get("groupId");
+  if (groupId) back.searchParams.set("groupId", groupId);
+  back.searchParams.set("reportId", currentReport.id);
+  try {
+    back.searchParams.set("pageName", (await embeddedReport.getActivePage()).name);
+  } catch (e) {
+    // the report's default page will do
+  }
+  grantDesignAccess(back.href).catch((e) => toast("Couldn't ask for the permission", friendlyError(e), "error"));
 }
 
 function closeOptionsDrawer() {
@@ -219,6 +248,7 @@ function readDrawerOptions() {
     includeFilters: $("optFilters").checked,
     includeNotes: $("optNotes").checked,
     matchColors: $("optMatchColors").checked,
+    colorCells: $("optColorCells").checked,
     exhibitNumbers: $("optExhibitNumbers").checked,
   };
   saveJson(OPTIONS_KEY, exportOptions);
@@ -349,6 +379,13 @@ async function runDiagnostics() {
   log(`Report filters: ${describeFilters(await embeddedReport.getFilters())}`);
   const theme = await readThemeColors();
   log(`Colour theme: ${theme.fromReport ? "read from the report" : "not readable, using Power BI defaults"} – ${theme.colors.join(", ")}`);
+  try {
+    const rc = await loadReportColors(currentReport, theme.fromReport ? { dataColors: theme.colors } : null);
+    const own = Object.values(rc.visuals).filter((v) => Object.keys(v.overrides).length).length;
+    log(`Exact colours: available – ${rc.format} report file, ${own} visual(s) with colours set by hand`);
+  } catch (e) {
+    log(`Exact colours: not available (${errorText(e)}) – ${reportColorsMessage(e)}`);
+  }
   log(`Page filters:   ${describeFilters(await page.getFilters())}`);
 
   const counts = { ok: 0, fail: 0, skip: 0 };
@@ -423,6 +460,11 @@ $("scrim").addEventListener("click", closeOptionsDrawer);
 document.querySelectorAll("[data-close-drawer]").forEach((b) => b.addEventListener("click", () => { readDrawerOptions(); closeOptionsDrawer(); }));
 document.querySelectorAll('input[name="optPages"]').forEach((r) => r.addEventListener("change", updateDrawerVisibility));
 $("optCollapse").addEventListener("change", () => { $("optVisibleRows").disabled = !$("optCollapse").checked; });
+$("optMatchColors").addEventListener("change", () => {
+  $("optColorCells").disabled = !$("optMatchColors").checked;
+  showExactColorsHint();
+});
+$("grantExactColors").addEventListener("click", allowExactColors);
 $("visualsAll").addEventListener("click", () => setAllVisuals(true));
 $("visualsNone").addEventListener("click", () => setAllVisuals(false));
 $("drawerOpenSettings").addEventListener("click", () => { readDrawerOptions(); closeOptionsDrawer(); openSettings(); });

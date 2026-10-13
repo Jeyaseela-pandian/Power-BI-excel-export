@@ -3,7 +3,8 @@
 /*
  * Sign-in (MSAL), Power BI REST calls, report picker, report links and embedding.
  * Also holds helpers shared by export.js and ui.js: $, log, errorText, friendlyError,
- * describeFilters, NON_DATA_TYPES, models, embeddedReport, currentReportName.
+ * describeFilters, filterParts, NON_DATA_TYPES, models, embeddedReport, currentReport,
+ * currentReportName, getDesignToken.
  */
 
 /* ── Setup ─────────────────────────────────────────────────────────────── */
@@ -11,6 +12,9 @@ const PBI_SCOPES = [
   "https://analysis.windows.net/powerbi/api/Report.Read.All",
   "https://analysis.windows.net/powerbi/api/Workspace.Read.All",
 ];
+// Exact chart colours read the report's design file, which also needs Dataset.Read.All.
+// It is asked for separately, so sign-in keeps working where it hasn't been approved.
+const DESIGN_SCOPES = [...PBI_SCOPES, "https://analysis.windows.net/powerbi/api/Dataset.Read.All"];
 const PBI_API = "https://api.powerbi.com/v1.0/myorg";
 const models = window["powerbi-client"].models;
 const cfg = window.APP_CONFIG;
@@ -75,6 +79,25 @@ async function getToken() {
     }
     throw e;
   }
+}
+
+/* Token that can also download report design files, or null when Dataset.Read.All hasn't
+   been granted. Never redirects, so an export in progress just falls back. */
+async function getDesignToken({ quiet = false } = {}) {
+  const account = currentAccount();
+  if (!account) return null;
+  try {
+    return (await msalApp.acquireTokenSilent({ scopes: DESIGN_SCOPES, account })).accessToken;
+  } catch (e) {
+    if (!quiet) log(`Exact colours: permission not granted yet (${errorText(e)})`);
+    return null;
+  }
+}
+
+/* Asks for Dataset.Read.All (Microsoft shows "approval required" where only an admin may
+   grant it), then returns to `returnUrl` */
+function grantDesignAccess(returnUrl) {
+  return msalApp.acquireTokenRedirect({ scopes: DESIGN_SCOPES, account: currentAccount(), redirectStartPage: returnUrl });
 }
 
 function signIn() {
@@ -189,6 +212,8 @@ async function openFromUrl() {
 async function openReport(report, pageName) {
   const container = $("report");
   powerbi.reset(container);
+  // Exact colours are read again for a report that is reopened (they may have changed)
+  if (typeof forgetReportColors === "function") forgetReportColors(report.id);
   currentReport = report;
   currentReportName = report.name;
   setExportEnabled(false);
@@ -265,13 +290,61 @@ function describeConditions(f) {
     .join(f.logicalOperator === "Or" ? " or " : " and ");
 }
 
-/* Filters as { field, value } pairs – the export shows them as chips */
+/* Relative date / time filters: "last 12 months", "this calendar year", "next 7 days incl. today" */
+function describeRelative(f) {
+  const time = f.filterType === models.FilterType.RelativeTime;
+  const unit = (time ? ["minute", "hour"] : ["day", "week", "week", "month", "month", "year", "year"])[f.timeUnitType] || "period";
+  const calendar = !time && [2, 4, 6].includes(f.timeUnitType) ? "calendar " : "";
+  const n = f.timeUnitsCount || 1;
+  const text = f.operator === 1 ? `this ${calendar}${unit}`
+    : `${f.operator === 2 ? "next" : "last"} ${n === 1 ? "" : n + " "}${calendar}${unit}${n === 1 ? "" : "s"}`;
+  return text + (f.includeToday ? " incl. today" : "");
+}
+
+/* Hierarchy slicer selections: "2024", "2024 Jan", "2024 except Jan" */
+function describeHierarchy(nodes, prefix = "") {
+  const out = [];
+  for (const n of nodes || []) {
+    const label = prefix + formatFilterValue(n.value);
+    if (n.operator === "Selected") {
+      const except = (n.children || []).filter((c) => c.operator === "NotSelected").map((c) => formatFilterValue(c.value));
+      out.push(except.length ? `${label} except ${except.join(", ")}` : label);
+    } else if (n.operator === "Inherited") {
+      out.push(...describeHierarchy(n.children, label + " "));
+    }
+  }
+  return out;
+}
+
+function targetName(t) {
+  if (Array.isArray(t)) return t.map(targetName).join(", ");
+  return t ? (t.column || t.measure || t.hierarchyLevel || t.hierarchy || "?") : "?";
+}
+
+/* Filters as { field, value, all } – the export shows them as chips. A filter with nothing
+   selected reads "All" (all: true) and isn't counted as applied. */
 function filterParts(filters) {
+  const all = (field) => ({ field, value: "All", all: true });
   return (filters || []).map((f) => {
-    const field = f.target ? (f.target.column || f.target.measure || f.target.hierarchyLevel || "?") : "?";
-    const value = f.values ? f.values.map(formatFilterValue).join(", ")
-      : f.conditions ? describeConditions(f) : "";
-    return { field, value };
+    const field = targetName(f.target);
+    if (f.timeUnitType !== undefined) return { field, value: describeRelative(f) };
+    if (f.itemCount !== undefined) {
+      const by = f.orderBy ? ` by ${f.orderBy.measure || f.orderBy.column || ""}` : "";
+      return { field, value: `${f.operator || "Top"} ${f.itemCount}${by}`.trim() };
+    }
+    if (f.hierarchyData) {
+      const picked = describeHierarchy(f.hierarchyData);
+      return picked.length ? { field, value: picked.join(", ") } : all(field);
+    }
+    if (f.values) {
+      if (!f.values.length || f.operator === "All") return all(field);
+      // Tuple filters hold arrays of { value } objects
+      const one = (e) => formatFilterValue(e && typeof e === "object" ? e.value : e);
+      const values = f.values.map((v) => (Array.isArray(v) ? v.map(one).join(" · ") : one(v))).join(", ");
+      return { field, value: (f.operator === "NotIn" || f.isExclude ? "not " : "") + values };
+    }
+    if (f.conditions) return f.conditions.length ? { field, value: describeConditions(f) } : all(field);
+    return { field, value: "filtered" };
   });
 }
 

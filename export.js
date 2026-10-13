@@ -17,17 +17,21 @@
  *     Every other visual is an "exhibit": a title, a caption row (legend of the chart's
  *     colours, or "Table · 24 rows"), and a real Excel Table with filter / sort
  *     buttons, styled only with ink rules and hairlines (or a built-in table style).
- *  3. Chart colours appear only as "●" dots: in the caption legend, and in the gutter
- *     left of each row for charts that colour rows by category (kept right after a
- *     sort by conditional formatting). The accent appears only in the top rule, KPI
- *     tile caps and the sheet tab.
+ *  3. Chart tables show the chart's exact colours: a colour key in the caption, the
+ *     series colour on each series header, value cells filled with the colour of their
+ *     bar / line / slice, and a colour tab in the gutter left of each row for charts
+ *     that colour rows by category (kept right after a sort by conditional formatting).
+ *     Colours come from the report file when it can be read (colors.js: exact theme and
+ *     colours set by hand), else from the theme the embed API reports. The accent
+ *     appears only in the top rule, KPI tile caps and the sheet tab.
  *  4. Long tables collapse rows past `visibleRows` behind [+] / [–]. Excel hides whole
  *     rows, so only rows holding nothing but those extra rows are collapsed, and
  *     side-by-side tables are aligned so none hides another's content.
  *  5. Notes, footer, print setup (landscape, fit to width, header / footer).
  * The file is white-label: no product name is written anywhere.
- * Uses globals from app.js: embeddedReport, currentReportName, models, log, errorText,
- * filterParts, NON_DATA_TYPES.
+ * Uses globals from app.js: embeddedReport, currentReport, currentReportName, models, log,
+ * errorText, filterParts, NON_DATA_TYPES; and from colors.js: loadReportColors,
+ * reportColorsMessage, normalizeField, normalizeValue.
  */
 
 const KPI_TYPES = ["card", "multiRowCard", "kpi", "cardVisual", "gauge"];
@@ -64,6 +68,10 @@ const HEADER_BORDER = { top: { style: "medium", color: { argb: C.INK } } };
 const BODY_BORDER = { top: { style: "thin", color: { argb: C.HAIR } } };
 const INK_RULE = { style: "thin", color: { argb: C.INK } };
 const LIGHT_RULE = { style: "thin", color: { argb: C.RULE } };
+// Coloured cells are parted by white hairlines, so filled rows read like separate bars
+const GAP_BORDER = { top: { style: "thin", color: { argb: C.WHITE } }, bottom: { style: "thin", color: { argb: C.WHITE } } };
+const REPORT_COLORS_TIMEOUT_MS = 45000;   // longest wait for the report file after the pages are read
+const KEY_GLYPH = "■";                     // colour key in captions: a swatch, like the filled cells
 
 // Power BI's default theme data colours, used when the report's own theme can't be read
 const DEFAULT_THEME_COLORS = ["#118DFF", "#12239E", "#E66C37", "#6B007B", "#E044A7", "#744EC2", "#D9B300", "#D64550"];
@@ -234,55 +242,152 @@ async function readThemeColors() {
 }
 
 /*
- * Works out the colours of a chart's table, to match the chart. Returns null for cards,
- * table/matrix visuals, or when there is no palette.
- *  - A column of hex colours (e.g. a Deneb "Bar Color" field) is what the visual draws
- *    with: its most common colour is the series colour, and row dots follow it.
- *  - Otherwise the n-th series (number column) gets the theme's n-th data colour,
- *    which is how Power BI colours series by default. The first column is the axis
- *    and helper columns (sort keys, ranks, IDs) are skipped.
- *  - Rows coloured by a field (`rowKey`): treemap / pie / donut colour each value of
- *    their first field; a single series split by a legend colours each legend value.
- *    Values take theme colours in the order they first appear, as Power BI assigns them.
- *  - `dot` says which column decides each row's dot colour (rowKey, else hex column).
+ * Legend values in Power BI's series order. Rows come grouped by the axis, and within a
+ * group in series order. A series missing from the first groups still lands in its place:
+ * each group's sequence is merged in, a new value going after the previous value of its
+ * group already listed (or before the next one).
  */
-function columnColors(item, palette) {
-  if (!palette || item.isKpi || TABLE_VISUAL_TYPES.includes(item.type)) return null;
-  const { header, filled, numeric, hex, helper } = classifyColumns(item.rows);
+function seriesOrder(data, keyCol, groupCols) {
+  const order = [];
+  let group = null, seq = [];
+  const flush = () => {
+    seq.forEach((v, i) => {
+      if (order.includes(v)) return;
+      const prev = seq.slice(0, i).reverse().find((x) => order.includes(x));
+      const next = seq.slice(i + 1).find((x) => order.includes(x));
+      const at = prev !== undefined ? order.indexOf(prev) + 1 : next !== undefined ? order.indexOf(next) : order.length;
+      order.splice(at, 0, v);
+    });
+    seq = [];
+  };
+  for (const row of data) {
+    const g = groupCols.map((c) => row[c]).join("\u0001");
+    if (g !== group) { flush(); group = g; }
+    const v = (row[keyCol] ?? "").trim();
+    if (v && !seq.includes(v)) seq.push(v);
+  }
+  flush();
+  return order;
+}
+
+/*
+ * Works out the colours of a chart's table, to match the chart. Returns null for cards,
+ * table / matrix visuals, or when there is no palette. Sources, best first:
+ *  1. A column of hex colours (e.g. a Deneb "Bar Color" field) is what the visual draws
+ *     with: each row takes its own colour.
+ *  2. The report file (`info`, from colors.js, when it could be read): which columns are
+ *     drawn as series (tooltips aren't), which field is the legend or the category, and
+ *     colours set by hand (per measure, per item, or for every data point).
+ *  3. Otherwise inferred: the n-th number column after the axis is the n-th series
+ *     (helper columns such as sort keys, ranks and IDs are skipped); treemap / pie /
+ *     donut colour each value of their first field; one series beside one text column
+ *     is split by a legend.
+ * Series take the theme's data colours in field order, legend values in series order
+ * (seriesOrder) and pie / treemap categories in the order they appear, as Power BI does.
+ * Returns { series, rowCols, hexCols, rowKey, dot, exact }:
+ *  - series: { col: argb } columns drawn in one colour (header band, filled cells)
+ *  - rowCols: columns whose cells take their row's colour (rows coloured by key or hex)
+ *  - rowKey: { col, colorOf: { value: argb } } legend / category colours, for the caption
+ *  - dot: { keyCol, colorOf(value) } the column that decides each row's colour
+ *  - exact: true when the report file described this visual
+ */
+function columnColors(item, palette, info) {
+  if (!palette || !palette.length || item.isKpi || TABLE_VISUAL_TYPES.includes(item.type)) return null;
+  const { header, data, filled, numeric, hex, helper } = classifyColumns(item.rows);
   const cols = header.map((_, ci) => ci);
   const hexCols = cols.filter((ci) => hex[ci]);
-  const seriesCols = cols.filter((ci) => ci > 0 && !hex[ci] && !helper[ci] && numeric[ci]);
-  if (!seriesCols.length && !hexCols.length) return null;
+  const color = (i) => toArgb(palette[i % palette.length]);
+  const norm = header.map((h) => normalizeField(h));
+  const lower = header.map((h) => String(h ?? "").trim().toLowerCase());
+  // A field's column: its renamed label first, then its name ("Sum of Sales" and "Average of
+  // Sales" both read "sales", so a column already taken is skipped)
+  const findCol = (field, taken = {}) => {
+    if (!field) return -1;
+    const free = cols.filter((ci) => taken[ci] === undefined);
+    const byLabel = field.label ? free.find((ci) => lower[ci] === field.label) : undefined;
+    return byLabel !== undefined ? byLabel : free.find((ci) => norm[ci] === field.ref) ?? -1;
+  };
 
-  let fixed = null;
+  // Series columns: the report file's value fields when they match, else every number column
+  let seriesCols = [];
+  const fieldOf = {};   // series column → its field in the report file
+  const indexOf = {};   // series column → its position among the visual's series
+  if (info && info.measures.length) {
+    info.measures.forEach((m, i) => {
+      const ci = findCol(m, indexOf);
+      if (ci >= 0 && numeric[ci] && !hex[ci]) { seriesCols.push(ci); fieldOf[ci] = m; indexOf[ci] = i; }
+    });
+  }
+  if (!seriesCols.length) {
+    const tooltips = new Set((info && info.tooltips) || []);
+    seriesCols = cols.filter((ci) => ci > 0 && !hex[ci] && !helper[ci] && numeric[ci] && !tooltips.has(norm[ci]));
+    seriesCols.forEach((ci, i) => { indexOf[ci] = i; });
+  }
+  if (!seriesCols.length && !hexCols.length) return null;
+  const exact = !!info;
+
+  // 1. A hex colour column: every row in its own colour (one band colour when they all agree)
   if (hexCols.length) {
+    const colors = new Set(filled(hexCols[0]).map((x) => x.toUpperCase()));
+    const dot = { keyCol: hexCols[0], colorOf: (v) => (HEX_COLOR.test(v) ? toArgb(v) : null) };
+    if (colors.size === 1) {   // one colour for every row: a series colour, no row tabs needed
+      const one = toArgb([...colors][0]);
+      return { series: Object.fromEntries(seriesCols.map((ci) => [ci, one])), rowCols: [], hexCols, rowKey: null, dot: null, exact };
+    }
     const counts = {};
     filled(hexCols[0]).forEach((x) => { counts[x] = (counts[x] || 0) + 1; });
-    fixed = toArgb(Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0]);
+    const common = toArgb(Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0]);
+    return { series: {}, legendColor: common, rowCols: seriesCols, hexCols, rowKey: null, dot, exact };
   }
 
-  const series = {};
-  seriesCols.forEach((ci, i) => { series[ci] = fixed || toArgb(palette.at(i % palette.length)); });
+  const overrides = (info && info.overrides) || {};
+  const itemOverride = (v) => overrides["i:" + normalizeValue(v)];
+  const seriesColor = (ci) => {
+    const f = fieldOf[ci];
+    const set = overrides["m:" + norm[ci]] || (f && (overrides["m:" + f.ref] || (f.label && overrides["m:" + f.label])));
+    if (set) return toArgb(set);
+    if (overrides.all) return toArgb(overrides.all);
+    if (info && info.rule === "single") return color(0);
+    return color(indexOf[ci]);
+  };
+  const keyedRows = (keyCol, colorOfValue, bySeries) => {
+    const values = bySeries
+      ? seriesOrder(data, keyCol, cols.filter((ci) => ci !== keyCol && !seriesCols.includes(ci) && !hex[ci]))
+      : [...new Set(filled(keyCol))];   // order of first appearance
+    return { col: keyCol, colorOf: Object.fromEntries(values.map((v, i) => [v, colorOfValue(v, i)])) };
+  };
 
-  let keyCol = null;
-  if (!fixed && COLOR_BY_CATEGORY_TYPES.includes(item.type) && !numeric[0]) {
-    keyCol = 0;
-  } else if (!fixed && seriesCols.length === 1) {
-    const textCols = cols.filter((ci) => ci > 0 && !hex[ci] && !numeric[ci]);
-    if (textCols.length === 1) keyCol = textCols[0];
-  }
+  // 2. Rows coloured by a field: the legend (Series) or, for pie / donut / treemap, the category
   let rowKey = null;
-  if (keyCol !== null) {
-    const values = [...new Set(filled(keyCol))];   // order of first appearance
-    if (values.length > 1 && values.length <= palette.length) {
-      rowKey = { col: keyCol, colorOf: Object.fromEntries(values.map((v, i) => [v, toArgb(palette.at(i))])) };
+  if (info && (info.rule === "legend" || info.rule === "item")) {
+    let keyCol = findCol(info.rule === "legend" ? info.series : info.category);
+    if (keyCol < 0 && info.rule === "item" && !numeric[0] && !hex[0]) keyCol = 0;
+    if (keyCol >= 0) rowKey = keyedRows(keyCol, (v, i) => toArgb(itemOverride(v) || palette[i % palette.length]), info.rule === "legend");
+  } else if (info && seriesCols.length === 1 && Object.keys(overrides).some((k) => k.startsWith("i:"))) {
+    // One series with colours set per bar ("Show all"): set bars keep theirs, the rest the series colour
+    const keyCol = findCol(info.category);
+    const base = seriesColor(seriesCols[0]);
+    if (keyCol >= 0) rowKey = keyedRows(keyCol, (v) => (itemOverride(v) ? toArgb(itemOverride(v)) : base));
+  } else if (!info) {
+    let keyCol = null, legend = false;
+    if (COLOR_BY_CATEGORY_TYPES.includes(item.type) && !numeric[0]) {
+      keyCol = 0;
+    } else if (seriesCols.length === 1) {
+      const textCols = cols.filter((ci) => ci > 0 && !hex[ci] && !numeric[ci]);
+      if (textCols.length === 1) { keyCol = textCols[0]; legend = true; }
+    }
+    if (keyCol !== null) {
+      const values = new Set(filled(keyCol));
+      if (values.size > 1 && values.size <= palette.length) rowKey = keyedRows(keyCol, (v, i) => color(i), legend);
     }
   }
 
-  let dot = null;
-  if (rowKey) dot = { keyCol: rowKey.col, colorOf: (v) => rowKey.colorOf[v] || null };
-  else if (hexCols.length) dot = { keyCol: hexCols[0], colorOf: (v) => (HEX_COLOR.test(v) ? toArgb(v) : null) };
-  return { series, hexCols, rowKey, dot };
+  if (rowKey) {
+    const dot = { keyCol: rowKey.col, colorOf: (v) => rowKey.colorOf[v] || null };
+    return { series: {}, rowCols: seriesCols, hexCols, rowKey, dot, exact };
+  }
+  const series = Object.fromEntries(seriesCols.map((ci) => [ci, seriesColor(ci)]));
+  return { series, rowCols: [], hexCols, rowKey: null, dot: null, exact };
 }
 
 /* ── CSV → cells ──────────────────────────────────────────────────────── */
@@ -505,8 +610,12 @@ function blockSize(item, options) {
   return { width: item.rows[0].length, height: HEAD_ROWS + n + 1, note };
 }
 
-/* KPI / card as a scorecard tile: uppercase label, large value, optional sub-fields */
-function writeKpiBlock(ws, r, col, item, widths, lay, divider) {
+/*
+ * KPI / card as a scorecard tile: uppercase label, large value, optional sub-fields.
+ * strip: { titleRow, height } for tiles in a key-figure strip, so every tile reserves the
+ * same title row and reaches the same bottom row, and the caps join into one ribbon.
+ */
+function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
   const fonts = lay.fonts;
   const [header, values = []] = item.rows;
   const cells = header.map((_, i) => toCellValue(values[i]));
@@ -519,6 +628,9 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider) {
     t.value = item.displayTitle;
     t.font = fonts.exTitle;
     t.alignment = { vertical: "bottom" };
+    widths.span(col, col + 1, Math.ceil(item.displayTitle.length * (fonts.exTitle.name === "Georgia" ? 1.2 : 1.1)) + 2);
+    top = r + 1;
+  } else if (strip && strip.titleRow) {
     top = r + 1;
   }
 
@@ -564,7 +676,7 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider) {
     widths.want(col + 1, displayText(cells[i].value, fmtOf(i)).length + 3);
   }
 
-  const last = next - 1;
+  const last = Math.max(next - 1, strip ? r + strip.height - 1 : 0);
   for (let rr = top; rr <= last; rr++) {
     for (let cc = col; cc <= col + 1; cc++) {
       const cell = ws.getCell(rr, cc);
@@ -595,7 +707,7 @@ function captionRuns(item, colors, header, fonts, units) {
     for (const e of entries) {
       const add = e.label.length * 0.8 + 4;
       if (shown && len + add > units - 6) break;
-      runs.push(["●  ", fonts.dot(e.argb)], [e.label + "      ", fonts.caption]);
+      runs.push([KEY_GLYPH + "  ", fonts.dot(e.argb)], [e.label + "      ", fonts.caption]);
       len += add;
       shown++;
     }
@@ -606,15 +718,16 @@ function captionRuns(item, colors, header, fonts, units) {
     const entries = Object.entries(colors.rowKey.colorOf).map(([label, argb]) => ({ label, argb }));
     const { runs, shown } = legend(entries);
     if (shown === entries.length) return runs;
-    const few = entries.slice(0, 4).map((e) => ["● ", fonts.dot(e.argb)]);
+    const few = entries.slice(0, 4).map((e) => [KEY_GLYPH + " ", fonts.dot(e.argb)]);
     return [...few, [` Colour by ${header[colors.rowKey.col]}`, fonts.caption]];
   }
 
   const seriesEntries = Object.entries(colors.series).map(([ci, argb]) => ({ label: header[ci], argb }));
   if (colors.hexCols.length) {
-    const first = seriesEntries[0];
+    const first = seriesEntries[0] || (colors.legendColor && colors.rowCols.length
+      ? { label: header[colors.rowCols[0]], argb: colors.legendColor } : null);
     return [
-      ...(first ? [["●  ", fonts.dot(first.argb)], [first.label, fonts.caption]] : []),
+      ...(first ? [[KEY_GLYPH + "  ", fonts.dot(first.argb)], [first.label, fonts.caption]] : []),
       [`${first ? "  ·  " : ""}row colours from ${header[colors.hexCols[0]]}`, fonts.caption],
     ];
   }
@@ -668,6 +781,11 @@ function writeDataTable(ws, r, col, item, tableName, widths, lay, number) {
   }
   units.forEach((u, ci) => widths.want(col + ci, u));
   const totalUnits = units.reduce((a, b) => a + b, 0);
+  // The title overflows to the right, up to the next visual's title one gutter along:
+  // widen the table's last column when the title needs more (capped, so it stays a table)
+  const titleLen = (number ? 4 : 0) + String(item.displayTitle || "").length;
+  const titleUnits = Math.ceil(titleLen * (fonts.exTitle.name === "Georgia" ? 1.2 : 1.1)) + 1 - GUTTER_W;
+  widths.span(col, col + header.length - 1, Math.min(titleUnits, totalUnits + 40));
 
   // Title and caption
   const t = ws.getCell(r, col);
@@ -710,45 +828,105 @@ function writeDataTable(ws, r, col, item, tableName, widths, lay, number) {
     }
   });
 
-  if (item.colors) applyVisualColors(ws, hr, col, item, item.colors, fonts);
+  if (item.colors) applyVisualColors(ws, hr, col, item, item.colors, lay);
+}
+
+/* Text colour that reads best on a filled cell: white or ink, whichever contrasts more */
+function textOn(argb) {
+  return contrast(argb, C.WHITE) >= contrast(argb, C.INK) ? C.WHITE : C.INK;
 }
 
 /*
- * Row dots for charts that colour rows by a field (legend, treemap, pie) or by a hex
- * colour column: "●" in the gutter column left of the table, in the row's colour.
- * Conditional formatting re-colours each dot from its own row's key cell, so the dots
- * stay right after the table is sorted (static colours are the fallback).
+ * Paints a chart table in the chart's colours:
+ *  - series drawn in one colour: the header cell becomes a band in that colour and, with
+ *    `lay.colorCells`, every value cell below is filled with it
+ *  - rows coloured by a field (legend, pie, treemap) or a hex column: each row's value
+ *    cells are filled with the row's colour (Excel moves fills along when sorting), and
+ *    the row gets a colour tab in the column left of the table, painted by paintRowTabs
+ *    once column widths are known (lay.pendingTabs)
+ * Text on a filled cell is white or ink, whichever reads better.
  */
-function applyVisualColors(ws, hr, col, item, colors, fonts) {
-  const dot = colors.dot;
-  if (!dot || col <= 1) return;
-  const g = col - 1;
+function applyVisualColors(ws, hr, col, item, colors, lay) {
+  const fonts = lay.fonts;
   const data = item.rows.slice(1);
   const first = hr + 1, last = hr + data.length;
-  const align = { horizontal: "right", vertical: "middle" };
-  const seen = new Map();
+  const styles = new Map();   // argb → shared fill / font objects (big tables stay fast)
+  const styleOf = (argb) => {
+    if (!styles.has(argb)) {
+      const fill = solidFill(argb);
+      styles.set(argb, { fill, font: { ...fonts.body, color: { argb: textOn(argb) } }, headFont: { ...fonts.header, color: { argb: textOn(argb) } } });
+    }
+    return styles.get(argb);
+  };
+  const fillCell = (cell, argb) => {
+    const s = styleOf(argb);
+    cell.fill = s.fill;
+    cell.font = s.font;
+    cell.border = GAP_BORDER;
+  };
+
+  for (const [ci, argb] of Object.entries(colors.series)) {
+    const c = col + Number(ci);
+    const h = ws.getCell(hr, c);
+    h.fill = styleOf(argb).fill;
+    h.font = styleOf(argb).headFont;
+    if (lay.colorCells) for (let r = first; r <= last; r++) fillCell(ws.getCell(r, c), argb);
+  }
+
+  const dot = colors.dot;
+  if (!dot) return;
+  const tabs = { g: col - 1, keyCol: col + dot.keyCol, first, last, cells: [], seen: new Map() };
   data.forEach((row, ri) => {
     const key = (row[dot.keyCol] ?? "").trim();
     const argb = key ? dot.colorOf(key) : null;
     if (!argb) return;
-    const cell = ws.getCell(first + ri, g);
-    cell.value = "●";
-    cell.font = fonts.dot(argb);
-    cell.alignment = align;
-    if (!seen.has(key)) seen.set(key, argb);
+    if (lay.colorCells) for (const ci of colors.rowCols) fillCell(ws.getCell(first + ri, col + ci), argb);
+    tabs.cells.push([first + ri, argb]);
+    if (!tabs.seen.has(key)) tabs.seen.set(key, argb);
   });
-  if (!seen.size || seen.size > MAX_CF_RULES) return;
+  if (tabs.g >= 1 && tabs.cells.length && lay.pendingTabs) lay.pendingTabs.push(tabs);
+}
 
-  const K = ws.getColumn(col + dot.keyCol).letter;
-  const rules = [];
-  for (const [key, argb] of seen) {
-    const typed = toCellValue(key).value;
-    const literal = typeof typed === "number" ? String(typed) : `"${String(key).replace(/"/g, '""')}"`;
-    if (literal.length > 250) return;
-    rules.push({ type: "expression", formulae: [`$${K}${first}=${literal}`], style: { font: { color: { argb } } } });
+/*
+ * Row colour tabs, painted once column widths are known. In a narrow gutter a tab is a
+ * filled cell; where the column is wider (another band's data column) it is a swatch
+ * glyph at the right edge, so it never becomes a wide coloured block. The tabs aren't part
+ * of the table, so up to MAX_CF_RULES colours conditional formatting alone colours each
+ * tab from its own row's key cell, and tabs stay right after a sort or filter (rows with
+ * no colour stay blank). Above that the colours are static.
+ */
+function paintRowTabs(ws, pendingTabs, fonts) {
+  for (const t of pendingTabs) {
+    const narrow = (ws.getColumn(t.g).width || GUTTER_W) <= GUTTER_W + 0.01;
+    const K = ws.getColumn(t.keyCol).letter;
+    let rules = t.seen.size <= MAX_CF_RULES ? [] : null;
+    for (const [key, argb] of rules ? t.seen : []) {
+      const typed = toCellValue(key).value;
+      const literal = typeof typed === "number" ? String(typed) : `"${String(key).replace(/"/g, '""')}"`;
+      if (literal.length > 250) { rules = null; break; }
+      rules.push({
+        type: "expression",
+        formulae: [`$${K}${t.first}=${literal}`],
+        style: narrow ? { fill: { type: "pattern", pattern: "solid", bgColor: { argb } } } : { font: { color: { argb } } },
+      });
+    }
+    const align = { horizontal: "right", vertical: "middle" };
+    for (const [r, argb] of t.cells) {
+      const cell = ws.getCell(r, t.g);
+      if (narrow) {
+        if (!rules) cell.fill = solidFill(argb);
+        cell.border = GAP_BORDER;
+      } else {
+        cell.value = KEY_GLYPH;
+        cell.font = fonts.dot(rules ? C.WHITE : argb);   // with rules, only matching rows show a colour
+        cell.alignment = align;
+      }
+    }
+    if (rules && rules.length) {
+      const G = ws.getColumn(t.g).letter;
+      ws.addConditionalFormatting({ ref: `${G}${t.first}:${G}${t.last}`, rules });
+    }
   }
-  const G = ws.getColumn(g).letter;
-  ws.addConditionalFormatting({ ref: `${G}${first}:${G}${last}`, rules });
 }
 
 /* ── Page layout ──────────────────────────────────────────────────────── */
@@ -892,8 +1070,11 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
       if (usedTitles[key] > 1) title = `${title} (${usedTitles[key]})`;
     }
     item.displayTitle = title;
-    item.colors = lay.palette && !item.isKpi ? columnColors(item, lay.palette) : null;
+    const info = lay.reportColors && item.name ? lay.reportColors.visuals[item.name] || null : null;
+    item.colors = lay.palette && !item.isKpi ? columnColors(item, lay.palette, info) : null;
   }
+  const executive = !BUILT_IN_STYLES.includes(lay.tableStyle);
+  const hasTab = (it) => !it.isKpi && !!(it.colors && it.colors.dot);
 
   const bands = stacked
     ? groupIntoBands(items).flatMap((b) => [...b.items].sort((a, c) => a.layout.x - c.layout.x).map((it) => ({ items: [it] })))
@@ -910,26 +1091,40 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     const plan = [];
     const allCards = !stacked && band.items.every((it) => it.isKpi);
     const stacks = stacked ? [{ items: band.items, left: 0 }] : groupIntoStacks(band.items);
+    // Key-figure strip: the first tile of every stack shares one title row and one height
+    let strip = null;
+    if (allCards) {
+      const heads = stacks.map((s) => s.items[0]);
+      const titleRow = heads.some(kpiHasTitle);
+      const height = Math.max(...heads.map((it) => blockSize(it, options).height + (titleRow && !kpiHasTitle(it) ? 1 : 0)));
+      strip = { titleRow, height };
+    }
     let cursorCol = CONTENT_COL;
     stacks.forEach((stack, stackIndex) => {
-      let col = cursorCol;
+      // Row colour tabs sit in the column left of a table: keep a blank gutter before them,
+      // so they don't touch the visual to the left
+      // (lining up with an earlier visual at the same x wins; paintRowTabs copes with wide columns)
+      let col = cursorCol + (stackIndex > 0 && stack.items.some(hasTab) ? 1 : 0);
       if (!stacked && !allCards) {
         const anchor = anchors.find((a) => Math.abs(a.x - stack.left) <= SNAP_PX && a.col >= cursorCol);
         if (anchor) col = anchor.col;
         else anchors.push({ x: stack.left, col });
       }
       let r = bandTop, stackWidth = 0;
-      for (const item of stack.items) {
+      stack.items.forEach((item, i) => {
+        const inStrip = strip && i === 0;
         const size = blockSize(item, options);
+        if (inStrip) size.height = strip.height;
         const n = item.rows.length - 1;
         plan.push({
           item, col, r, size, stackIndex, vis: threshold, extra: 0,
           noteRow: size.note ? r + HEAD_ROWS + n : null,
           divider: allCards && stackIndex > 0,
+          strip: inStrip ? strip : null,
         });
         stackWidth = Math.max(stackWidth, size.width);
         r += size.height + 1;
-      }
+      });
       cursorCol = col + stackWidth + (allCards ? 0 : 1);
     });
 
@@ -942,7 +1137,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
       const { item, col, r, size } = p;
       lastCol = Math.max(lastCol, col + size.width - 1);
       if (item.isKpi) {
-        writeKpiBlock(ws, r, col, item, widths, lay, p.divider);
+        writeKpiBlock(ws, r, col, item, widths, lay, p.divider, p.strip);
         for (let i = 0; i < size.height; i++) mark(r + i, "other");
       } else {
         const number = options.exhibitNumbers ? ++exhibit : null;
@@ -953,7 +1148,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
         const closeRow = p.noteRow || r + HEAD_ROWS + n;
         for (let x = r + HEAD_ROWS + n; x < closeRow; x++) mark(x, "deep");   // padding lined up with a neighbour
         mark(closeRow, "other");
-        paintRange(ws, closeRow, col, col + size.width - 1, { border: { top: INK_RULE } });
+        if (executive) paintRange(ws, closeRow, col, col + size.width - 1, { border: { top: INK_RULE } });
         tables.push({ top: r, col, w: size.width, n, vis: p.vis, noteRow: p.noteRow });
       }
       bandBottom = Math.max(bandBottom, r + size.height);
@@ -1044,8 +1239,8 @@ async function collectPage(page, options, onProgress, isCancelled) {
 
   const filterChips = [];
   if (options.includeFilters) {
-    filterParts(await embeddedReport.getFilters()).forEach((p) => filterChips.push({ ...p, all: false }));
-    filterParts(await page.getFilters()).forEach((p) => filterChips.push({ ...p, all: false }));
+    filterParts(await embeddedReport.getFilters()).forEach((p) => filterChips.push({ all: false, ...p }));
+    filterParts(await page.getFilters()).forEach((p) => filterChips.push({ all: false, ...p }));
   }
 
   const items = [];
@@ -1066,7 +1261,7 @@ async function collectPage(page, options, onProgress, isCancelled) {
         const state = await v.getSlicerState();
         const parts = filterParts(state.filters);
         if (parts.length) {
-          parts.forEach((p) => filterChips.push({ ...p, all: false }));
+          parts.forEach((p) => filterChips.push({ all: false, ...p }));
         } else {
           const target = (state.targets && state.targets[0]) || {};
           const field = target.column || target.hierarchyLevel || target.measure || target.hierarchy ||
@@ -1095,7 +1290,7 @@ async function collectPage(page, options, onProgress, isCancelled) {
         }
         continue;
       }
-      items.push({ title, type: v.type, layout: v.layout, rows, isKpi });
+      items.push({ title, name: v.name, type: v.type, layout: v.layout, rows, isKpi });
       log(`Exported "${title}" (${rows.length - 1} rows)`);
     } catch (e) {
       if (NON_DATA_TYPES.includes(v.type)) continue;
@@ -1145,7 +1340,14 @@ function hfText(s) {
 function writePageSheet(wb, sheetName, page, data, options, branding, logo, nameTable, ctx) {
   const accent = accentPlan(toArgb(branding.accent));
   const fonts = makeFonts(branding.titleFont);
-  const lay = { fonts, accent, tableStyle: branding.tableStyle || EXECUTIVE, palette: options.matchColors ? options.palette : null };
+  const lay = {
+    fonts, accent,
+    tableStyle: branding.tableStyle || EXECUTIVE,
+    palette: options.matchColors ? options.palette : null,
+    reportColors: options.matchColors ? options.reportColors || null : null,
+    colorCells: options.colorCells !== false,
+    pendingTabs: [],   // row colour tabs, painted once column widths are known
+  };
   const ws = wb.addWorksheet(sheetName, {
     views: [{ showGridLines: false, zoomScale: 100 }],
     properties: { tabColor: { argb: accent.tab }, defaultRowHeight: ROW_H },
@@ -1241,11 +1443,12 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
     Math.ceil(metaText.length * 0.9) + 6, Math.ceil(longestFilterLine * 0.9) + 6);
   const { contentEnd, bandEnd } = widths.apply(ws, Math.max(layout.lastCol, B), minPage);
 
-  // 4. Rules and fills
+  // 4. Rules and fills, row colour tabs
   paintRange(ws, 1, 1, bandEnd, { fill: solidFill(accent.rule) });
+  paintRowTabs(ws, lay.pendingTabs, fonts);
   paintRange(ws, metaRow, B, contentEnd, { border: { bottom: INK_RULE } });
   for (const fr of filterRows) paintRange(ws, fr, B, contentEnd, { fill: SURFACE_FILL });
-  if (emptyRow) paintRange(ws, emptyRow, B, Math.min(B + 7, contentEnd), { fill: SURFACE_FILL });
+  if (emptyRow) paintRange(ws, emptyRow, B, contentEnd, { fill: SURFACE_FILL });
 
   // 5. Logo: 32px high, at most 200px wide, anchored by native offsets at B
   if (logo) {
@@ -1339,12 +1542,16 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
   const original = await embeddedReport.getActivePage();
   const collected = [];
 
-  // Chart colours come from the report theme; read it once for the whole export
-  let themeNote = null;
+  // Chart colours: the theme from the embed API now, and the report file (exact theme and
+  // colours set by hand) downloaded while the pages are read
+  let theme = null, reportColorsJob = null;
   if (options.matchColors) {
-    const theme = await readThemeColors();
+    theme = await readThemeColors();
     options = { ...options, palette: theme.colors };
-    if (!theme.fromReport) themeNote = "The report's colour theme could not be read, so chart colour keys use Power BI's default colours, which may differ from this report.";
+    reportColorsJob = typeof loadReportColors === "function"
+      ? loadReportColors(currentReport, theme.fromReport ? { dataColors: theme.colors } : null)
+      : Promise.reject(new Error("NOT_LOADED"));
+    reportColorsJob.catch(() => {});   // handled below, after the pages
   }
   try {
     for (let p = 0; p < pages.length; p++) {
@@ -1354,7 +1561,6 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
       const data = await collectPage(page, options,
         (i, n, title) => onProgress({ pageIndex: p + 1, pageCount: pages.length, pageName: page.displayName, visualIndex: i, visualCount: n, visualTitle: title }),
         isCancelled);
-      if (themeNote) data.notes.push(themeNote);
       collected.push({ page, data });
     }
   } finally {
@@ -1362,6 +1568,31 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
     if (pages.length > 1 || pages[0].name !== original.name) {
       await activatePage(original).catch(() => {});
     }
+  }
+
+  if (reportColorsJob) {
+    onProgress({ pageIndex: pages.length, pageCount: pages.length, pageName: pages[pages.length - 1].displayName, visualIndex: 0, visualCount: 0, visualTitle: "Reading the report's colours…" });
+    let colorNote = null, timer = null, poll = null;
+    try {
+      const stop = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("TIMEOUT")), REPORT_COLORS_TIMEOUT_MS);
+        poll = setInterval(() => { if (isCancelled()) reject(new Error("CANCELLED")); }, 250);
+      });
+      const rc = await Promise.race([reportColorsJob, stop]);
+      options = { ...options, palette: rc.palette, reportColors: rc };
+    } catch (e) {
+      const code = String((e && e.message) || "");
+      if ((code === "TIMEOUT" || code === "CANCELLED") && reportColorsJob.abort) reportColorsJob.abort();
+      if (code === "CANCELLED") throw { cancelled: true };
+      log(`Exact report colours not used: ${errorText(e)}`);
+      colorNote = theme.fromReport ? reportColorsMessage(e)
+        : "The report's colour theme could not be read, so chart colours use Power BI's default colours, which may differ from this report.";
+    } finally {
+      clearTimeout(timer);
+      clearInterval(poll);
+    }
+    if (isCancelled()) throw { cancelled: true };
+    if (colorNote && collected.length) collected[0].data.notes.push(colorNote);
   }
 
   const exportTime = new Date();
