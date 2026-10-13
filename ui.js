@@ -18,15 +18,19 @@ const DEFAULT_OPTIONS = {
   visibleRows: 8,
   includeFilters: true,
   includeNotes: true,
+  matchColors: true,
+  exhibitNumbers: false,   // "01  Title" numbering of visuals
 };
 const DEFAULT_BRANDING = {
   companyName: "",
   logo: null,              // data URL
   logoWidth: 0,
   logoHeight: 0,
-  accent: "#1A73E8",
-  tableStyle: "TableStyleMedium2",
+  accent: "#0B7F56",
+  tableStyle: "Executive", // "Executive" (ruled, no fills) or a built-in Excel TableStyle name
+  titleFont: "Calibri Light",
   footer: "",
+  v: 2,                    // settings version, for migrateBranding
 };
 
 // Storage can be unavailable (private windows, blocked site data): fall back to defaults
@@ -49,7 +53,31 @@ function saveJson(key, value) {
 }
 
 let exportOptions = loadJson(OPTIONS_KEY, DEFAULT_OPTIONS);
-let branding = loadJson(BRANDING_KEY, DEFAULT_BRANDING);
+let branding = migrateBranding(loadJson(BRANDING_KEY, DEFAULT_BRANDING));
+
+/*
+ * Settings saved before the Boardroom design (v < 2): the old default blue accent
+ * becomes the new default, and old table style choices map to what their labels now
+ * show (the earlier labels didn't match ExcelJS's built-in theme colours).
+ */
+function migrateBranding(b) {
+  if ((b.v || 1) >= 2) return b;
+  const styles = {
+    TableStyleMedium2: "Executive",
+    TableStyleMedium7: "TableStyleMedium4",   // was labelled "Green"
+    TableStyleMedium3: "TableStyleMedium7",   // was labelled "Orange"
+    TableStyleMedium4: "TableStyleMedium1",   // was labelled "Gray"
+  };
+  const migrated = {
+    ...b,
+    accent: String(b.accent || "").toUpperCase() === "#1A73E8" ? "#0B7F56" : b.accent,
+    tableStyle: styles[b.tableStyle] || b.tableStyle || "Executive",
+    titleFont: b.titleFont || "Calibri Light",
+    v: 2,
+  };
+  saveJson(BRANDING_KEY, migrated);
+  return migrated;
+}
 
 // Per-session choices that depend on the open report
 const chosenPages = new Map();      // reportId → Set of page names
@@ -108,6 +136,8 @@ async function openOptionsDrawer() {
   $("optVisibleRows").disabled = !exportOptions.collapse;
   $("optFilters").checked = exportOptions.includeFilters;
   $("optNotes").checked = exportOptions.includeNotes;
+  $("optMatchColors").checked = exportOptions.matchColors;
+  $("optExhibitNumbers").checked = exportOptions.exhibitNumbers;
 
   await renderPageChecklist();
   await renderVisualChecklist();
@@ -188,6 +218,8 @@ function readDrawerOptions() {
     visibleRows: visibleRows > 0 ? Math.min(visibleRows, 1000) : DEFAULT_OPTIONS.visibleRows,
     includeFilters: $("optFilters").checked,
     includeNotes: $("optNotes").checked,
+    matchColors: $("optMatchColors").checked,
+    exhibitNumbers: $("optExhibitNumbers").checked,
   };
   saveJson(OPTIONS_KEY, exportOptions);
 }
@@ -199,6 +231,7 @@ function openSettings() {
   $("brandCompany").value = branding.companyName;
   $("brandAccent").value = branding.accent;
   $("brandTableStyle").value = branding.tableStyle;
+  $("brandTitleFont").value = branding.titleFont;
   $("brandFooter").value = branding.footer;
   $("brandLogo").value = "";
   pendingLogo = { logo: branding.logo, logoWidth: branding.logoWidth, logoHeight: branding.logoHeight };
@@ -234,7 +267,9 @@ function saveSettings() {
     companyName: $("brandCompany").value.trim(),
     accent: $("brandAccent").value,
     tableStyle: $("brandTableStyle").value,
+    titleFont: $("brandTitleFont").value,
     footer: $("brandFooter").value.trim(),
+    v: 2,
     ...pendingLogo,
   };
   if (!saveJson(BRANDING_KEY, branding)) {
@@ -312,6 +347,8 @@ async function runDiagnostics() {
   const visuals = await page.getVisuals();
   log(`Page "${page.displayName}" (${page.name}): ${visuals.length} visual(s)`);
   log(`Report filters: ${describeFilters(await embeddedReport.getFilters())}`);
+  const theme = await readThemeColors();
+  log(`Colour theme: ${theme.fromReport ? "read from the report" : "not readable, using Power BI defaults"} – ${theme.colors.join(", ")}`);
   log(`Page filters:   ${describeFilters(await page.getFilters())}`);
 
   const counts = { ok: 0, fail: 0, skip: 0 };

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "data": { "name": "dataset" },
+  "mark": { "type": "bar", "tooltip": true },
+  "encoding": {
+    "x": {
+      "field": "Month",
+      "type": "ordinal",
+      "sort": { "field": "Month Sort" },
+      "title": "Month"
+    },
+    "y": {
+      "field": "Total Sales",
+      "type": "quantitative",
+      "title": "Sales"
+    },
+    "color": {
+      "field": "Bar Color",
+      "type": "nominal",
+      "scale": null,
+      "legend": null
+    }
+  }
+}

@@ -146,7 +146,7 @@
       <fieldset>
         <legend>Layout</legend>
         <label class="choice"><input type="radio" name="optLayout" value="report">
-          <span>Like the report<small>Visuals keep their positions: left, right, above, below.</small></span></label>
+          <span>Like the report<small>Visuals keep their positions: left, right, above, below. Filtering one table also hides rows of the tables beside it – choose Stacked for analysis.</small></span></label>
         <label class="choice"><input type="radio" name="optLayout" value="stacked">
           <span>Stacked<small>One visual under another. Best when you will filter the tables.</small></span></label>
       </fieldset>
@@ -160,9 +160,16 @@
       </fieldset>
 
       <fieldset>
+        <legend>Colours</legend>
+        <label class="choice"><input type="checkbox" id="optMatchColors">
+          <span>Show chart colour keys<small>Legends above chart tables and a coloured dot beside rows coloured by category, in the report's colours.</small></span></label>
+      </fieldset>
+
+      <fieldset>
         <legend>Include</legend>
         <label class="choice"><input type="checkbox" id="optFilters"> <span>Active filters and slicer selections</span></label>
         <label class="choice"><input type="checkbox" id="optNotes"> <span>Export notes (skipped or failed visuals)</span></label>
+        <label class="choice"><input type="checkbox" id="optExhibitNumbers"> <span>Number visuals (01, 02 …)</span></label>
       </fieldset>
 
       <p class="muted">Logo, colours and footer are set in <button type="button" class="link" id="drawerOpenSettings">branding settings</button>.</p>
@@ -192,13 +199,20 @@
           <input type="color" id="brandAccent"></label>
         <label class="field">Table style
           <select id="brandTableStyle">
-            <option value="TableStyleMedium2">Blue</option>
-            <option value="TableStyleMedium7">Green</option>
-            <option value="TableStyleMedium3">Orange</option>
-            <option value="TableStyleMedium4">Gray</option>
-            <option value="TableStyleLight9">Light blue</option>
+            <option value="Executive">Executive (recommended)</option>
+            <option value="TableStyleMedium2">Classic blue</option>
+            <option value="TableStyleMedium4">Classic green</option>
+            <option value="TableStyleMedium7">Classic orange</option>
+            <option value="TableStyleMedium1">Classic graphite</option>
+            <option value="TableStyleLight9">Classic blue, light body</option>
           </select></label>
       </div>
+      <p class="muted">The accent is used for the top rule, KPI tile caps and sheet tabs – never for text.</p>
+      <label class="field">Title font
+        <select id="brandTitleFont">
+          <option value="Calibri Light">Calibri Light (modern)</option>
+          <option value="Georgia">Georgia (editorial)</option>
+        </select></label>
       <label class="field">Footer text
         <input id="brandFooter" placeholder="e.g. Confidential – internal use only"></label>
       <div class="dialog-actions">

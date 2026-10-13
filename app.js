@@ -265,14 +265,20 @@ function describeConditions(f) {
     .join(f.logicalOperator === "Or" ? " or " : " and ");
 }
 
-function describeFilters(filters) {
-  if (!filters || filters.length === 0) return "none";
-  return filters.map((f) => {
+/* Filters as { field, value } pairs – the export shows them as chips */
+function filterParts(filters) {
+  return (filters || []).map((f) => {
     const field = f.target ? (f.target.column || f.target.measure || f.target.hierarchyLevel || "?") : "?";
-    const values = f.values ? f.values.map(formatFilterValue).join(", ")
+    const value = f.values ? f.values.map(formatFilterValue).join(", ")
       : f.conditions ? describeConditions(f) : "";
-    return `${field}${values ? ": " + values : ""}`;
-  }).join(" | ");
+    return { field, value };
+  });
+}
+
+function describeFilters(filters) {
+  const parts = filterParts(filters);
+  if (parts.length === 0) return "none";
+  return parts.map((p) => `${p.field}${p.value ? ": " + p.value : ""}`).join(" | ");
 }
 
 /* ── Start-up (called from ui.js once every script is loaded) ─────────── */
