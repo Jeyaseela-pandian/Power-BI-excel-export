@@ -18,9 +18,8 @@
  *     colours, or "Table · 24 rows"), and a real Excel Table with filter / sort
  *     buttons, styled only with ink rules and hairlines (or a built-in table style).
  *  3. Chart tables show the chart's exact colours: a colour key in the caption, the
- *     series colour on each series header, value cells filled with the colour of their
- *     bar / line / slice, and a colour tab in the gutter left of each row for charts
- *     that colour rows by category (kept right after a sort by conditional formatting).
+ *     series colour on each series header, and value cells filled with the colour of
+ *     their bar / line / slice (Excel moves the fills with the rows when sorting).
  *     Colours come from the report file when it can be read (colors.js: exact theme and
  *     colours set by hand), else from the theme the embed API reports. The accent
  *     appears only in the top rule, KPI tile caps and the sheet tab.
@@ -50,6 +49,8 @@ const C = {
   WHITE: "FFFFFFFF",
 };
 const DEFAULT_ACCENT = "FF0B7F56";
+const NEUTRAL_ACCENT = "FF1F3A5F";   // deep navy: the "match the report" accent when no theme can be read
+const MIN_RULE_CONTRAST = 2;         // accent rules and caps stay at least this visible on white
 const ROW_H = 18;          // the row grid, in points
 const HEAD_ROWS = 3;       // exhibit title, caption, table header
 const CONTENT_COL = 2;     // everything starts at column B; column A is the margin
@@ -58,7 +59,6 @@ const GUTTER_W = 3;
 const MIN_PAGE_W = 100;    // minimum content width (Excel width units)
 const SNAP_PX = 40;        // stacks starting within this many page pixels share a column
 const BAND_GAP = 2;        // blank rows between bands
-const MAX_CF_RULES = 24;   // above this many row colours, dots stay static (not sort-safe)
 const WIDTH_STEPS = [10, 11, 12, 13, 14, 16, 18, 20, 22, 24, 28, 32, 36, 40, 45, 50, 60];
 const EXECUTIVE = "Executive";
 const BUILT_IN_STYLES = ["TableStyleMedium2", "TableStyleMedium4", "TableStyleMedium7", "TableStyleMedium1", "TableStyleLight9"];
@@ -108,11 +108,21 @@ function contrast(a, b) {
   return (hi + 0.05) / (lo + 0.05);
 }
 
-/* Where the customer accent goes. A very light accent (white, pale yellow) would vanish
-   on white, so the rule and KPI caps fall back to ink; the sheet tab keeps the accent. */
+/* A colour darkened step by step until it shows clearly on white: pale yellow becomes a
+   deep gold, not black, so the colour stays recognisable */
+function readableOnWhite(argb, min = MIN_RULE_CONTRAST) {
+  let n = parseInt(argb.slice(2), 16);
+  for (let i = 0; i < 12 && contrast("FF" + n.toString(16).padStart(6, "0").toUpperCase(), C.WHITE) < min; i++) {
+    n = (Math.round(((n >> 16) & 255) * 0.88) << 16) | (Math.round(((n >> 8) & 255) * 0.88) << 8) | Math.round((n & 255) * 0.88);
+  }
+  return "FF" + n.toString(16).padStart(6, "0").toUpperCase();
+}
+
+/* Where the customer accent goes: the top rule and KPI caps (a darker shade when the accent
+   is too pale to see on white), and the sheet tab (the accent itself) */
 function accentPlan(argb) {
-  const tooLight = contrast(argb, C.WHITE) < 1.5;
-  return { rule: tooLight ? C.INK : argb, cap: tooLight ? C.INK : argb, tab: argb };
+  const strong = readableOnWhite(argb);
+  return { rule: strong, cap: strong, tab: argb };
 }
 
 /* Every text role's font. Calibri / Calibri Light ship with every Office since 2013,
@@ -295,7 +305,7 @@ const NON_ADDITIVE = /%|\b(avg|average|mean|median|rate|ratio|margin|percent|pct
  * Rules for one measure win over rules for every series; series without a rule keep
  * their series colour, and rows a rule leaves uncoloured keep it too.
  * Returns colours for columnColors: perCol (a colour per row for each ruled column), the
- * remaining series, the row tabs (colour per row and key column) and a caption legend.
+ * remaining series, the row colours by key column and a caption legend.
  */
 function colorRuleRows(rules, t) {
   const { header, data, cols, norm, lower, numeric, hex, seriesCols, findCol, info, seriesColor } = t;
@@ -355,20 +365,15 @@ function colorRuleRows(rules, t) {
   const series = {};
   for (const ci of seriesCols) if (!perCol[ci]) series[ci] = seriesColor(ci);
 
-  // Row tabs follow a key column; they stay right after a sort only if each key has one colour
+  // Row colours by key column (caption and cell fills)
   const keyCol = first.scope === "series" && legendCol >= 0 ? legendCol
     : categoryCol >= 0 ? categoryCol : cols.find((ci) => !numeric[ci] && !hex[ci]) ?? -1;
-  const tabColors = perCol[first.col];
+  const rowColors = perCol[first.col];
   let dot = null;
   if (keyCol >= 0) {
     const byKey = {};
-    let sortSafe = true;
-    data.forEach((r, ri) => {
-      const k = String(r[keyCol] ?? "").trim();
-      if (byKey[k] && byKey[k] !== tabColors[ri]) sortSafe = false;
-      byKey[k] = tabColors[ri];
-    });
-    dot = { keyCol, colorOf: (v) => byKey[v] || null, sortSafe };
+    data.forEach((r, ri) => { byKey[String(r[keyCol] ?? "").trim()] = rowColors[ri]; });
+    dot = { keyCol, colorOf: (v) => byKey[v] || null };
   }
 
   const rule = first.rule;
@@ -382,7 +387,7 @@ function colorRuleRows(rules, t) {
   const note = approx.length
     ? `Colours of "${t.title || "a chart"}" follow a rule on ${approx.join(", ")}, which isn't in the exported data, so they are approximated.`
     : null;
-  return { series, rowCols: Object.keys(perCol).map(Number), perCol, tabColors, rowKey: null, dot, legend, note };
+  return { series, rowCols: Object.keys(perCol).map(Number), perCol, rowColors, rowKey: null, dot, legend, note };
 }
 
 /*
@@ -447,7 +452,7 @@ function columnColors(item, palette, info) {
   if (hexCols.length) {
     const colors = new Set(filled(hexCols[0]).map((x) => x.toUpperCase()));
     const dot = { keyCol: hexCols[0], colorOf: (v) => (HEX_COLOR.test(v) ? toArgb(v) : null) };
-    if (colors.size === 1) {   // one colour for every row: a series colour, no row tabs needed
+    if (colors.size === 1) {   // one colour for every row: a series colour
       const one = toArgb([...colors][0]);
       return { series: Object.fromEntries(seriesCols.map((ci) => [ci, one])), rowCols: [], hexCols, rowKey: null, dot: null, exact };
     }
@@ -478,13 +483,13 @@ function columnColors(item, palette, info) {
   if (info && info.waterfall && seriesCols.length) {
     const w = info.waterfall, ci = seriesCols[0];
     const keyCol = cols.find((c) => !numeric[c] && !hex[c]) ?? -1;
-    const tabColors = data.map((r) => {
+    const rowColors = data.map((r) => {
       const label = keyCol >= 0 ? String(r[keyCol] ?? "").trim() : "";
       const v = toCellValue(r[ci]).value;
       return toArgb(/^total$/i.test(label) ? w.total : typeof v === "number" && v < 0 ? w.decrease : w.increase);
     });
     const legend = { entries: [{ label: "Increase", argb: toArgb(w.increase) }, { label: "Decrease", argb: toArgb(w.decrease) }, { label: "Total", argb: toArgb(w.total) }] };
-    return { series: {}, rowCols: [ci], perCol: { [ci]: tabColors }, tabColors, hexCols, rowKey: null, dot: null, legend, exact };
+    return { series: {}, rowCols: [ci], perCol: { [ci]: rowColors }, rowColors, hexCols, rowKey: null, dot: null, legend, exact };
   }
 
   // 3. Conditional formatting (fx) in the report file: colour scales, rules, colours from a field
@@ -776,6 +781,8 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
     return hex ? toArgb(hex) : null;
   };
   const tinted = (font, i) => (valueColor(i) ? { ...font, color: { argb: valueColor(i) } } : font);
+  // The cap takes the card's own colour from the report, so the tile reads as one unit
+  const cap = valueColor(0) ? readableOnWhite(valueColor(0)) : lay.accent.cap;
 
   let top = r;
   if (kpiHasTitle(item)) {
@@ -837,7 +844,7 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
       const cell = ws.getCell(rr, cc);
       cell.fill = SURFACE_FILL;
       const b = {};
-      if (rr === top) b.top = { style: "medium", color: { argb: lay.accent.cap } };
+      if (rr === top) b.top = { style: "medium", color: { argb: cap } };
       if (rr === last) b.bottom = LIGHT_RULE;
       if (divider && cc === col) b.left = LIGHT_RULE;
       if (b.top || b.bottom || b.left) cell.border = b;
@@ -1122,10 +1129,8 @@ function textOn(argb) {
  * Paints a chart table in the chart's colours:
  *  - series drawn in one colour: the header cell becomes a band in that colour and every
  *    value cell below is filled with it
- *  - rows coloured by a field (legend, pie, treemap) or a hex column: each row's value
- *    cells are filled with the row's colour (Excel moves fills along when sorting), and
- *    the row gets a colour tab in the column left of the table, painted by paintRowTabs
- *    once column widths are known (lay.pendingTabs)
+ *  - rows coloured by a field (legend, pie, treemap), a rule or a hex column: each row's
+ *    value cells are filled with the row's colour (Excel moves fills along when sorting)
  * Text on a filled cell is white or ink, whichever reads better.
  */
 function applyVisualColors(ws, hr, col, item, colors, lay) {
@@ -1157,63 +1162,14 @@ function applyVisualColors(ws, hr, col, item, colors, lay) {
 
   const dot = colors.dot;
   if (!dot && !colors.perCol) return;
-  const tabs = dot ? { g: col - 1, keyCol: col + dot.keyCol, first, last, cells: [], seen: new Map(), noRules: dot.sortSafe === false } : null;
   data.forEach((row, ri) => {
     const key = dot ? (row[dot.keyCol] ?? "").trim() : "";
-    const argb = colors.tabColors ? colors.tabColors[ri] : key ? dot.colorOf(key) : null;
+    const argb = key ? dot.colorOf(key) : null;
     for (const ci of colors.rowCols) {
       const cellColor = colors.perCol && colors.perCol[ci] ? colors.perCol[ci][ri] : argb;
       if (cellColor) fillCell(ws.getCell(first + ri, col + ci), cellColor);
     }
-    if (!argb) return;
-    if (!tabs) return;
-    tabs.cells.push([first + ri, argb]);
-    if (key && !tabs.seen.has(key)) tabs.seen.set(key, argb);
   });
-  if (!tabs) return;
-  if (tabs.g >= 1 && tabs.cells.length && lay.pendingTabs) lay.pendingTabs.push(tabs);
-}
-
-/*
- * Row colour tabs, painted once column widths are known. In a narrow gutter a tab is a
- * filled cell; where the column is wider (another band's data column) it is a swatch
- * glyph at the right edge, so it never becomes a wide coloured block. The tabs aren't part
- * of the table, so up to MAX_CF_RULES colours conditional formatting alone colours each
- * tab from its own row's key cell, and tabs stay right after a sort or filter (rows with
- * no colour stay blank). Above that the colours are static.
- */
-function paintRowTabs(ws, pendingTabs, fonts) {
-  for (const t of pendingTabs) {
-    const narrow = (ws.getColumn(t.g).width || GUTTER_W) <= GUTTER_W + 0.01;
-    const K = ws.getColumn(t.keyCol).letter;
-    let rules = !t.noRules && t.seen.size <= MAX_CF_RULES ? [] : null;
-    for (const [key, argb] of rules ? t.seen : []) {
-      const typed = toCellValue(key).value;
-      const literal = typeof typed === "number" ? String(typed) : `"${String(key).replace(/"/g, '""')}"`;
-      if (literal.length > 250) { rules = null; break; }
-      rules.push({
-        type: "expression",
-        formulae: [`$${K}${t.first}=${literal}`],
-        style: narrow ? { fill: { type: "pattern", pattern: "solid", bgColor: { argb } } } : { font: { color: { argb } } },
-      });
-    }
-    const align = { horizontal: "right", vertical: "middle" };
-    for (const [r, argb] of t.cells) {
-      const cell = ws.getCell(r, t.g);
-      if (narrow) {
-        if (!rules) cell.fill = solidFill(argb);
-        cell.border = GAP_BORDER;
-      } else {
-        cell.value = KEY_GLYPH;
-        cell.font = fonts.dot(rules ? C.WHITE : argb);   // with rules, only matching rows show a colour
-        cell.alignment = align;
-      }
-    }
-    if (rules && rules.length) {
-      const G = ws.getColumn(t.g).letter;
-      ws.addConditionalFormatting({ ref: `${G}${t.first}:${G}${t.last}`, rules });
-    }
-  }
 }
 
 /* ── Page layout ──────────────────────────────────────────────────────── */
@@ -1364,7 +1320,6 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
   }
   const executive = !BUILT_IN_STYLES.includes(lay.tableStyle);
-  const hasTab = (it) => !it.isKpi && !!(it.colors && it.colors.dot);
 
   const bands = stacked
     ? groupIntoBands(items).flatMap((b) => [...b.items].sort((a, c) => a.layout.x - c.layout.x).map((it) => ({ items: [it] })))
@@ -1391,10 +1346,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     }
     let cursorCol = CONTENT_COL;
     stacks.forEach((stack, stackIndex) => {
-      // Row colour tabs sit in the column left of a table: keep a blank gutter before them,
-      // so they don't touch the visual to the left
-      // (lining up with an earlier visual at the same x wins; paintRowTabs copes with wide columns)
-      let col = cursorCol + (stackIndex > 0 && stack.items.some(hasTab) ? 1 : 0);
+      let col = cursorCol;
       if (!stacked && !allCards) {
         const anchor = anchors.find((a) => Math.abs(a.x - stack.left) <= SNAP_PX && a.col >= cursorCol);
         if (anchor) col = anchor.col;
@@ -1635,7 +1587,6 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
     tableStyle: branding.tableStyle || EXECUTIVE,
     palette: options.matchColors ? options.palette : null,
     reportColors: options.matchColors ? options.reportColors || null : null,
-    pendingTabs: [],   // row colour tabs, painted once column widths are known
   };
   const ws = wb.addWorksheet(sheetName, {
     views: [{ showGridLines: false, zoomScale: 100 }],
@@ -1732,9 +1683,8 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
     Math.ceil(metaText.length * 0.9) + 6, Math.ceil(longestFilterLine * 0.9) + 6);
   const { contentEnd, bandEnd } = widths.apply(ws, Math.max(layout.lastCol, B), minPage);
 
-  // 4. Rules and fills, row colour tabs
+  // 4. Rules and fills
   paintRange(ws, 1, 1, bandEnd, { fill: solidFill(accent.rule) });
-  paintRowTabs(ws, lay.pendingTabs, fonts);
   paintRange(ws, metaRow, B, contentEnd, { border: { bottom: INK_RULE } });
   for (const fr of filterRows) paintRange(ws, fr, B, contentEnd, { fill: SURFACE_FILL });
   if (emptyRow) paintRange(ws, emptyRow, B, contentEnd, { fill: SURFACE_FILL });
@@ -1883,6 +1833,13 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
     }
     if (isCancelled()) throw { cancelled: true };
     if (colorNote && collected.length) collected[0].data.notes.push(colorNote);
+  }
+
+  // "Match the report" accent: the report theme's main colour, else a neutral navy
+  if (branding.accentAuto) {
+    if (!theme) theme = await readThemeColors();
+    const main = options.reportColors ? options.reportColors.palette[0] : theme.fromReport ? theme.colors[0] : null;
+    branding = { ...branding, accent: main || "#" + NEUTRAL_ACCENT.slice(2) };
   }
 
   const exportTime = new Date();

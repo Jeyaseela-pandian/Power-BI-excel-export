@@ -170,6 +170,10 @@ legend + * { clear: both; }
 .field-row { display: flex; gap: 16px; }
 .field-row .field { flex: 1; }
 .field-row .field:first-child { flex: none; }
+.accent-row { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
+.accent-row input[type="color"] { margin-top: 0; }
+.accent-row .choice { padding: 0; font-weight: 400; }
+.accent-row input[type="color"]:disabled { opacity: 0.4; }
 .logo-row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 6px; font-weight: 400; }
 .logo-row input[type="file"] { max-width: 100%; min-width: 0; }
 .logo-row img { height: 40px; max-width: 140px; object-fit: contain; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 4px; background: #fff; }

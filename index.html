@@ -199,8 +199,12 @@
         </div>
       </div>
       <div class="field-row">
-        <label class="field">Accent colour
-          <input type="color" id="brandAccent"></label>
+        <div class="field">Accent colour
+          <div class="accent-row">
+            <input type="color" id="brandAccent" aria-label="Accent colour">
+            <label class="choice"><input type="checkbox" id="brandAccentAuto"> <span>Match the report</span></label>
+          </div>
+        </div>
         <label class="field">Table style
           <select id="brandTableStyle">
             <option value="Executive">Executive (recommended)</option>
@@ -211,7 +215,7 @@
             <option value="TableStyleLight9">Classic blue, light body</option>
           </select></label>
       </div>
-      <p class="muted">The accent is used for the top rule, KPI tile caps and sheet tabs – never for text.</p>
+      <p class="muted">The accent is used for the top rule, KPI tile caps and sheet tabs – never for text. "Match the report" uses the report's main colour. Tiles for cards coloured in the report take the card's own colour.</p>
       <label class="field">Title font
         <select id="brandTitleFont">
           <option value="Calibri Light">Calibri Light (modern)</option>

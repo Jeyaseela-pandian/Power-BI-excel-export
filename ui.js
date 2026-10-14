@@ -26,11 +26,12 @@ const DEFAULT_BRANDING = {
   logo: null,              // data URL
   logoWidth: 0,
   logoHeight: 0,
-  accent: "#0B7F56",
+  accent: "#1F3A5F",        // used when accentAuto is off
+  accentAuto: true,         // accent = the report's main colour
   tableStyle: "Executive", // "Executive" (ruled, no fills) or a built-in Excel TableStyle name
   titleFont: "Calibri Light",
   footer: "",
-  v: 2,                    // settings version, for migrateBranding
+  v: 3,                    // settings version, for migrateBranding
 };
 
 // Storage can be unavailable (private windows, blocked site data): fall back to defaults
@@ -57,12 +58,20 @@ let exportOptions = loadJson(OPTIONS_KEY, DEFAULT_OPTIONS);
 let branding = migrateBranding(loadJson(BRANDING_KEY, { ...DEFAULT_BRANDING, v: 1 }));
 
 /*
- * Settings saved before the Boardroom design (v < 2): the old default blue accent
- * becomes the new default, and old table style choices map to what their labels now
- * show (the earlier labels didn't match ExcelJS's built-in theme colours).
+ * Older saved settings:
+ *  - before the Boardroom design (v < 2): old table style choices map to what their labels
+ *    now show (the earlier labels didn't match ExcelJS's built-in theme colours)
+ *  - before "match the report" (v < 3): an accent left at an old default (#1A73E8 blue,
+ *    #0B7F56 green) now follows the report; an accent the user picked is kept
  */
 function migrateBranding(b) {
-  if ((b.v || 1) >= 2) return b;
+  if ((b.v || 1) >= 3) return b;
+  const oldDefault = ["#1A73E8", "#0B7F56"].includes(String(b.accent || "").toUpperCase());
+  if ((b.v || 1) >= 2) {
+    const migrated = { ...b, accentAuto: oldDefault, accent: oldDefault ? "#1F3A5F" : b.accent, v: 3 };
+    saveJson(BRANDING_KEY, migrated);
+    return migrated;
+  }
   const styles = {
     TableStyleMedium2: "Executive",
     TableStyleMedium7: "TableStyleMedium4",   // was labelled "Green"
@@ -72,10 +81,11 @@ function migrateBranding(b) {
   };
   const migrated = {
     ...b,
-    accent: String(b.accent || "").toUpperCase() === "#1A73E8" ? "#0B7F56" : b.accent,
+    accentAuto: oldDefault || !b.accent,
+    accent: oldDefault || !b.accent ? "#1F3A5F" : b.accent,
     tableStyle: styles[b.tableStyle] || b.tableStyle || "Executive",
     titleFont: b.titleFont || "Calibri Light",
-    v: 2,
+    v: 3,
   };
   saveJson(BRANDING_KEY, migrated);
   return migrated;
@@ -264,6 +274,8 @@ let pendingLogo = null; // { logo, logoWidth, logoHeight } while the dialog is o
 function openSettings() {
   $("brandCompany").value = branding.companyName;
   $("brandAccent").value = branding.accent;
+  $("brandAccentAuto").checked = !!branding.accentAuto;
+  $("brandAccent").disabled = !!branding.accentAuto;
   $("brandTableStyle").value = branding.tableStyle;
   $("brandTitleFont").value = branding.titleFont;
   $("brandFooter").value = branding.footer;
@@ -300,10 +312,11 @@ function saveSettings() {
   branding = {
     companyName: $("brandCompany").value.trim(),
     accent: $("brandAccent").value,
+    accentAuto: $("brandAccentAuto").checked,
     tableStyle: $("brandTableStyle").value,
     titleFont: $("brandTitleFont").value,
     footer: $("brandFooter").value.trim(),
-    v: 2,
+    v: 3,
     ...pendingLogo,
   };
   if (!saveJson(BRANDING_KEY, branding)) {
@@ -482,6 +495,7 @@ document.addEventListener("keydown", (e) => {
 
 $("openSettings").addEventListener("click", openSettings);
 $("brandLogo").addEventListener("change", (e) => readLogoFile(e.target.files[0]));
+$("brandAccentAuto").addEventListener("change", () => { $("brandAccent").disabled = $("brandAccentAuto").checked; });
 $("brandLogoRemove").addEventListener("click", () => {
   pendingLogo = { logo: null, logoWidth: 0, logoHeight: 0 };
   $("brandLogo").value = "";

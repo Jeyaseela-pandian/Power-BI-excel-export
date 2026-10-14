@@ -233,6 +233,13 @@
       if (cell.value === 7 && cell.font && cell.font.bold) costValue = hexOf(cell.font.color.argb);
     }));
     t("card: value colour set by hand", salesValue === "#123456", salesValue);
+    // The card's tile cap takes its value colour (a top border on the pale tile fill)
+    let capColor = null;
+    ws.eachRow((row) => row.eachCell((cell) => {
+      const b = cell.border && cell.border.top;
+      if (!capColor && b && b.style === "medium" && cell.fill && cell.fill.fgColor && cell.fill.fgColor.argb === "FFF3F5F8" && cell.value === "SALES") capColor = hexOf(b.color.argb);
+    }));
+    t("card: tile cap in the card's colour", capColor === "#123456", capColor);
     t("card: value colour from a rule", costValue === "#00AA00", costValue);
     return res;
   }

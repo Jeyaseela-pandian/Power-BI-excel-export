@@ -176,10 +176,10 @@ exported when picked on purpose.
 | Total Sales (card) | A scorecard tile: accent cap on top, `TOTAL SALES` label, large value `2,517,775.17`; no "Card" title. Cards on one row join into one strip |
 | All tables | Same frame everywhere: pale header with an ink rule above it, hairlines between rows, a closing ink rule; numbers with thousands separators (e.g. `93,687.30`); Month Sort stays `202401`. Only chart values are coloured, never text columns |
 | Sales and cost by month | Caption key **■ red** Total Sales, **■ blue** Total Cost. The *Total Sales* header and every value under it are filled **red** with white text; *Total Cost* **blue** |
-| Sales by segment | Caption key **■ red** Consumer, **■ blue** Corporate, **■ green** Home Office. Each *Total Sales* value is filled in its segment's colour, and a colour tab fills the cell left of each row. Sort the table: the fills move with their rows and the tabs re-colour to match |
+| Sales by segment | Caption key **■ red** Consumer, **■ blue** Corporate, **■ green** Home Office. Each *Total Sales* value is filled in its segment's colour. Sort the table: the fills move with their rows |
 | Sales by category (custom colour) | With exact colours: the *Total Sales* header and values filled **black** (`#000000`) with white text, as in the report. Without the permission: **red** (theme colour 1) and a note at the bottom: *Chart colours follow the report theme…* |
-| Deneb sales | Title built from the data (e.g. *Total Sales by Month*, as "Deneb" says nothing); caption `■ Total Sales · row colours from Bar Color` in **green**; the *Total Sales* header and values filled green. No row tabs: every row has the same colour |
-| Sales by category tiles (treemap) | Each *Total Sales* value filled in its tile's colour, with a matching colour tab beside the row: **Apparel red, Electronics blue, Furniture green, Office Supplies purple** (in the order the categories appear in the export) |
+| Deneb sales | Title built from the data (e.g. *Total Sales by Month*, as "Deneb" says nothing); caption `■ Total Sales · row colours from Bar Color` in **green**; the *Total Sales* header and values filled green |
+| Sales by category tiles (treemap) | Each *Total Sales* value filled in its tile's colour: **Apparel red, Electronics blue, Furniture green, Office Supplies purple** (in the order the categories appear in the export) |
 | Category summary (table) | Caption `Table · 4 rows`, no colour keys |
 | Sales by category and year (matrix) | Caption `Matrix · 4 rows`, flat rows (matrix layout isn't rebuilt) |
 | Footer and print | Footer line `Source: Power BI · Export colour test`; File → Print shows landscape, one page wide, page numbers in the footer |
@@ -191,9 +191,9 @@ exported when picked on purpose.
 
 | Test | Expected |
 | --- | --- |
-| *Match the report's chart colours* off | No colours at all: no keys, fills or tabs; captions read `Line chart · 24 rows` etc. |
-| Branding → Table style *Classic blue* | Tables use Excel's blue table style (blue header, stripes) with no ink rules; series headers, value fills and tabs still in the report colours |
-| Branding → a very pale accent (e.g. `#FFF200`) | The top rule and KPI caps turn ink-dark so they stay visible; the sheet tab keeps the pale accent |
+| *Match the report's chart colours* off | No colours at all: no keys or fills; captions read `Line chart · 24 rows` etc. |
+| Branding → Table style *Classic blue* | Tables use Excel's blue table style (blue header, stripes) with no ink rules; series headers and value fills still in the report colours |
+| Branding → a very pale accent (e.g. `#FFF200`) | The top rule and KPI caps use a darker shade of the accent (deep gold) so they stay visible; the sheet tab keeps the pale accent |
 | Export options → *Number visuals* | Titles read `01  Sales and cost by month`, `02  …` |
 | Open in desktop Excel | No repair prompt; every table's filter and sort buttons work |
 
