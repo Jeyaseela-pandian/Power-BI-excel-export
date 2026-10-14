@@ -271,6 +271,104 @@ function seriesOrder(data, keyCol, groupCols) {
 }
 
 /*
+ * Evaluates an fx colour rule (colors.js parseColorRule) for every row of a chart table.
+ * The rule's input is a column of the table; else a column whose name holds all its words
+ * ("Profit %" → "Profit Margin %"); else, for a rule per legend value, the legend order
+ * (Power BI's scale over e.g. "Latest year" follows the years). Blank inputs count as zero,
+ * Power BI's default. The last two are approximations and add a note.
+ * Returns colours for columnColors: perRow (one colour per row), the filled columns, the
+ * tab key, and a caption legend (the scale, or one entry per rule).
+ */
+function colorRuleRows({ scope, rule }, t) {
+  const { header, data, cols, norm, lower, numeric, hex, seriesCols, findCol, info, seriesColor } = t;
+  const targets = scope.startsWith("m:") ? seriesCols.filter((ci) => "m:" + norm[ci] === scope) : seriesCols;
+  if (!targets.length || !data.length) return null;
+  let approx = false;
+  const resolve = (input) => {
+    const ci = findCol({ ref: input.toLowerCase() });
+    if (ci >= 0 && numeric[ci]) return ci;
+    const words = input.toLowerCase().split(/\s+/).filter(Boolean);
+    const close = cols.filter((c) => numeric[c] && words.every((w) => lower[c].split(/\s+/).includes(w)));
+    if (close.length === 1) { approx = true; return close[0]; }
+    return -1;
+  };
+  const num = (ri, ci) => { const v = toCellValue(data[ri][ci]).value; return typeof v === "number" ? v : 0; };
+  const legendCol = info.series ? findCol(info.series) : -1;
+  const categoryCol = findCol(info.category);
+  const keyCol = scope === "series" && legendCol >= 0 ? legendCol
+    : categoryCol >= 0 ? categoryCol : cols.find((ci) => !numeric[ci] && !hex[ci]) ?? -1;
+  // A category hierarchy (Group, then Region) exports every level, but the chart shows its
+  // first level: one bar per Group, coloured by that Group's total. Rows are coloured by
+  // their group's total, so the table matches the bars (not for percentages, which don't add up).
+  const levels = (info.categories || []).map((f) => findCol(f)).filter((ci) => ci >= 0);
+  const grouped = scope !== "series" && levels.length > 1 && levels[0] === categoryCol;
+
+  let perRow, legend, inputName = rule.input;
+  if (rule.kind === "gradient") {
+    const inputCol = resolve(rule.input);
+    let values;
+    if (inputCol >= 0) {
+      values = data.map((_, ri) => num(ri, inputCol));
+      inputName = header[inputCol];
+      const percent = data.some((r) => String(r[inputCol] ?? "").trim().endsWith("%"));
+      if (grouped && !percent) {
+        const totals = {};
+        const groupOf = (r) => (r[categoryCol] ?? "").trim();
+        data.forEach((r, ri) => { totals[groupOf(r)] = (totals[groupOf(r)] || 0) + values[ri]; });
+        values = data.map((r) => totals[groupOf(r)]);
+      }
+    } else if (scope === "series" && legendCol >= 0) {
+      const order = seriesOrder(data, legendCol, cols.filter((ci) => ci !== legendCol && !seriesCols.includes(ci) && !hex[ci]));
+      values = data.map((r) => order.indexOf((r[legendCol] ?? "").trim()));
+      approx = true;
+    } else {
+      return null;
+    }
+    const lo = rule.min.value ?? Math.min(...values), hi = rule.max.value ?? Math.max(...values);
+    const hasMid = rule.mid && rule.mid.color;
+    const mid = hasMid ? (rule.mid.value ?? (lo + hi) / 2) : null;
+    const part = (v, a, b) => (b === a ? 1 : Math.max(0, Math.min(1, (v - a) / (b - a))));
+    const at = (v) => (hasMid
+      ? (v <= mid ? mixHex(rule.min.color, rule.mid.color, part(v, lo, mid)) : mixHex(rule.mid.color, rule.max.color, part(v, mid, hi)))
+      : mixHex(rule.min.color, rule.max.color, part(v, lo, hi)));
+    perRow = values.map((v) => toArgb(at(v)));
+    legend = { scale: [rule.min.color, hasMid ? rule.mid.color : null, rule.max.color].filter(Boolean).map((c) => toArgb(c)), label: `Colour scale on ${inputName}` };
+  } else {
+    const test = (c, ri) => {
+      if (c.and) return c.and.every((x) => test(x, ri));
+      const ci = resolve(c.input);
+      if (ci < 0) return false;
+      const v = num(ri, ci);
+      return [v === c.value, v > c.value, v >= c.value, v <= c.value, v < c.value][c.op] || false;
+    };
+    const base = seriesColor(targets[0]);
+    perRow = data.map((_, ri) => { const hit = rule.cases.find((c) => test(c.test, ri)); return hit ? toArgb(hit.color) : base; });
+    const ops = ["=", ">", "≥", "≤", "<"];
+    const describe = (c) => (c.and ? c.and.map(describe).join(" and ") : `${ops[c.op] || "?"} ${c.value}`);
+    const firstCol = resolve(rule.input);
+    inputName = firstCol >= 0 ? header[firstCol] : rule.input;
+    legend = { entries: rule.cases.map((c) => ({ label: `${inputName} ${describe(c.test)}`, argb: toArgb(c.color) })) };
+  }
+
+  // Tabs follow a key column; they stay right after a sort only if each key has one colour
+  let dot = null;
+  if (keyCol >= 0) {
+    const byKey = {};
+    let sortSafe = true;
+    data.forEach((r, ri) => {
+      const k = (r[keyCol] ?? "").trim();
+      if (byKey[k] && byKey[k] !== perRow[ri]) sortSafe = false;
+      byKey[k] = perRow[ri];
+    });
+    dot = { keyCol, colorOf: (v) => byKey[v] || null, sortSafe };
+  }
+  const note = approx
+    ? `Colours of "${t.title || "a chart"}" follow a rule on ${rule.input}, which isn't in the exported data, so they are approximated.`
+    : null;
+  return { series: {}, rowCols: targets, rowKey: null, dot, perRow, legend, note };
+}
+
+/*
  * Works out the colours of a chart's table, to match the chart. Returns null for cards,
  * table / matrix visuals, or when there is no palette. Sources, best first:
  *  1. A column of hex colours (e.g. a Deneb "Bar Color" field) is what the visual draws
@@ -318,9 +416,11 @@ function columnColors(item, palette, info) {
       if (ci >= 0 && numeric[ci] && !hex[ci]) { seriesCols.push(ci); fieldOf[ci] = m; indexOf[ci] = i; }
     });
   }
+  // Whole years (2024) are a category such as a legend or axis, never a series
+  const yearLike = cols.map((ci) => numeric[ci] && filled(ci).every((x) => /^(19|20)\d\d$/.test(x)));
   if (!seriesCols.length) {
     const tooltips = new Set((info && info.tooltips) || []);
-    seriesCols = cols.filter((ci) => ci > 0 && !hex[ci] && !helper[ci] && numeric[ci] && !tooltips.has(norm[ci]));
+    seriesCols = cols.filter((ci) => ci > 0 && !hex[ci] && !helper[ci] && numeric[ci] && !yearLike[ci] && !tooltips.has(norm[ci]));
     seriesCols.forEach((ci, i) => { indexOf[ci] = i; });
   }
   if (!seriesCols.length && !hexCols.length) return null;
@@ -357,7 +457,14 @@ function columnColors(item, palette, info) {
     return { col: keyCol, colorOf: Object.fromEntries(values.map((v, i) => [v, colorOfValue(v, i)])) };
   };
 
-  // 2. Rows coloured by a field: the legend (Series) or, for pie / donut / treemap, the category
+  // 2. Conditional formatting (fx) in the report file: colour scales and rules, row by row
+  const fx = info && (info.rules || []).find((r) => r.scope === "all" || r.scope === "series" || seriesCols.some((ci) => "m:" + norm[ci] === r.scope));
+  if (fx) {
+    const result = colorRuleRows(fx, { header, data, cols, norm, lower, numeric, hex, seriesCols, findCol, info, seriesColor, title: item.displayTitle || item.title });
+    if (result) return { ...result, hexCols, exact };
+  }
+
+  // 3. Rows coloured by a field: the legend (Series) or, for pie / donut / treemap, the category
   let rowKey = null;
   if (info && (info.rule === "legend" || info.rule === "item")) {
     let keyCol = findCol(info.rule === "legend" ? info.series : info.category);
@@ -373,7 +480,7 @@ function columnColors(item, palette, info) {
     if (COLOR_BY_CATEGORY_TYPES.includes(item.type) && !numeric[0]) {
       keyCol = 0;
     } else if (seriesCols.length === 1) {
-      const textCols = cols.filter((ci) => ci > 0 && !hex[ci] && !numeric[ci]);
+      const textCols = cols.filter((ci) => ci > 0 && !hex[ci] && (!numeric[ci] || yearLike[ci]));
       if (textCols.length === 1) { keyCol = textCols[0]; legend = true; }
     }
     if (keyCol !== null) {
@@ -621,6 +728,14 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
   const cells = header.map((_, i) => toCellValue(values[i]));
   const formats = readableFormats(header, [cells]);
   const fmtOf = (i) => formats[i] || cells[i].numFmt || null;
+  // The value colours set on the card in the report, when the report file was read
+  const info = lay.reportColors && item.name ? lay.reportColors.visuals[item.name] : null;
+  const valueColor = (i) => {
+    const vc = (info && info.valueColors) || {};
+    const hex = vc["m:" + normalizeField(header[i])] || vc.all;
+    return hex ? toArgb(hex) : null;
+  };
+  const tinted = (font, i) => (valueColor(i) ? { ...font, color: { argb: valueColor(i) } } : font);
 
   let top = r;
   if (kpiHasTitle(item)) {
@@ -649,7 +764,7 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
   const v = ws.getCell(top + 1, col);
   v.value = hero.value;
   if (compact || heroFmt) v.numFmt = compact || heroFmt;
-  v.font = fonts.kpiValue;
+  v.font = tinted(fonts.kpiValue, 0);
   v.alignment = { horizontal: "left", vertical: "middle", indent: 1 };
 
   let next = top + 3;
@@ -670,7 +785,7 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
     const sv = ws.getCell(next, col + 1);
     sv.value = cells[i].value;
     if (fmtOf(i)) sv.numFmt = fmtOf(i);
-    sv.font = fonts.kpiSubValue;
+    sv.font = tinted(fonts.kpiSubValue, i);
     sv.alignment = { horizontal: "right", vertical: "middle", indent: 1 };
     widths.want(col, Math.min(30, String(header[i]).length + 3));
     widths.want(col + 1, displayText(cells[i].value, fmtOf(i)).length + 3);
@@ -713,6 +828,15 @@ function captionRuns(item, colors, header, fonts, units) {
     }
     return { runs, shown };
   };
+
+  if (colors.legend && colors.legend.scale) {
+    return [...colors.legend.scale.map((argb) => [KEY_GLYPH, fonts.dot(argb)]), ["  " + colors.legend.label, fonts.caption]];
+  }
+  if (colors.legend && colors.legend.entries) {
+    const { runs, shown } = legend(colors.legend.entries);
+    if (shown < colors.legend.entries.length) runs.push([`+${colors.legend.entries.length - shown} more`, fonts.captionMore]);
+    return runs;
+  }
 
   if (colors.rowKey) {
     const entries = Object.entries(colors.rowKey.colorOf).map(([label, argb]) => ({ label, argb }));
@@ -874,16 +998,18 @@ function applyVisualColors(ws, hr, col, item, colors, lay) {
   }
 
   const dot = colors.dot;
-  if (!dot) return;
-  const tabs = { g: col - 1, keyCol: col + dot.keyCol, first, last, cells: [], seen: new Map() };
+  if (!dot && !colors.perRow) return;
+  const tabs = dot ? { g: col - 1, keyCol: col + dot.keyCol, first, last, cells: [], seen: new Map(), noRules: dot.sortSafe === false } : null;
   data.forEach((row, ri) => {
-    const key = (row[dot.keyCol] ?? "").trim();
-    const argb = key ? dot.colorOf(key) : null;
+    const key = dot ? (row[dot.keyCol] ?? "").trim() : "";
+    const argb = colors.perRow ? colors.perRow[ri] : key ? dot.colorOf(key) : null;
     if (!argb) return;
     if (lay.colorCells) for (const ci of colors.rowCols) fillCell(ws.getCell(first + ri, col + ci), argb);
+    if (!tabs) return;
     tabs.cells.push([first + ri, argb]);
-    if (!tabs.seen.has(key)) tabs.seen.set(key, argb);
+    if (key && !tabs.seen.has(key)) tabs.seen.set(key, argb);
   });
+  if (!tabs) return;
   if (tabs.g >= 1 && tabs.cells.length && lay.pendingTabs) lay.pendingTabs.push(tabs);
 }
 
@@ -899,7 +1025,7 @@ function paintRowTabs(ws, pendingTabs, fonts) {
   for (const t of pendingTabs) {
     const narrow = (ws.getColumn(t.g).width || GUTTER_W) <= GUTTER_W + 0.01;
     const K = ws.getColumn(t.keyCol).letter;
-    let rules = t.seen.size <= MAX_CF_RULES ? [] : null;
+    let rules = !t.noRules && t.seen.size <= MAX_CF_RULES ? [] : null;
     for (const [key, argb] of rules ? t.seen : []) {
       const typed = toCellValue(key).value;
       const literal = typeof typed === "number" ? String(typed) : `"${String(key).replace(/"/g, '""')}"`;
@@ -1062,6 +1188,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
 
   // Titles (generic ones described from their columns, duplicates numbered) and colours
   const usedTitles = {};
+  const colorNotes = [];
   for (const item of items) {
     let title = isGenericTitle(item.title, item.type) ? (item.isKpi ? null : describeTitle(item)) : item.title;
     if (title) {
@@ -1072,6 +1199,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     item.displayTitle = title;
     const info = lay.reportColors && item.name ? lay.reportColors.visuals[item.name] || null : null;
     item.colors = lay.palette && !item.isKpi ? columnColors(item, lay.palette, info) : null;
+    if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
   }
   const executive = !BUILT_IN_STYLES.includes(lay.tableStyle);
   const hasTab = (it) => !it.isKpi && !!(it.colors && it.colors.dot);
@@ -1178,7 +1306,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     if (hidden) pendingNotes.push({ row: t.noteRow, col: t.col, w: t.w, n: t.n, hidden });
   }
 
-  return { nextRow, lastCol, tableCount: tables.length, grouped, pendingNotes };
+  return { nextRow, lastCol, tableCount: tables.length, grouped, pendingNotes, colorNotes };
 }
 
 /* ── Collecting a page ────────────────────────────────────────────────── */
@@ -1475,6 +1603,7 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
   }
 
   // 7. Notes block and footer
+  if (layout.colorNotes) data.notes.push(...layout.colorNotes);
   row = layout.nextRow;
   if (options.includeNotes && data.notes.length) {
     row += 2;

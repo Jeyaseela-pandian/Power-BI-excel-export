@@ -64,10 +64,14 @@ function normalizeValue(text) {
 }
 
 /* A colour set on a visual: "#01B8AA", or a theme colour with an optional lighter / darker
-   shade. Theme colour ids: 0 = background, 1 = text (foreground), 2 onwards = data colours.
-   Rules (conditional formatting, "fx") return null: their colours depend on the data. */
+   shade. Theme colour ids: 0 = white and 1 = black (the picker's first two columns, the same
+   in every theme: "white, 20% darker" is #CCCCCC even in a dark theme), 2 onwards = data colours.
+   Rules (conditional formatting, "fx") return null here: see parseColorRule. */
 function colorFromFill(fill, theme) {
-  const e = fill && fill.solid && fill.solid.color && fill.solid.color.expr;
+  return colorFromExpr(fill && fill.solid && fill.solid.color && fill.solid.color.expr, theme);
+}
+
+function colorFromExpr(e, theme) {
   if (!e) return null;
   if (e.Literal) {
     const hex = String(e.Literal.Value).replace(/'/g, "");
@@ -75,13 +79,80 @@ function colorFromFill(fill, theme) {
   }
   if (e.ThemeDataColor) {
     const id = e.ThemeDataColor.ColorId, pct = e.ThemeDataColor.Percent || 0;
-    const base = id === 0 ? theme.background
-      : id === 1 ? theme.foreground
+    const base = id === 0 ? "#FFFFFF"
+      : id === 1 ? "#000000"
         : theme.dataColors[(id - 2) % theme.dataColors.length];
     if (!base) return null;
     return pct ? mixHex(base, pct < 0 ? "#000000" : "#FFFFFF", Math.abs(pct)) : base.toUpperCase();
   }
   return null;
+}
+
+/* ── Conditional formatting ("fx") colour rules ───────────────────────────
+ * Kept as data and evaluated per row by export.js (colorRuleRows), because the colour
+ * depends on each data point's values:
+ *  { kind: "gradient", input, min, mid, max }   stops: { color, value|null }
+ *  { kind: "conditional", input, cases: [{ test, color }] }
+ * input is the name of the measure / column the rule reads, as the report spells it.
+ */
+function refName(x) {
+  if (!x) return null;
+  const inner = x.Measure || x.Column || (x.Aggregation && (x.Aggregation.Expression.Column || x.Aggregation.Expression.Measure));
+  if (inner && inner.Property) return String(inner.Property);
+  if (x.HierarchyLevel && x.HierarchyLevel.Level) return String(x.HierarchyLevel.Level);
+  return null;
+}
+
+function literalValue(x) {
+  if (!x || !x.Literal) return null;
+  const v = String(x.Literal.Value);
+  const num = v.match(/^(-?\d+(?:\.\d+)?(?:E[+-]?\d+)?)[LDM]?$/i);
+  if (num) return Number(num[1]);
+  return normalizeValue(v);
+}
+
+/* ComparisonKind: 0 =, 1 >, 2 >=, 3 <=, 4 < */
+function parseCondition(c) {
+  if (!c) return null;
+  if (c.Comparison) {
+    const input = refName(c.Comparison.Left);
+    const value = literalValue(c.Comparison.Right);
+    return input && value !== null ? { input, op: c.Comparison.ComparisonKind, value } : null;
+  }
+  if (c.And) {
+    const a = parseCondition(c.And.Left), b = parseCondition(c.And.Right);
+    return a && b ? { and: [a, b], input: a.input } : null;
+  }
+  return null;
+}
+
+function parseColorRule(fill, theme) {
+  const e = fill && fill.solid && fill.solid.color && fill.solid.color.expr;
+  if (!e) return null;
+  if (e.FillRule) {
+    const fr = e.FillRule.FillRule || {};
+    const g = fr.linearGradient3 || fr.linearGradient2;
+    const input = refName(e.FillRule.Input);
+    if (!g || !input) return null;
+    const stop = (st) => (st ? { color: colorFromExpr(st.color, theme), value: st.value ? literalValue(st.value) : null } : null);
+    const rule = { kind: "gradient", input, min: stop(g.min), mid: stop(g.mid), max: stop(g.max) };
+    return rule.min && rule.min.color && rule.max && rule.max.color ? rule : null;
+  }
+  if (e.Conditional) {
+    const cases = (e.Conditional.Cases || []).map((c) => ({ test: parseCondition(c.Condition), color: colorFromExpr(c.Value, theme) }))
+      .filter((c) => c.test && c.color);
+    return cases.length ? { kind: "conditional", input: cases[0].test.input, cases } : null;
+  }
+  return null;
+}
+
+/* Which data points a rule colours: every point / category ("all"), each legend value
+   ("series"), or one measure ("m:<field>") */
+function ruleScope(selector) {
+  if (!selector) return "all";
+  if (selector.metadata) return "m:" + normalizeField(selector.metadata);
+  const roles = (selector.data || []).flatMap((d) => d.roles || []);
+  return roles.includes("Series") ? "series" : "all";
 }
 
 /* Which data points a colour set by hand applies to:
@@ -163,7 +234,8 @@ function legacyVisual(config) {
       label: props[p.queryRef] && props[p.queryRef].displayName ? String(props[p.queryRef].displayName).toLowerCase() : null,
     }));
   }
-  return { type: sv.visualType, roles, dataPoint: (sv.objects || {}).dataPoint || [] };
+  const o = sv.objects || {};
+  return { type: sv.visualType, roles, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [], values: [...(o.value || []), ...(o.labels || [])] };
 }
 
 function pbirVisual(json) {
@@ -175,19 +247,35 @@ function pbirVisual(json) {
       label: p.displayName ? String(p.displayName).toLowerCase() : null,
     }));
   }
-  return { type: v.visualType, roles, dataPoint: (v.objects || {}).dataPoint || [] };
+  const o = v.objects || {};
+  return { type: v.visualType, roles, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [], values: [...(o.value || []), ...(o.labels || [])] };
 }
 
 /* How a visual colours its data, with every colour set by hand resolved to a hex code */
 function visualColorInfo(visual, theme) {
   const overrides = {};
-  for (const d of visual.dataPoint) {
+  const rules = [];   // fx rules: { scope, rule }
+  const points = visual.dataPoint.map((d) => [d, (d.properties || {}).fill]);
+  const bubbles = visual.bubbles.map((d) => [d, (d.properties || {}).fillColor]);
+  // An Azure Map draws its bubble layer's colour; its data point colour is a leftover
+  const entries = visual.type === "azureMap" ? [...bubbles, ...points] : [...points, ...bubbles];
+  for (const [d, fill] of entries) {
     const props = d.properties || {};
     const key = selectorKey(d.selector);
-    const color = colorFromFill(props.fill, theme);
+    const color = colorFromFill(fill, theme);
     if (color && key) overrides[key] = color;
+    const rule = color ? null : parseColorRule(fill, theme);
+    if (rule) rules.push({ scope: ruleScope(d.selector), rule });
     const fallback = colorFromFill(props.defaultColor, theme);
     if (fallback && !overrides.all) overrides.all = fallback;
+  }
+  // Card values: the new card's value font colour, or the classic card's label colour
+  const valueColors = {};
+  for (const d of visual.values) {
+    const props = d.properties || {};
+    const color = colorFromFill(props.fontColor || props.color, theme);
+    const key = selectorKey(d.selector);
+    if (color && key && !valueColors[key]) valueColors[key] = color;
   }
   const roles = visual.roles;
   const series = (roles.Series || [])[0] || null;
@@ -199,10 +287,13 @@ function visualColorInfo(visual, theme) {
   return {
     rule,
     category: (roles.Category || roles.Group || [])[0] || null,   // treemaps use Group
+    categories: roles.Category || roles.Group || [],               // a hierarchy: Group, then Region…
     series,
     measures,
     tooltips: (roles.Tooltips || []).map((t) => t.ref),
     overrides,
+    rules,
+    valueColors,
   };
 }
 

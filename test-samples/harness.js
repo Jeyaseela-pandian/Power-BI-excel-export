@@ -135,8 +135,8 @@
   window.__colors = (ws) => Object.values(ws.tables || {}).map((x) => {
     const t = x.table, m = t.tableRef.match(/([A-Z]+)(\d+):([A-Z]+)(\d+)/);
     const r0 = +m[2], c0 = colN(m[1]);
-    const fillOf = (cell) => (cell.fill && cell.fill.fgColor ? "#" + cell.fill.fgColor.argb.slice(2) : "-");
-    const fontOf = (cell) => (cell.font && cell.font.color ? "#" + cell.font.color.argb.slice(2) : "-");
+    const fillOf = (cell) => (cell.fill && cell.fill.fgColor && cell.fill.fgColor.argb ? "#" + cell.fill.fgColor.argb.slice(2) : "-");
+    const fontOf = (cell) => (cell.font && cell.font.color && cell.font.color.argb ? "#" + cell.font.color.argb.slice(2) : "-");
     const cf = (ws.conditionalFormattings || []).find((f) => f.ref.startsWith(ws.getColumn(c0 - 1).letter + (r0 + 1)));
     return {
       table: t.name,

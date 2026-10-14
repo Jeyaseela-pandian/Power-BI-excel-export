@@ -195,6 +195,7 @@ legend + * { clear: both; }
 .toast.error { border-left-color: var(--danger); }
 .toast.info { border-left-color: #4b7bec; }
 .toast-body { flex: 1; min-width: 0; }
+.toast-action { margin-top: 10px; }
 .toast-title { font-weight: 700; }
 .toast-text { color: var(--text-muted); font-size: 13px; overflow-wrap: anywhere; }
 .toast details { margin-top: 6px; font-size: 13px; }

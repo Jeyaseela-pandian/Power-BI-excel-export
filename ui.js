@@ -87,7 +87,7 @@ const chosenPages = new Map();      // reportId → Set of page names
 const excludedVisuals = new Map();  // "reportId:pageName" → Set of visual names
 
 /* ── Toasts ───────────────────────────────────────────────────────────── */
-function toast(title, text, kind = "success", details = []) {
+function toast(title, text, kind = "success", details = [], action = null) {
   const el = document.createElement("div");
   el.className = `toast ${kind}`;
   el.setAttribute("role", kind === "error" ? "alert" : "status");
@@ -108,7 +108,15 @@ function toast(title, text, kind = "success", details = []) {
   const close = () => el.remove();
   el.querySelector(".icon-btn").addEventListener("click", close);
   $("toasts").appendChild(el);
-  if (kind !== "error" && !details.length) setTimeout(close, 8000);
+  if (action) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn btn-primary toast-action";
+    b.textContent = action.label;
+    b.addEventListener("click", () => { close(); action.run(); });
+    el.querySelector(".toast-body").appendChild(b);
+  }
+  if (kind !== "error" && !details.length && !action) setTimeout(close, 8000);
   return el;
 }
 
@@ -351,6 +359,12 @@ async function runExport() {
       result.kpis ? `${result.kpis} KPI${result.kpis === 1 ? "" : "s"}` : null,
     ].filter(Boolean);
     toast(`Saved ${result.fileName}`, `${parts.join(", ")} · check your Downloads folder.`, "success", result.notes);
+    // Exact colours (fx rules, hand-picked colours) need Dataset.Read.All: offer it right here
+    if (result.notes.some((n) => n.includes("Dataset.Read.All"))) {
+      toast("Colours may differ from the report",
+        "Colours set in the report (colour rules, hand-picked colours) are read from the report file, which needs one more permission. Allow it, then export again.",
+        "info", [], { label: "Allow exact colours", run: allowExactColors });
+    }
   } catch (e) {
     if (e && e.cancelled) {
       toast("Export cancelled", "No file was created.", "info");
