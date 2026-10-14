@@ -3,3 +3,6 @@
 
 # Test samples (local test reports and data)
 test-samples/
+
+# Documents, such as the setup and test guide (kept locally)
+*.docx
