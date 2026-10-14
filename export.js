@@ -744,7 +744,9 @@ function toCellValue(raw) {
   const n = Number(cleaned) * (negative ? -1 : 1);
   const decimals = Math.min((cleaned.split(".")[1] || "").length, 4);
   const dec = decimals ? "." + "0".repeat(decimals) : "";
-  const thousands = s.includes(",") ? "#,##0" : "0";      // keep years like 2024 as 2024
+  // Years like 2024 stay 2024; amounts with a currency sign are always grouped, as Power BI
+  // shows them (it exports "$2627668" for $2,627,668)
+  const thousands = s.includes(",") || currency ? "#,##0" : "0";
 
   if (isPercent) return { value: n / 100, numFmt: `0${dec}%` };
   if (currency) return { value: n, numFmt: `"${currency}"${thousands}${dec}` };
@@ -906,6 +908,30 @@ function makeWidthTracker() {
 }
 
 /* ── Block writers ────────────────────────────────────────────────────── */
+
+/*
+ * A gauge or KPI shows one field as its main value and the others (target, minimum,
+ * maximum) as context, but Power BI exports them in the order they were added. The main
+ * value is moved first, so it becomes the tile's large value. The report file names it;
+ * without the file, a gauge's title names it first ("This Year Sales and Last Year Sales").
+ */
+function mainValueFirst(item, info) {
+  const header = item.rows[0].map((h) => String(h ?? "").trim());
+  let k = -1;
+  if (info && info.mainValue) {
+    const f = info.mainValue;
+    if (f.label) k = header.findIndex((h) => h.toLowerCase() === f.label);
+    if (k < 0) k = header.findIndex((h) => normalizeField(h) === f.ref);
+  } else if (!info && item.type === "gauge" && item.title) {
+    const title = item.title.toLowerCase();
+    let at = Infinity;
+    header.forEach((h, i) => {
+      const p = h ? title.indexOf(h.toLowerCase()) : -1;
+      if (p >= 0 && (p < at || (p === at && h.length > header[k].length))) { at = p; k = i; }
+    });
+  }
+  if (k > 0) item.rows = item.rows.map((row) => [row[k], ...row.filter((_, i) => i !== k)]);
+}
 
 /* KPI tiles show a title row only when the title adds something beyond the field name */
 function kpiHasTitle(item) {
@@ -1565,18 +1591,23 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
   const rowUse = [];  // per Excel row: does it hold collapsible table rows ("deep") / anything else ("other")?
   const mark = (r, kind) => { (rowUse[r] = rowUse[r] || { deep: false, other: false })[kind] = true; };
 
-  // Titles (generic ones described from their columns, duplicates numbered) and colours
+  // A KPI's main value first; titles (generic ones described from their columns, duplicates
+  // numbered) and colours
   const usedTitles = {};
   const colorNotes = [];
   for (const item of items) {
-    let title = isGenericTitle(item.title, item.type) ? (item.isKpi ? null : describeTitle(item)) : item.title;
+    const info = visualInfo(lay.reportColors, item.page, item.name);
+    if (item.isKpi) mainValueFirst(item, info);
+    // A title turned off in the report isn't shown either (it is often an internal name such
+    // as "TYS Card"): a table is titled from its columns instead, a KPI tile by its label
+    const hidden = !!(info && info.titleHidden);
+    let title = hidden || isGenericTitle(item.title, item.type) ? (item.isKpi ? null : describeTitle(item)) : item.title;
     if (title) {
       const key = title.toLowerCase();
       usedTitles[key] = (usedTitles[key] || 0) + 1;
       if (usedTitles[key] > 1) title = `${title} (${usedTitles[key]})`;
     }
     item.displayTitle = title;
-    const info = visualInfo(lay.reportColors, item.page, item.name);
     item.colors = lay.palette && !item.isKpi ? columnColors(item, lay.palette, info) : null;
     item.tableFormat = info && info.tableFormats && info.tableFormats.length ? info : null;
     item.colorInfo = info;

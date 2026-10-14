@@ -4,10 +4,12 @@
  * Exact report colours. Downloads the report's design file (needs the Dataset.Read.All
  * permission and download rights: Contributor, Member or Admin of the workspace), reads
  * the report's theme and the colours set by hand on each visual, and describes how each
- * visual colours its data (by item, by legend value, by measure, or one colour).
+ * visual colours its data (by item, by legend value, by measure, or one colour), plus
+ * two display facts the embed API doesn't give: titles turned off, and the field a gauge
+ * or KPI shows as its main value.
  * Both report formats are read: the classic one ("Report/Layout") and the newer PBIR
- * folders ("Report/definition/…"). Only colour information is used; nothing is stored
- * or sent anywhere. When the file can't be read the export falls back to the theme
+ * folders ("Report/definition/…"). Only this design information is used; nothing is
+ * stored or sent anywhere. When the file can't be read the export falls back to the theme
  * colours Power BI reports through the embed API (export.js).
  * Uses globals from app.js: getDesignToken, PBI_API, log, errorText.
  */
@@ -34,6 +36,7 @@ const KEYWORD_DEFAULTS = { maximum: "#118DFF", minimum: "#DEEFFF", center: "#D9B
 const COLOR_BY_ITEM_TYPES = ["pieChart", "donutChart", "treemap"];
 const SINGLE_COLOR_TYPES = ["scatterChart", "map", "filledMap", "shapeMap", "azureMap", "funnel"];
 const MEASURE_ROLES = ["Y", "Y2", "Values", "ColumnY", "LineY", "Size"];   // roles whose fields are drawn as series
+const KPI_VALUE_ROLE = { gauge: "Y", kpi: "Indicator" };   // the main value; the other fields are its target, minimum…
 
 /* Supported AppSource visuals, by type name:
    - roles: each of the visual's own roles, as the built-in role it acts like
@@ -365,9 +368,17 @@ async function readTheme(zip, themeCollection) {
 
 /*
  * One visual, in a shape shared by both formats:
- * { type, roles: { Category: [{ ref, label }], Series: [...], Y: [...] … }, dataPoint: [...] }
+ * { type, roles: { Category: [{ ref, label }], Series: [...], Y: [...] … }, dataPoint: [...], titleShown }
  * ref is the normalised field name; label the visual's own name for it when renamed.
  */
+/* Whether a visual's title is shown, from its container settings: true / false when the
+   report says, null when it leaves the default */
+function titleShown(containerObjects) {
+  const show = ((((containerObjects || {}).title || [])[0] || {}).properties || {}).show;
+  const value = show && show.expr && show.expr.Literal && show.expr.Literal.Value;
+  return value === "true" ? true : value === "false" ? false : null;
+}
+
 /* A query field's name: "Month", "Sum(Sales.Sales)" → "sales", a hierarchy level's name */
 function fieldName(f) {
   if (!f) return null;
@@ -399,7 +410,8 @@ function legacyVisual(config) {
     }));
   }
   const o = sv.objects || {};
-  return { type: sv.visualType, roles, objects: o, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [], values: [...(o.value || []), ...(o.labels || [])] };
+  return { type: sv.visualType, roles, objects: o, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [], values: [...(o.value || []), ...(o.labels || [])],
+    titleShown: titleShown(sv.vcObjects) };
 }
 
 function pbirVisual(json) {
@@ -412,7 +424,8 @@ function pbirVisual(json) {
     }));
   }
   const o = v.objects || {};
-  return { type: v.visualType, roles, objects: o, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [], values: [...(o.value || []), ...(o.labels || [])] };
+  return { type: v.visualType, roles, objects: o, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [], values: [...(o.value || []), ...(o.labels || [])],
+    titleShown: titleShown(v.visualContainerObjects) };
 }
 
 /* Icon rules ("fx" icons): each case's lower bound (a threshold) and its icon */
@@ -566,6 +579,8 @@ function visualColorInfo(visual, theme) {
     accent,
     waterfall,
     tableFormats: ["tableEx", "pivotTable", "table", "matrix"].includes(visual.type) ? tableFormats(visual.objects, theme) : [],
+    titleHidden: visual.titleShown === false,
+    mainValue: KPI_VALUE_ROLE[visual.type] ? (roles[KPI_VALUE_ROLE[visual.type]] || [])[0] || null : null,
   };
 }
 
