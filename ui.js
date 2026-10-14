@@ -437,7 +437,7 @@ async function runDiagnostics() {
         counts.fail++;
       }
     }
-    if (v.type === "slicer") {
+    if (isSlicerType(v.type)) {
       try {
         detail += ` · Selection: ${describeFilters((await v.getSlicerState()).filters)}`;
       } catch (e) {

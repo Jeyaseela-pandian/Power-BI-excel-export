@@ -1,0 +1,17 @@
+// Measures for the export test report.
+// In Power BI Desktop: Modeling → New measure, paste one measure at a time.
+// The table is named "sample-sales" after the CSV; rename it to Sales first
+// (README step 3) so these measures work as written.
+
+Total Sales = SUM ( Sales[Sales] )
+
+Total Cost = SUM ( Sales[Cost] )
+
+Total Orders = SUM ( Sales[Orders] )
+
+// Format as Percentage (Measure tools → Format → Percentage, 1 decimal)
+Margin % = DIVIDE ( [Total Sales] - [Total Cost], [Total Sales] )
+
+// Colour measure used by the Deneb chart. The export should colour the Deneb
+// table green (#0B8E37) because this value appears in the exported data.
+Bar Color = "#0B8E37"

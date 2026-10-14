@@ -20,7 +20,13 @@ const models = window["powerbi-client"].models;
 const cfg = window.APP_CONFIG;
 
 // Decorative visual types: export is still attempted, but a failure is expected, not an error
-const NON_DATA_TYPES = ["textbox", "image", "shape", "basicShape", "actionButton", "pageNavigator", "bookmarkNavigator"];
+const NON_DATA_TYPES = ["textbox", "image", "shape", "basicShape", "actionButton", "pageNavigator", "bookmarkNavigator", "aiNarratives", "qnaVisual"];
+
+/* Every kind of slicer: the classic one ("slicer") and the newer button, list, text and
+   date slicers (advancedSlicerVisual, listSlicer, textSlicer…) */
+function isSlicerType(type) {
+  return /slicer/i.test(String(type || ""));
+}
 
 const msalApp = new msal.PublicClientApplication({
   auth: {
