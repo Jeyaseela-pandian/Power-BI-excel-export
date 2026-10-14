@@ -572,6 +572,7 @@ function visualColorInfo(visual, theme) {
     series,
     measures,
     tooltips: (roles.Tooltips || []).map((t) => t.ref),
+    roles,   // every role's fields, e.g. a scatter chart's X, Y and Size (charts mode)
     overrides,
     rules,
     valueColors,

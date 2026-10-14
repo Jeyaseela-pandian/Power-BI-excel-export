@@ -1613,6 +1613,9 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     item.colorInfo = info;
     item.chart = options.visualsAs === "charts" ? chartPlan(item) : null;   // charts mode only
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
+    if (options.visualsAs === "charts" && item.type === "scatterChart" && !item.chart && !lay.reportColors) {
+      colorNotes.push(`"${item.displayTitle}" stays a table: its X and Y fields are read from the report file, which couldn't be read.`);
+    }
   }
   const executive = !BUILT_IN_STYLES.includes(lay.tableStyle);
 
@@ -2091,6 +2094,9 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
  * page's "Data" sheet, and addChartsToFile() adds the chart parts to the finished .xlsx
  * (with JSZip). Only used when options.visualsAs === "charts"; the data tables mode
  * never runs this code. Visuals without an Excel chart equivalent stay data tables.
+ * With the report file, a chart draws the fields the visual draws (tooltip-only measures
+ * are left out; a combo's line values are its Y2 fields), and scatter charts know their
+ * X, Y and Size fields.
  */
 const EXCEL_CHARTS = {
   clusteredColumnChart: { kind: "bar", dir: "col", grouping: "clustered" },
@@ -2107,6 +2113,7 @@ const EXCEL_CHARTS = {
   lineStackedColumnComboChart: { kind: "combo", dir: "col", grouping: "stacked" },
   pieChart: { kind: "pie" },
   donutChart: { kind: "doughnut" },
+  scatterChart: { kind: "scatter" },   // a bubble chart when the visual has a Size field
 };
 const CHART_SCALE = 1;          // Power BI page pixels → chart pixels
 const CHART_MIN_W = 360;        // smallest chart, in pixels
@@ -2139,10 +2146,6 @@ function chartPlan(item) {
   const { header, data, numeric, hex, helper } = classifyColumns(item.rows);
   if (!data.length) return null;
   const cols = header.map((_, ci) => ci);
-  const textCols = cols.filter((ci) => !numeric[ci] && !hex[ci]);
-  const catCol = textCols.length ? textCols[0] : 0;
-  const valueCols = cols.filter((ci) => ci !== catCol && numeric[ci] && !hex[ci] && !helper[ci]);
-  if (!valueCols.length) return null;
   const colors = item.colors || null;
   const info = item.colorInfo || null;
   const key = (r, ci) => String(r[ci] ?? "").trim();
@@ -2153,6 +2156,41 @@ function chartPlan(item) {
     const exported = cells.map((c) => c[0]).find((c) => typeof c.value === "number" && c.numFmt);
     return readable || (exported && exported.numFmt) || "General";
   };
+  // A report field's column: its renamed label first, then its name (each column used once)
+  const lower = header.map((h) => String(h ?? "").trim().toLowerCase());
+  const norm = header.map((h) => normalizeField(h));
+  const taken = new Set();
+  const colOf = (f) => {
+    if (!f) return -1;
+    const free = cols.filter((c) => !taken.has(c));
+    let ci = f.label ? free.find((c) => lower[c] === f.label) : undefined;
+    if (ci === undefined) ci = free.find((c) => norm[c] === f.ref);
+    if (ci === undefined) return -1;
+    taken.add(ci);
+    return ci;
+  };
+  if (spec.kind === "scatter") return scatterPlan(item, { header, data, info, colors, colOf, key, num, formatOf });
+
+  const textCols = cols.filter((ci) => !numeric[ci] && !hex[ci]);
+  let catCol = textCols.length ? textCols[0] : 0;
+  let valueCols = cols.filter((ci) => ci !== catCol && numeric[ci] && !hex[ci] && !helper[ci]);
+  // With the report file, the series are the fields the visual draws: tooltip-only measures
+  // aren't drawn, and a combo's line values are its Y2 fields
+  let lineCols = null;
+  if (info) {
+    const c = colOf(info.category);
+    if (c >= 0) catCol = c; else taken.add(catCol);
+    const drawn = (info.measures || []).map((m) => ({ ci: colOf(m), role: m.role }))
+      .filter((m) => m.ci >= 0 && numeric[m.ci] && !hex[m.ci]);
+    if (drawn.length) {
+      valueCols = drawn.map((m) => m.ci);
+      lineCols = drawn.filter((m) => m.role === "Y2").map((m) => m.ci);
+    } else {
+      const tooltips = new Set(info.tooltips || []);
+      valueCols = valueCols.filter((ci) => ci !== catCol && !tooltips.has(norm[ci]));
+    }
+  }
+  if (!valueCols.length) return null;
   const categories = [...new Set(data.map((r) => key(r, catCol)))];
   const firstRowOf = (c) => data.findIndex((r) => key(r, catCol) === c);
   // One value per category; a category with several rows (a hierarchy) is totalled
@@ -2199,14 +2237,20 @@ function chartPlan(item) {
     };
   }
 
-  // One series per measure; a combo draws its last measure as a line on a second axis
+  // One series per measure; a combo draws its line values (its last measure, without the
+  // report file) as lines on a second axis
   const series = valueCols.map((ci, i) => ({
     name: header[ci],
     values: valuesFor(ci, data),
     fmt: formatOf(ci),
     color: (colors && colors.series && colors.series[ci]) || null,
-    line: spec.kind === "combo" && valueCols.length > 1 && i === valueCols.length - 1,
+    line: spec.kind === "combo" && (lineCols ? lineCols.includes(ci) : valueCols.length > 1 && i === valueCols.length - 1),
   }));
+  // A combo showing only line values is a line chart
+  if (series.every((s) => s.line)) {
+    series.forEach((s) => { s.line = false; });
+    base.spec = { kind: "line" };
+  }
   // One measure coloured per bar (colours set by hand, or a colour rule)
   let pointColors = null;
   if (series.length === 1 && colors) {
@@ -2216,6 +2260,43 @@ function chartPlan(item) {
     else if (colors.tabColors) pointColors = categories.map((c) => colors.tabColors[firstRowOf(c)] || null);
   }
   return { ...base, series, pointColors };
+}
+
+/*
+ * A scatter chart: a point per row at its X and Y values, a bubble chart when the visual
+ * sizes its points by a field; one series per legend value (in the legend's colours),
+ * else one series in the visual's colour. Which field is X, Y and Size comes from the report
+ * file: the exported columns come in the order the fields were added, so without the file
+ * the visual stays a table.
+ */
+function scatterPlan(item, t) {
+  const { header, data, info, colors, colOf, key, num, formatOf } = t;
+  const roles = info && info.roles;
+  if (!roles) return null;
+  const x = colOf((roles.X || [])[0]), y = colOf((roles.Y || [])[0]);
+  if (x < 0 || y < 0) return null;
+  const size = colOf((roles.Size || [])[0]);
+  const labelCol = colOf(info.category), legendCol = colOf(info.series);
+  const points = data.map((r) => ({
+    label: labelCol >= 0 ? key(r, labelCol) : "",
+    legend: legendCol >= 0 ? key(r, legendCol) : "",
+    x: num(r[x]), y: num(r[y]), size: size >= 0 ? num(r[size]) : null,
+  })).filter((p) => p.x !== null && p.y !== null);
+  if (!points.length) return null;
+  const byKey = legendCol >= 0 && colors && colors.rowKey && colors.rowKey.col === legendCol ? colors.rowKey.colorOf : null;
+  const series = legendCol >= 0
+    ? [...new Set(points.map((p) => p.legend))].map((v) => ({
+      name: v || "(Blank)", color: (byKey && byKey[v]) || null, points: points.filter((p) => p.legend === v) }))
+    : [{ name: header[y], color: (colors && colors.series && colors.series[y]) || null, points }];
+  return {
+    spec: { kind: size >= 0 ? "bubble" : "scatter" },
+    title: item.displayTitle || item.title,
+    labelName: labelCol >= 0 ? header[labelCol] : null,
+    legendName: legendCol >= 0 ? header[legendCol] : null,
+    xName: header[x], yName: header[y], sizeName: size >= 0 ? header[size] : null,
+    xFmt: formatOf(x), yFmt: formatOf(y), sizeFmt: size >= 0 ? formatOf(size) : null,
+    series,
+  };
 }
 
 /* Writes every chart's numbers on the page's "Data" sheet and records the cell ranges */
@@ -2233,6 +2314,11 @@ function writeChartDataSheet(wb, name, charts) {
     t.value = p.title;
     t.font = { name: "Calibri", size: 12, bold: true, color: { argb: C.INK } };
     const hr = row + 1;
+    if (p.spec.kind === "scatter" || p.spec.kind === "bubble") {
+      row = writeScatterData(ws, p, hr, sheetRef, abs);
+      widest = Math.max(widest, 2 + (p.legendName ? 1 : 0) + (p.sizeName ? 1 : 0));
+      continue;
+    }
     const h0 = ws.getCell(hr, 2);
     h0.value = p.catName || "Category";
     h0.font = { name: "Calibri", size: 10, bold: true, color: { argb: C.INK } };
@@ -2267,6 +2353,42 @@ function writeChartDataSheet(wb, name, charts) {
   ws.getColumn(2).width = 30;
   for (let c = 3; c < 3 + widest; c++) ws.getColumn(c).width = 18;
   return ws;
+}
+
+/* A scatter chart's numbers: a row per point (label, legend value, X, Y, size), each
+   series' points together. Returns the row after the block's spacing. */
+function writeScatterData(ws, p, hr, sheetRef, abs) {
+  const head = { name: "Calibri", size: 10, bold: true, color: { argb: C.INK } };
+  const names = [p.labelName || "Point", ...(p.legendName ? [p.legendName] : []), p.xName, p.yName, ...(p.sizeName ? [p.sizeName] : [])];
+  const xc = 3 + (p.legendName ? 1 : 0), yc = xc + 1, sc = yc + 1;
+  names.forEach((n, i) => {
+    const h = ws.getCell(hr, 2 + i);
+    h.value = n;
+    h.font = head;
+    h.fill = SURFACE_FILL;
+    if (2 + i >= xc) h.alignment = { horizontal: "right" };
+  });
+  const put = (r, c, v, fmt) => {
+    const cell = ws.getCell(r, c);
+    cell.value = v;
+    if (fmt && fmt !== "General") cell.numFmt = fmt;
+  };
+  let r = hr + 1;
+  p.refs = { series: [] };
+  for (const s of p.series) {
+    const first = r;
+    for (const pt of s.points) {
+      put(r, 2, pt.label || null);
+      if (p.legendName) put(r, 3, pt.legend || null);
+      put(r, xc, pt.x, p.xFmt);
+      put(r, yc, pt.y, p.yFmt);
+      if (p.sizeName) put(r, sc, pt.size, p.sizeFmt);
+      r++;
+    }
+    const range = (c) => `${sheetRef}!${abs(first, c)}:${abs(r - 1, c)}`;
+    p.refs.series.push({ xRef: range(xc), yRef: range(yc), sizeRef: p.sizeName ? range(sc) : null });
+  }
+  return r + 2;
 }
 
 /* ── Chart XML (DrawingML) ── */
@@ -2311,19 +2433,45 @@ function catAxXml(id, crossId, pos, { reverse = false, hidden = false } = {}) {
     `<c:crossAx val="${crossId}"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/><c:noMultiLvlLbl val="0"/></c:catAx>`;
 }
 
-function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true } = {}) {
+/* A value axis. Scatter charts have two: "midCat" crossing, and labels kept at the plot's
+   edge ("low") when the other axis crosses at zero inside the plot */
+function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true, crossBetween = "between", labels = "nextTo" } = {}) {
   return `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="${pos}"/>` +
     (grid ? `<c:majorGridlines><c:spPr><a:ln w="6350">${fillXml(C.HAIR)}</a:ln></c:spPr></c:majorGridlines>` : "") +
-    `<c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/>` +
-    `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:crossAx val="${crossId}"/><c:crosses val="${crosses}"/><c:crossBetween val="between"/></c:valAx>`;
+    `<c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="${labels}"/>` +
+    `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:crossAx val="${crossId}"/><c:crosses val="${crosses}"/><c:crossBetween val="${crossBetween}"/></c:valAx>`;
+}
+
+/* A scatter or bubble series: its points' X and Y (and size) values, marked in its colour */
+function scatterSeriesXml(kind, s, i, plan, ref) {
+  const values = (k) => s.points.map((p) => p[k]);
+  const numRef = (f, vals, fmt) => `<c:numRef><c:f>${xmlEsc(f)}</c:f>${numCacheXml(vals, fmt)}</c:numRef>`;
+  const head = `<c:idx val="${i}"/><c:order val="${i}"/><c:tx><c:v>${xmlEsc(s.name)}</c:v></c:tx>`;
+  const xy = `<c:xVal>${numRef(ref.xRef, values("x"), plan.xFmt)}</c:xVal><c:yVal>${numRef(ref.yRef, values("y"), plan.yFmt)}</c:yVal>`;
+  const look = s.color ? `<c:spPr>${fillXml(s.color)}<a:ln w="6350">${fillXml(C.WHITE)}</a:ln></c:spPr>` : "";
+  if (kind === "bubble") {
+    return `<c:ser>${head}${look}<c:invertIfNegative val="0"/>${xy}` +
+      `<c:bubbleSize>${numRef(ref.sizeRef, values("size"), plan.sizeFmt)}</c:bubbleSize><c:bubble3D val="0"/></c:ser>`;
+  }
+  // Points only: no line between them
+  return `<c:ser>${head}<c:spPr><a:ln w="19050"><a:noFill/></a:ln></c:spPr>` +
+    `<c:marker><c:symbol val="circle"/><c:size val="7"/>${look}</c:marker>${xy}<c:smooth val="0"/></c:ser>`;
 }
 
 function chartXml(plan) {
   const { spec, series } = plan;
   const kind = spec.kind;
   const refs = plan.refs;
+  const A1 = 50010, A2 = 50020, A3 = 50030, A4 = 50040;
   let body;
-  if (kind === "pie" || kind === "doughnut") {
+  if (kind === "scatter" || kind === "bubble") {
+    const sers = series.map((s, i) => scatterSeriesXml(kind, s, i, plan, refs.series[i])).join("");
+    body = (kind === "bubble"
+      ? `<c:bubbleChart><c:varyColors val="0"/>${sers}<c:bubbleScale val="50"/><c:showNegBubbles val="0"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:bubbleChart>`
+      : `<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>${sers}<c:axId val="${A1}"/><c:axId val="${A2}"/></c:scatterChart>`) +
+      valAxXml(A1, A2, "b", plan.xFmt, { grid: false, crossBetween: "midCat", labels: "low" }) +
+      valAxXml(A2, A1, "l", plan.yFmt, { crossBetween: "midCat", labels: "low" });
+  } else if (kind === "pie" || kind === "doughnut") {
     const ser = chartSeriesXml("pie", series[0], 0, plan, refs.series[0]);
     body = kind === "pie"
       ? `<c:pieChart><c:varyColors val="1"/>${ser}<c:firstSliceAng val="0"/></c:pieChart>`
@@ -2335,7 +2483,6 @@ function chartXml(plan) {
     const horizontal = spec.dir === "bar";
     const pct = spec.grouping === "percentStacked";
     const valFmt = pct ? "0%" : (main[0] ? main[0][0].fmt : series[0].fmt);
-    const A1 = 50010, A2 = 50020, A3 = 50030, A4 = 50040;
     let groups = "";
     if (kind === "bar" || kind === "combo") {
       const grouping = spec.grouping || "clustered";
