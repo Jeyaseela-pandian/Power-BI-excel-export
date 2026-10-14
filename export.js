@@ -270,102 +270,119 @@ function seriesOrder(data, keyCol, groupCols) {
   return order;
 }
 
+/* "≥ 0", "> 80% of range", "= Bikes": a rule case for caption legends */
+function describeTest(c) {
+  if (c.and) return c.and.map(describeTest).join(" and ");
+  if (c.or) return c.or.map(describeTest).join(" or ");
+  if (c.not) return "not " + describeTest(c.not);
+  const ops = ["=", ">", "≥", "≤", "<"];
+  const at = c.at.num !== undefined ? c.at.num.toLocaleString() : c.at.pct !== undefined ? `${Math.round(c.at.pct * 100)}% of range`
+    : c.at.pctl !== undefined ? `${Math.round(c.at.pctl * 100)}th percentile` : c.at.str;
+  return `${ops[c.op] || "?"} ${at}`;
+}
+
+// Measures whose group value isn't the sum of its rows
+const NON_ADDITIVE = /%|\b(avg|average|mean|median|rate|ratio|margin|percent|pct|distinct|min|max|count of)\b/i;
+
 /*
- * Evaluates an fx colour rule (colors.js parseColorRule) for every row of a chart table.
- * The rule's input is a column of the table; else a column whose name holds all its words
- * ("Profit %" → "Profit Margin %"); else, for a rule per legend value, the legend order
- * (Power BI's scale over e.g. "Latest year" follows the years). Blank inputs count as zero,
- * Power BI's default. The last two are approximations and add a note.
- * Returns colours for columnColors: perRow (one colour per row), the filled columns, the
- * tab key, and a caption legend (the scale, or one entry per rule).
+ * Applies the report's fx colour rules (colors.js) to a chart table, row by row.
+ * A rule reads a field: a column of this table; else a column whose name holds all the
+ * field's words ("Profit %" → "Profit Margin %"); else, for a scale per legend value, the
+ * legend order (a scale over e.g. "Latest year" follows the years). Those two are
+ * approximations and add a note; a rule whose field can't be found is left out.
+ * A category hierarchy (Group, then Region) is drawn at its first level, so an additive
+ * field is totalled per group first, as the bars show it.
+ * Rules for one measure win over rules for every series; series without a rule keep
+ * their series colour, and rows a rule leaves uncoloured keep it too.
+ * Returns colours for columnColors: perCol (a colour per row for each ruled column), the
+ * remaining series, the row tabs (colour per row and key column) and a caption legend.
  */
-function colorRuleRows({ scope, rule }, t) {
+function colorRuleRows(rules, t) {
   const { header, data, cols, norm, lower, numeric, hex, seriesCols, findCol, info, seriesColor } = t;
-  const targets = scope.startsWith("m:") ? seriesCols.filter((ci) => "m:" + norm[ci] === scope) : seriesCols;
-  if (!targets.length || !data.length) return null;
-  let approx = false;
-  const resolve = (input) => {
-    const ci = findCol({ ref: input.toLowerCase() });
-    if (ci >= 0 && numeric[ci]) return ci;
-    const words = input.toLowerCase().split(/\s+/).filter(Boolean);
-    const close = cols.filter((c) => numeric[c] && words.every((w) => lower[c].split(/\s+/).includes(w)));
-    if (close.length === 1) { approx = true; return close[0]; }
-    return -1;
-  };
-  const num = (ri, ci) => { const v = toCellValue(data[ri][ci]).value; return typeof v === "number" ? v : 0; };
+  const n = data.length;
+  if (!n) return null;
   const legendCol = info.series ? findCol(info.series) : -1;
   const categoryCol = findCol(info.category);
-  const keyCol = scope === "series" && legendCol >= 0 ? legendCol
-    : categoryCol >= 0 ? categoryCol : cols.find((ci) => !numeric[ci] && !hex[ci]) ?? -1;
-  // A category hierarchy (Group, then Region) exports every level, but the chart shows its
-  // first level: one bar per Group, coloured by that Group's total. Rows are coloured by
-  // their group's total, so the table matches the bars (not for percentages, which don't add up).
   const levels = (info.categories || []).map((f) => findCol(f)).filter((ci) => ci >= 0);
-  const grouped = scope !== "series" && levels.length > 1 && levels[0] === categoryCol;
-
-  let perRow, legend, inputName = rule.input;
-  if (rule.kind === "gradient") {
-    const inputCol = resolve(rule.input);
-    let values;
-    if (inputCol >= 0) {
-      values = data.map((_, ri) => num(ri, inputCol));
-      inputName = header[inputCol];
-      const percent = data.some((r) => String(r[inputCol] ?? "").trim().endsWith("%"));
-      if (grouped && !percent) {
-        const totals = {};
-        const groupOf = (r) => (r[categoryCol] ?? "").trim();
-        data.forEach((r, ri) => { totals[groupOf(r)] = (totals[groupOf(r)] || 0) + values[ri]; });
-        values = data.map((r) => totals[groupOf(r)]);
-      }
-    } else if (scope === "series" && legendCol >= 0) {
-      const order = seriesOrder(data, legendCol, cols.filter((ci) => ci !== legendCol && !seriesCols.includes(ci) && !hex[ci]));
-      values = data.map((r) => order.indexOf((r[legendCol] ?? "").trim()));
-      approx = true;
-    } else {
-      return null;
+  const grouped = levels.length > 1 && levels[0] === categoryCol;
+  const approx = [];
+  const columnFor = (name) => {
+    const low = String(name).toLowerCase();
+    let ci = findCol({ ref: normalizeField(low) });
+    if (ci < 0) {
+      const words = low.split(/\s+/).filter(Boolean);
+      const close = cols.filter((c) => words.every((w) => lower[c].split(/\s+/).includes(w)));
+      if (close.length === 1) { ci = close[0]; if (!approx.includes(name)) approx.push(name); }
     }
-    const lo = rule.min.value ?? Math.min(...values), hi = rule.max.value ?? Math.max(...values);
-    const hasMid = rule.mid && rule.mid.color;
-    const mid = hasMid ? (rule.mid.value ?? (lo + hi) / 2) : null;
-    const part = (v, a, b) => (b === a ? 1 : Math.max(0, Math.min(1, (v - a) / (b - a))));
-    const at = (v) => (hasMid
-      ? (v <= mid ? mixHex(rule.min.color, rule.mid.color, part(v, lo, mid)) : mixHex(rule.mid.color, rule.max.color, part(v, mid, hi)))
-      : mixHex(rule.min.color, rule.max.color, part(v, lo, hi)));
-    perRow = values.map((v) => toArgb(at(v)));
-    legend = { scale: [rule.min.color, hasMid ? rule.mid.color : null, rule.max.color].filter(Boolean).map((c) => toArgb(c)), label: `Colour scale on ${inputName}` };
-  } else {
-    const test = (c, ri) => {
-      if (c.and) return c.and.every((x) => test(x, ri));
-      const ci = resolve(c.input);
-      if (ci < 0) return false;
-      const v = num(ri, ci);
-      return [v === c.value, v > c.value, v >= c.value, v <= c.value, v < c.value][c.op] || false;
-    };
-    const base = seriesColor(targets[0]);
-    perRow = data.map((_, ri) => { const hit = rule.cases.find((c) => test(c.test, ri)); return hit ? toArgb(hit.color) : base; });
-    const ops = ["=", ">", "≥", "≤", "<"];
-    const describe = (c) => (c.and ? c.and.map(describe).join(" and ") : `${ops[c.op] || "?"} ${c.value}`);
-    const firstCol = resolve(rule.input);
-    inputName = firstCol >= 0 ? header[firstCol] : rule.input;
-    legend = { entries: rule.cases.map((c) => ({ label: `${inputName} ${describe(c.test)}`, argb: toArgb(c.color) })) };
-  }
+    return ci;
+  };
+  const column = (scope) => (name) => {
+    const ci = columnFor(name);
+    if (ci < 0) return null;
+    const raw = data.map((r) => String(r[ci] ?? "").trim());
+    let v = raw.map((x) => (x ? toCellValue(x).value : null));
+    if (grouped && scope !== "series" && numeric[ci] && !NON_ADDITIVE.test(header[ci]) && !raw.some((x) => x.endsWith("%"))) {
+      const totals = {};
+      const groupOf = (r) => String(r[categoryCol] ?? "").trim();
+      data.forEach((r, ri) => { totals[groupOf(r)] = (totals[groupOf(r)] || 0) + (typeof v[ri] === "number" ? v[ri] : 0); });
+      v = data.map((r) => totals[groupOf(r)]);
+    }
+    return v;
+  };
 
-  // Tabs follow a key column; they stay right after a sort only if each key has one colour
+  const perCol = {};
+  let first = null;
+  // A rule for one measure wins over a rule for every series; otherwise the first rule wins
+  // (an Azure Map's bubble colour is listed before its leftover data point colour)
+  const ordered = [...rules].sort((a, b) => Number(b.scope.startsWith("m:")) - Number(a.scope.startsWith("m:")));
+  for (const r of ordered) {
+    const targets = (r.scope.startsWith("m:") ? seriesCols.filter((ci) => "m:" + norm[ci] === r.scope) : seriesCols)
+      .filter((ci) => !perCol[ci]);
+    if (!targets.length) continue;
+    let { colors, missing } = evaluateColorRule(r.rule, column(r.scope), n);
+    if (missing.length && r.rule.kind === "gradient" && r.scope === "series" && legendCol >= 0) {
+      const order = seriesOrder(data, legendCol, cols.filter((ci) => ci !== legendCol && !seriesCols.includes(ci) && !hex[ci]));
+      ({ colors } = evaluateColorRule(r.rule, () => data.map((row) => order.indexOf(String(row[legendCol] ?? "").trim())), n));
+      approx.push(r.rule.input);
+    } else if (missing.length) {
+      continue;
+    }
+    for (const ci of targets) perCol[ci] = colors.map((c) => (c ? toArgb(c) : null));
+    if (!first) first = { rule: r.rule, scope: r.scope, col: targets[0] };
+  }
+  if (!first) return null;
+  for (const ci of Object.keys(perCol)) perCol[ci] = perCol[ci].map((c) => c || seriesColor(Number(ci)));
+  const series = {};
+  for (const ci of seriesCols) if (!perCol[ci]) series[ci] = seriesColor(ci);
+
+  // Row tabs follow a key column; they stay right after a sort only if each key has one colour
+  const keyCol = first.scope === "series" && legendCol >= 0 ? legendCol
+    : categoryCol >= 0 ? categoryCol : cols.find((ci) => !numeric[ci] && !hex[ci]) ?? -1;
+  const tabColors = perCol[first.col];
   let dot = null;
   if (keyCol >= 0) {
     const byKey = {};
     let sortSafe = true;
     data.forEach((r, ri) => {
-      const k = (r[keyCol] ?? "").trim();
-      if (byKey[k] && byKey[k] !== perRow[ri]) sortSafe = false;
-      byKey[k] = perRow[ri];
+      const k = String(r[keyCol] ?? "").trim();
+      if (byKey[k] && byKey[k] !== tabColors[ri]) sortSafe = false;
+      byKey[k] = tabColors[ri];
     });
     dot = { keyCol, colorOf: (v) => byKey[v] || null, sortSafe };
   }
-  const note = approx
-    ? `Colours of "${t.title || "a chart"}" follow a rule on ${rule.input}, which isn't in the exported data, so they are approximated.`
+
+  const rule = first.rule;
+  const ci0 = columnFor(rule.input);
+  const inputName = ci0 >= 0 ? header[ci0] : rule.input;
+  const legend = rule.kind === "gradient"
+    ? { scale: [rule.min.color, rule.mid && rule.mid.color, rule.max.color].filter(Boolean).map((c) => toArgb(c)), label: `Colour scale on ${inputName}` }
+    : rule.kind === "conditional"
+      ? { entries: rule.cases.map((c) => ({ label: `${inputName} ${describeTest(c.test)}`, argb: toArgb(c.color) })) }
+      : { text: `Colours from ${inputName}` };
+  const note = approx.length
+    ? `Colours of "${t.title || "a chart"}" follow a rule on ${approx.join(", ")}, which isn't in the exported data, so they are approximated.`
     : null;
-  return { series: {}, rowCols: targets, rowKey: null, dot, perRow, legend, note };
+  return { series, rowCols: Object.keys(perCol).map(Number), perCol, tabColors, rowKey: null, dot, legend, note };
 }
 
 /*
@@ -457,14 +474,27 @@ function columnColors(item, palette, info) {
     return { col: keyCol, colorOf: Object.fromEntries(values.map((v, i) => [v, colorOfValue(v, i)])) };
   };
 
-  // 2. Conditional formatting (fx) in the report file: colour scales and rules, row by row
-  const fx = info && (info.rules || []).find((r) => r.scope === "all" || r.scope === "series" || seriesCols.some((ci) => "m:" + norm[ci] === r.scope));
-  if (fx) {
-    const result = colorRuleRows(fx, { header, data, cols, norm, lower, numeric, hex, seriesCols, findCol, info, seriesColor, title: item.displayTitle || item.title });
+  // 2. Waterfall: each step in its increase / decrease colour (a "Total" step in the total colour)
+  if (info && info.waterfall && seriesCols.length) {
+    const w = info.waterfall, ci = seriesCols[0];
+    const keyCol = cols.find((c) => !numeric[c] && !hex[c]) ?? -1;
+    const tabColors = data.map((r) => {
+      const label = keyCol >= 0 ? String(r[keyCol] ?? "").trim() : "";
+      const v = toCellValue(r[ci]).value;
+      return toArgb(/^total$/i.test(label) ? w.total : typeof v === "number" && v < 0 ? w.decrease : w.increase);
+    });
+    const legend = { entries: [{ label: "Increase", argb: toArgb(w.increase) }, { label: "Decrease", argb: toArgb(w.decrease) }, { label: "Total", argb: toArgb(w.total) }] };
+    return { series: {}, rowCols: [ci], perCol: { [ci]: tabColors }, tabColors, hexCols, rowKey: null, dot: null, legend, exact };
+  }
+
+  // 3. Conditional formatting (fx) in the report file: colour scales, rules, colours from a field
+  const fxRules = info ? (info.rules || []).filter((r) => r.scope === "all" || r.scope === "series" || seriesCols.some((ci) => "m:" + norm[ci] === r.scope)) : [];
+  if (fxRules.length) {
+    const result = colorRuleRows(fxRules, { header, data, cols, norm, lower, numeric, hex, seriesCols, findCol, info, seriesColor, title: item.displayTitle || item.title });
     if (result) return { ...result, hexCols, exact };
   }
 
-  // 3. Rows coloured by a field: the legend (Series) or, for pie / donut / treemap, the category
+  // 4. Rows coloured by a field: the legend (Series) or, for pie / donut / treemap, the category
   let rowKey = null;
   if (info && (info.rule === "legend" || info.rule === "item")) {
     let keyCol = findCol(info.rule === "legend" ? info.series : info.category);
@@ -731,8 +761,18 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
   // The value colours set on the card in the report, when the report file was read
   const info = lay.reportColors && item.name ? lay.reportColors.visuals[item.name] : null;
   const valueColor = (i) => {
-    const vc = (info && info.valueColors) || {};
-    const hex = vc["m:" + normalizeField(header[i])] || vc.all;
+    const vc = (info && info.valueColors) || {}, vr = (info && info.valueRules) || {};
+    const key = "m:" + normalizeField(header[i]);
+    let hex = vc[key] || vc.all;
+    const rule = vr[key] || vr.all;
+    if (!hex && rule) {
+      // the rule reads this card's own fields
+      const column = (name) => {
+        const k = header.findIndex((h) => normalizeField(h) === normalizeField(name));
+        return k >= 0 ? [cells[k].value ?? null] : null;
+      };
+      hex = evaluateColorRule(rule, column, 1).colors[0];
+    }
     return hex ? toArgb(hex) : null;
   };
   const tinted = (font, i) => (valueColor(i) ? { ...font, color: { argb: valueColor(i) } } : font);
@@ -832,6 +872,7 @@ function captionRuns(item, colors, header, fonts, units) {
   if (colors.legend && colors.legend.scale) {
     return [...colors.legend.scale.map((argb) => [KEY_GLYPH, fonts.dot(argb)]), ["  " + colors.legend.label, fonts.caption]];
   }
+  if (colors.legend && colors.legend.text) return [[colors.legend.text, fonts.caption]];
   if (colors.legend && colors.legend.entries) {
     const { runs, shown } = legend(colors.legend.entries);
     if (shown < colors.legend.entries.length) runs.push([`+${colors.legend.entries.length - shown} more`, fonts.captionMore]);
@@ -953,6 +994,123 @@ function writeDataTable(ws, r, col, item, tableName, widths, lay, number) {
   });
 
   if (item.colors) applyVisualColors(ws, hr, col, item, item.colors, lay);
+  if (item.tableFormat) applyTableFormats(ws, hr, col, item, header, data, lay);
+}
+
+/* Excel icon sets for Power BI icon rules: the same number of icons, the closest family */
+function excelIconSet(cases) {
+  const n = cases.length;
+  const names = cases.map((c) => c.icon).join(" ");
+  const family = /signal|bar/i.test(names) ? "Rating" : /arrow/i.test(names) ? "Arrows" : /triangle/i.test(names) ? "Triangles"
+    : /star/i.test(names) ? "Stars" : /flag/i.test(names) ? "Flags" : /quarter|pie/i.test(names) ? "Quarters" : "Traffic";
+  const sets = {
+    3: { Arrows: "3Arrows", Triangles: "3Triangles", Stars: "3Stars", Flags: "3Flags" },
+    4: { Rating: "4Rating", Arrows: "4Arrows" },
+    5: { Rating: "5Rating", Arrows: "5Arrows", Quarters: "5Quarters" },
+  };
+  if (n < 3 || n > 5) return null;
+  return sets[n][family] || { 3: "3TrafficLights1", 4: "4TrafficLights", 5: "5Rating" }[n];
+}
+
+/* How "full" an icon looks, to tell whether the report's icons run high-to-low */
+function iconRank(name) {
+  const order = [/empty|none|red|down|low\b|bad/i, /low|one/i, /medium(?!2)|yellow|side|two/i, /medium2|three/i, /full|green|up|high|good/i];
+  const i = order.findIndex((re) => re.test(name));
+  return i < 0 ? 2 : i;
+}
+
+/*
+ * Table / matrix visuals keep their Power BI formatting (from the report file):
+ *  - background and font colours, fixed or from an fx rule (colour scale or rules), per cell,
+ *    with readable text on filled cells; Excel moves them with the rows when sorting
+ *  - data bars as Excel data bars, icon rules as the closest Excel icon set
+ * A format names its column by field; matrices export rows then values in field order,
+ * so a value field not found by name is found by its position among the values.
+ */
+function applyTableFormats(ws, hr, col, item, header, data, lay) {
+  const info = item.tableFormat;
+  const norm = header.map((h) => normalizeField(h));
+  const values = info.measures || [];
+  const columnOf = (name) => {
+    const n = String(name || "").toLowerCase();
+    const byName = norm.indexOf(normalizeField(n));
+    if (byName >= 0) return byName;
+    const k = values.findIndex((m) => m.ref === n || m.ref === normalizeField(n));
+    const ci = k >= 0 ? header.length - values.length + k : -1;
+    return ci >= 0 && ci < header.length ? ci : -1;
+  };
+  const first = hr + 1, last = hr + data.length;
+  if (!data.length) return;
+
+  // One colour per row for a column: a fixed colour, or its fx rule (null = left as is)
+  const column = (name) => {
+    const ci = columnOf(name);
+    return ci >= 0 ? data.map((r) => r[ci].value ?? null) : null;
+  };
+  const rowColors = (f) => {
+    if (f.color) return data.map(() => toArgb(f.color));
+    return evaluateColorRule(f.rule, column, data.length).colors.map((c) => (c ? toArgb(c) : null));
+  };
+
+  const fontCache = new Map();
+  const fontIn = (argb, bold) => {
+    const key = argb + (bold ? "b" : "");
+    if (!fontCache.has(key)) fontCache.set(key, { ...lay.fonts.body, color: { argb } });
+    return fontCache.get(key);
+  };
+  for (const f of info.tableFormats) {
+    if (f.target === "header") {
+      header.forEach((_, ci) => {
+        const h = ws.getCell(hr, col + ci);
+        if (f.kind === "back") { h.fill = solidFill(toArgb(f.color)); h.font = { ...h.font, color: { argb: textOn(toArgb(f.color)) } }; }
+        else h.font = { ...h.font, color: { argb: toArgb(f.color) } };
+      });
+      continue;
+    }
+    const targets = f.target === "all"
+      ? header.map((_, ci) => ci).filter((ci) => data.some((r) => typeof r[ci].value === "number"))
+      : [columnOf(f.target.slice(2))].filter((ci) => ci >= 0);
+    for (const ci of targets) {
+      const c = col + ci;
+      const L = ws.getColumn(c).letter;
+      if (f.kind === "back" || f.kind === "font") {
+        const colors = rowColors(f);
+        colors.forEach((argb, ri) => {
+          if (!argb) return;
+          const cell = ws.getCell(first + ri, c);
+          if (f.kind === "back") {
+            cell.fill = solidFill(argb);
+            cell.font = fontIn(textOn(argb));
+            cell.border = GAP_BORDER;
+          } else {
+            cell.font = fontIn(argb);
+          }
+        });
+      } else if (f.kind === "bar") {
+        ws.addConditionalFormatting({
+          ref: `${L}${first}:${L}${last}`,
+          rules: [{ type: "dataBar", gradient: false, border: false, showValue: f.bar.showValue, minLength: 0, maxLength: 100,
+            cfvo: [{ type: "min" }, { type: "max" }], color: { argb: toArgb(f.bar.color) } }],
+        });
+      } else if (f.kind === "icon") {
+        // Excel thresholds: % of range, a number or a percentile, like the report's
+        const cfvo = (at) => (at.num !== undefined ? { type: "num", value: at.num }
+          : at.pctl !== undefined ? { type: "percentile", value: Math.round(at.pctl * 100) }
+            : { type: "percent", value: Math.round((at.pct || 0) * 100) });
+        const sortKey = (at) => (at.num !== undefined ? at.num : (at.pct ?? at.pctl ?? 0));
+        const cases = [...f.icons.cases].sort((a, b) => sortKey(a.from) - sortKey(b.from));
+        const iconSet = excelIconSet(cases);
+        if (!iconSet) continue;
+        const reverse = iconRank(cases[cases.length - 1].icon) < iconRank(cases[0].icon);
+        const steps = cases.map((x) => cfvo(x.from));
+        if (steps[0].type === "num") steps[0] = { type: "min" };   // the lowest icon starts at the lowest value
+        ws.addConditionalFormatting({
+          ref: `${L}${first}:${L}${last}`,
+          rules: [{ type: "iconSet", iconSet, reverse, showValue: true, cfvo: steps }],
+        });
+      }
+    }
+  }
 }
 
 /* Text colour that reads best on a filled cell: white or ink, whichever contrasts more */
@@ -998,13 +1156,18 @@ function applyVisualColors(ws, hr, col, item, colors, lay) {
   }
 
   const dot = colors.dot;
-  if (!dot && !colors.perRow) return;
+  if (!dot && !colors.perCol) return;
   const tabs = dot ? { g: col - 1, keyCol: col + dot.keyCol, first, last, cells: [], seen: new Map(), noRules: dot.sortSafe === false } : null;
   data.forEach((row, ri) => {
     const key = dot ? (row[dot.keyCol] ?? "").trim() : "";
-    const argb = colors.perRow ? colors.perRow[ri] : key ? dot.colorOf(key) : null;
+    const argb = colors.tabColors ? colors.tabColors[ri] : key ? dot.colorOf(key) : null;
+    if (lay.colorCells) {
+      for (const ci of colors.rowCols) {
+        const cellColor = colors.perCol && colors.perCol[ci] ? colors.perCol[ci][ri] : argb;
+        if (cellColor) fillCell(ws.getCell(first + ri, col + ci), cellColor);
+      }
+    }
     if (!argb) return;
-    if (lay.colorCells) for (const ci of colors.rowCols) fillCell(ws.getCell(first + ri, col + ci), argb);
     if (!tabs) return;
     tabs.cells.push([first + ri, argb]);
     if (key && !tabs.seen.has(key)) tabs.seen.set(key, argb);
@@ -1199,6 +1362,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     item.displayTitle = title;
     const info = lay.reportColors && item.name ? lay.reportColors.visuals[item.name] || null : null;
     item.colors = lay.palette && !item.isKpi ? columnColors(item, lay.palette, info) : null;
+    item.tableFormat = info && info.tableFormats && info.tableFormats.length ? info : null;
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
   }
   const executive = !BUILT_IN_STYLES.includes(lay.tableStyle);

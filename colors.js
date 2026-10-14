@@ -25,6 +25,11 @@ const FALLBACK_THEME = {
   background: "#FFFFFF",
   foreground: "#252423",
 };
+// Named theme colours used by conditional formatting, with Power BI's defaults
+const THEME_KEYWORDS = { maxColor: "maximum", minColor: "minimum", midColor: "center", centerColor: "center",
+  good: "good", bad: "bad", neutral: "neutral", nullColor: "null", foreground: "foreground", background: "background" };
+const KEYWORD_DEFAULTS = { maximum: "#118DFF", minimum: "#DEEFFF", center: "#D9B300", good: "#1AAB40", bad: "#D64554",
+  neutral: "#D9B300", null: "#FF7F48", foreground: "#252423", background: "#FFFFFF" };
 const COLOR_BY_ITEM_TYPES = ["pieChart", "donutChart", "treemap"];
 const SINGLE_COLOR_TYPES = ["scatterChart", "map", "filledMap", "shapeMap", "azureMap", "funnel"];
 const MEASURE_ROLES = ["Y", "Y2", "Values", "ColumnY", "LineY", "Size"];   // roles whose fields are drawn as series
@@ -75,7 +80,10 @@ function colorFromExpr(e, theme) {
   if (!e) return null;
   if (e.Literal) {
     const hex = String(e.Literal.Value).replace(/'/g, "");
-    return /^#[0-9A-F]{6}$/i.test(hex) ? hex.toUpperCase() : null;
+    if (/^#[0-9A-F]{6}$/i.test(hex)) return hex.toUpperCase();
+    const key = THEME_KEYWORDS[hex];   // "maxColor" → the theme's maximum colour …
+    const named = key && ((theme.keywords && theme.keywords[key]) || KEYWORD_DEFAULTS[key]);
+    return named ? String(named).toUpperCase() : null;
   }
   if (e.ThemeDataColor) {
     const id = e.ThemeDataColor.ColorId, pct = e.ThemeDataColor.Percent || 0;
@@ -89,17 +97,21 @@ function colorFromExpr(e, theme) {
 }
 
 /* ── Conditional formatting ("fx") colour rules ───────────────────────────
- * Kept as data and evaluated per row by export.js (colorRuleRows), because the colour
- * depends on each data point's values:
- *  { kind: "gradient", input, min, mid, max }   stops: { color, value|null }
- *  { kind: "conditional", input, cases: [{ test, color }] }
+ * Kept as data and evaluated per row by evaluateColorRule, because the colour depends on
+ * each data point's values:
+ *  { kind: "gradient", input, min, mid, max, nulls }   stops: { color, at: threshold|null }
+ *  { kind: "conditional", input, cases: [{ test, color }], otherwise, nulls }
+ *  { kind: "field", input }                             the field's values are colours
  * input is the name of the measure / column the rule reads, as the report spells it.
+ * A threshold is { num }, { pct } (a fraction of the range from lowest to highest value),
+ * { pctl } (a percentile) or { str } (a text value).
  */
 function refName(x) {
   if (!x) return null;
   const inner = x.Measure || x.Column || (x.Aggregation && (x.Aggregation.Expression.Column || x.Aggregation.Expression.Measure));
   if (inner && inner.Property) return String(inner.Property);
   if (x.HierarchyLevel && x.HierarchyLevel.Level) return String(x.HierarchyLevel.Level);
+  if (x.SelectRef && x.SelectRef.ExpressionName) return String(x.SelectRef.ExpressionName).split(".").pop();   // "Sales.Profit"
   return null;
 }
 
@@ -111,19 +123,43 @@ function literalValue(x) {
   return normalizeValue(v);
 }
 
+function parseThreshold(x) {
+  if (!x) return null;
+  if (x.Literal) {
+    const v = literalValue(x);
+    return typeof v === "number" ? { num: v } : v === null ? null : { str: v };
+  }
+  if (x.RangePercent && x.RangePercent.Percent !== undefined) return { pct: Number(x.RangePercent.Percent) };
+  if (x.Percentile && x.Percentile.Percent !== undefined) return { pctl: Number(x.Percentile.Percent) };
+  return null;
+}
+
 /* ComparisonKind: 0 =, 1 >, 2 >=, 3 <=, 4 < */
 function parseCondition(c) {
   if (!c) return null;
   if (c.Comparison) {
     const input = refName(c.Comparison.Left);
-    const value = literalValue(c.Comparison.Right);
-    return input && value !== null ? { input, op: c.Comparison.ComparisonKind, value } : null;
+    const at = parseThreshold(c.Comparison.Right);
+    return input && at ? { input, op: c.Comparison.ComparisonKind, at } : null;
   }
-  if (c.And) {
-    const a = parseCondition(c.And.Left), b = parseCondition(c.And.Right);
-    return a && b ? { and: [a, b], input: a.input } : null;
+  for (const [k, kind] of [["And", "and"], ["Or", "or"]]) {
+    if (c[k]) {
+      const a = parseCondition(c[k].Left), b = parseCondition(c[k].Right);
+      return a && b ? { [kind]: [a, b], input: a.input } : null;
+    }
+  }
+  if (c.Not) {
+    const a = parseCondition(c.Not.Expression);
+    return a ? { not: a, input: a.input } : null;
   }
   return null;
+}
+
+/* How blanks are coloured: as zero (Power BI's default), not at all, or in a set colour */
+function parseNulls(fr, theme) {
+  const n = fr && fr.nullColoringStrategy;
+  const mode = n && n.strategy && n.strategy.Literal ? String(n.strategy.Literal.Value).replace(/'/g, "") : "asZero";
+  return { mode, color: n && n.color ? colorFromExpr(n.color.Literal ? n.color : n.color.solid ? n.color.solid.color.expr : n.color, theme) : null };
 }
 
 function parseColorRule(fill, theme) {
@@ -134,16 +170,99 @@ function parseColorRule(fill, theme) {
     const g = fr.linearGradient3 || fr.linearGradient2;
     const input = refName(e.FillRule.Input);
     if (!g || !input) return null;
-    const stop = (st) => (st ? { color: colorFromExpr(st.color, theme), value: st.value ? literalValue(st.value) : null } : null);
-    const rule = { kind: "gradient", input, min: stop(g.min), mid: stop(g.mid), max: stop(g.max) };
+    const stop = (st) => (st ? { color: colorFromExpr(st.color, theme), at: parseThreshold(st.value) } : null);
+    const rule = { kind: "gradient", input, min: stop(g.min), mid: stop(g.mid), max: stop(g.max), nulls: parseNulls(g, theme) };
     return rule.min && rule.min.color && rule.max && rule.max.color ? rule : null;
   }
   if (e.Conditional) {
     const cases = (e.Conditional.Cases || []).map((c) => ({ test: parseCondition(c.Condition), color: colorFromExpr(c.Value, theme) }))
       .filter((c) => c.test && c.color);
-    return cases.length ? { kind: "conditional", input: cases[0].test.input, cases } : null;
+    if (!cases.length) return null;
+    const otherwise = e.Conditional.DefaultValue ? colorFromExpr(e.Conditional.DefaultValue, theme) : null;
+    return { kind: "conditional", input: cases[0].test.input, cases, otherwise };
   }
-  return null;
+  // "Format by: Field value": a measure or column whose values are the colours
+  const field = refName(e);
+  return field ? { kind: "field", input: field } : null;
+}
+
+/*
+ * Colours an fx rule gives each row. column(name) returns the field's value in every row
+ * (numbers, text or null for blank), or null when the field isn't in the exported data.
+ * Returns { colors: [hex | null] (null = no rule colour), missing: [field names not found] }.
+ */
+function evaluateColorRule(rule, column, rowCount) {
+  const missing = [];
+  const get = (name) => { const v = column(name); if (!v && !missing.includes(name)) missing.push(name); return v; };
+  const none = () => ({ colors: new Array(rowCount).fill(null), missing });
+  const numbers = (v) => v.map((x) => (typeof x === "number" ? x : null));
+  const stats = (nums) => {
+    const present = nums.filter((x) => x !== null).sort((a, b) => a - b);
+    return { min: present[0] ?? 0, max: present[present.length - 1] ?? 0, sorted: present };
+  };
+  const level = (at, st) => {
+    if (!at) return null;
+    if (at.num !== undefined) return at.num;
+    if (at.pct !== undefined) return st.min + (st.max - st.min) * at.pct;
+    if (at.pctl !== undefined && st.sorted.length) return st.sorted[Math.min(st.sorted.length - 1, Math.floor(at.pctl * st.sorted.length))];
+    return null;
+  };
+
+  if (rule.kind === "field") {
+    const v = get(rule.input);
+    if (!v) return none();
+    return { colors: v.map((x) => { const t = String(x ?? "").trim(); return /^#[0-9A-F]{6}$/i.test(t) ? t.toUpperCase() : null; }), missing };
+  }
+
+  if (rule.kind === "gradient") {
+    const v = get(rule.input);
+    if (!v) return none();
+    const nulls = rule.nulls || { mode: "asZero" };
+    const nums = numbers(v).map((x) => (x === null && nulls.mode === "asZero" ? 0 : x));
+    const st = stats(nums);
+    const lo = level(rule.min.at, st) ?? st.min, hi = level(rule.max.at, st) ?? st.max;
+    const hasMid = rule.mid && rule.mid.color;
+    const mid = hasMid ? (level(rule.mid.at, st) ?? (lo + hi) / 2) : null;
+    const part = (x, a, b) => (b === a ? 1 : Math.max(0, Math.min(1, (x - a) / (b - a))));
+    return {
+      colors: nums.map((x) => {
+        if (x === null) return nulls.mode === "specificColor" ? nulls.color : null;
+        if (hasMid) return x <= mid ? mixHex(rule.min.color, rule.mid.color, part(x, lo, mid)) : mixHex(rule.mid.color, rule.max.color, part(x, mid, hi));
+        return mixHex(rule.min.color, rule.max.color, part(x, lo, hi));
+      }),
+      missing,
+    };
+  }
+
+  // Conditional: the first case whose condition holds
+  const cache = {};
+  const fieldOf = (name) => {
+    if (!(name in cache)) {
+      const v = get(name);
+      cache[name] = v ? { v, st: stats(numbers(v)) } : null;
+    }
+    return cache[name];
+  };
+  const test = (c, ri) => {
+    if (c.and) return c.and.every((x) => test(x, ri));
+    if (c.or) return c.or.some((x) => test(x, ri));
+    if (c.not) return !test(c.not, ri);
+    const f = fieldOf(c.input);
+    if (!f) return false;
+    const raw = f.v[ri];
+    if (c.at.str !== undefined) {
+      const eq = normalizeValue(raw) === c.at.str;
+      return c.op === 0 ? eq : false;
+    }
+    const x = typeof raw === "number" ? raw : 0;   // blanks count as zero
+    const y = level(c.at, f.st);
+    if (y === null) return false;
+    return [x === y, x > y, x >= y, x <= y, x < y][c.op] || false;
+  };
+  return {
+    colors: Array.from({ length: rowCount }, (_, ri) => { const hit = rule.cases.find((c) => test(c.test, ri)); return hit ? hit.color : rule.otherwise || null; }),
+    missing,
+  };
 }
 
 /* Which data points a rule colours: every point / category ("all"), each legend value
@@ -211,11 +330,14 @@ async function readTheme(zip, themeCollection) {
   const merged = { ...(base || {}), ...(custom || {}) };
   const dataColors = (merged.dataColors || []).filter((c) => /^#[0-9A-F]{6}$/i.test(c));
   if (!dataColors.length) return null;
+  const keywords = {};
+  for (const k of Object.values(THEME_KEYWORDS)) if (/^#[0-9A-F]{6}$/i.test(merged[k] || "")) keywords[k] = merged[k];
   return {
     name: (custom && custom.name) || (base && base.name) || "Report theme",
     dataColors,
     background: merged.background || FALLBACK_THEME.background,
     foreground: merged.foreground || FALLBACK_THEME.foreground,
+    keywords,
   };
 }
 
@@ -235,7 +357,7 @@ function legacyVisual(config) {
     }));
   }
   const o = sv.objects || {};
-  return { type: sv.visualType, roles, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [], values: [...(o.value || []), ...(o.labels || [])] };
+  return { type: sv.visualType, roles, objects: o, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [], values: [...(o.value || []), ...(o.labels || [])] };
 }
 
 function pbirVisual(json) {
@@ -248,7 +370,59 @@ function pbirVisual(json) {
     }));
   }
   const o = v.objects || {};
-  return { type: v.visualType, roles, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [], values: [...(o.value || []), ...(o.labels || [])] };
+  return { type: v.visualType, roles, objects: o, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [], values: [...(o.value || []), ...(o.labels || [])] };
+}
+
+/* Icon rules ("fx" icons): each case's lower bound (a threshold) and its icon */
+function parseIconRule(icon) {
+  const e = icon && icon.value && icon.value.expr && icon.value.expr.Conditional;
+  if (!e) return null;
+  const lower = (c) => {
+    if (!c) return null;
+    if (c.and) return lower(c.and[0]) || lower(c.and[1]);
+    return c.op === 1 || c.op === 2 ? c.at : null;   // > or >=
+  };
+  const cases = (e.Cases || []).map((c) => ({ from: lower(parseCondition(c.Condition)), icon: String((c.Value && c.Value.Literal && c.Value.Literal.Value) || "").replace(/'/g, "") }))
+    .map((c) => ({ ...c, from: c.from || { pct: 0 } }));
+  return cases.length >= 2 ? { cases } : null;
+}
+
+/*
+ * Formatting of a table or matrix visual: [{ target, kind, color | rule | bar | icons }]
+ * target "m:<field>" (one column) or "all"; kind "back" | "font" (a colour or an fx rule),
+ * "bar" (data bars) or "icon" (an icon rule).
+ */
+function tableFormats(objects, theme) {
+  const out = [];
+  for (const d of (objects && objects.values) || []) {
+    const props = d.properties || {};
+    const target = d.selector && d.selector.metadata ? "m:" + normalizeField(d.selector.metadata) : "all";
+    for (const [prop, kind] of [["backColor", "back"], ["fontColor", "font"]]) {
+      if (!props[prop]) continue;
+      const color = colorFromFill(props[prop], theme);
+      const rule = color ? null : parseColorRule(props[prop], theme);
+      if (color || rule) out.push({ target, kind, color, rule });
+    }
+    if (props.icon) {
+      const icons = parseIconRule(props.icon);
+      if (icons) out.push({ target, kind: "icon", icons });
+    }
+  }
+  // Column header colours set in the report
+  for (const d of (objects && objects.columnHeaders) || []) {
+    const props = d.properties || {};
+    const back = colorFromFill(props.backColor, theme), font = colorFromFill(props.fontColor, theme);
+    if (back) out.push({ target: "header", kind: "back", color: back });
+    if (font) out.push({ target: "header", kind: "font", color: font });
+  }
+  for (const d of (objects && objects.columnFormatting) || []) {
+    const bars = (d.properties || {}).dataBars;
+    if (!bars || !d.selector || !d.selector.metadata) continue;
+    const color = colorFromFill(bars.positiveColor, theme);
+    const hide = bars.hideText && bars.hideText.expr && bars.hideText.expr.Literal && bars.hideText.expr.Literal.Value === "true";
+    if (color) out.push({ target: "m:" + normalizeField(d.selector.metadata), kind: "bar", bar: { color, showValue: !hide } });
+  }
+  return out;
 }
 
 /* How a visual colours its data, with every colour set by hand resolved to a hex code */
@@ -270,13 +444,28 @@ function visualColorInfo(visual, theme) {
     if (fallback && !overrides.all) overrides.all = fallback;
   }
   // Card values: the new card's value font colour, or the classic card's label colour
-  const valueColors = {};
+  // (a fixed colour, or an fx rule); a gauge's value takes its arc colour
+  const valueColors = {}, valueRules = {};
   for (const d of visual.values) {
     const props = d.properties || {};
-    const color = colorFromFill(props.fontColor || props.color, theme);
+    const fill = props.fontColor || props.color;
     const key = selectorKey(d.selector);
-    if (color && key && !valueColors[key]) valueColors[key] = color;
+    if (!key) continue;
+    const color = colorFromFill(fill, theme);
+    if (color && !valueColors[key]) valueColors[key] = color;
+    const rule = color ? null : parseColorRule(fill, theme);
+    if (rule && !valueRules[key]) valueRules[key] = rule;
   }
+  if (visual.type === "gauge" && overrides.all && !valueColors.all) valueColors.all = overrides.all;
+  // Waterfall: increase / decrease / total colours (theme good / bad / first colour by default)
+  const sentiment = ((visual.objects || {}).sentimentColors || [])[0];
+  const sp = (sentiment && sentiment.properties) || {};
+  const kw = (k) => (theme.keywords && theme.keywords[k]) || KEYWORD_DEFAULTS[k];
+  const waterfall = visual.type === "waterfallChart" ? {
+    increase: colorFromFill(sp.increaseFill, theme) || kw("good"),
+    decrease: colorFromFill(sp.decreaseFill, theme) || kw("bad"),
+    total: colorFromFill(sp.totalFill, theme) || theme.dataColors[0],
+  } : null;
   const roles = visual.roles;
   const series = (roles.Series || [])[0] || null;
   const measures = MEASURE_ROLES.flatMap((r) => roles[r] || []);
@@ -294,6 +483,9 @@ function visualColorInfo(visual, theme) {
     overrides,
     rules,
     valueColors,
+    valueRules,
+    waterfall,
+    tableFormats: ["tableEx", "pivotTable", "table", "matrix"].includes(visual.type) ? tableFormats(visual.objects, theme) : [],
   };
 }
 
