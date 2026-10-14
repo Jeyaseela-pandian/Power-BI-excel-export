@@ -12,6 +12,7 @@
     background: "#FFFFFF", foreground: "#252423", good: "#00AA00", bad: "#CC0000", maximum: "#0000FF", minimum: "#FFFFFF",
   };
   const P = THEME.dataColors;
+  const DONUT = "doubleDonut2B2DE03D219E04DFF80684A45ECA4D25E";   // NeenOpal's Double Donut Chart (AppSource)
 
   // ── Report-file building blocks ─────────────────────────────────────
   const fieldRef = (f) => {
@@ -137,6 +138,28 @@
       rows: [["Month", "Gender", "Sales"], ["Jan", "Male", "5"], ["Jan", "Female", "6"]], expect: { col: "Sales", rows: [P[0], "#F5C869"] } },
     { id: "tooltip measures aren't series", v: visual("c22", "clusteredBarChart", { Category: ["S.Category"], Y: ["S.Sales"], Tooltips: ["S.Cost"] }),
       rows: [["Category", "Sales", "Cost"], ["A", "1", "2"]], expect: { series: { Sales: P[0] }, uncoloured: ["Cost"] } },
+    // Double donut (NeenOpal): inner ring by category, outer ring in lighter shades of it
+    { id: "double donut: blank category, outer ring in shades (CAPSTONE report)",
+      v: visual("d1", DONUT, { value: ["S.Supplied CBM"], category: ["S.Year"], subcategory: ["S.Quarter"] }),
+      rows: [["Supplied CBM", "Year", "Quarter"], ["181.26", "", ""], ["11126.49", "2021", "Qtr 2"], ["4995.39", "2021", "Qtr 3"], ["19875.18", "2021", "Qtr 4"]],
+      expect: { keyCol: "Year", col: "Year", rows: [P[0], P[1], P[1], P[1]],
+        rings: { col: "Quarter", rows: [mixHex(P[2], "#FFFFFF", 0.3), mixHex(P[1], "#FFFFFF", 0.3), mixHex(P[1], "#FFFFFF", 0.55), mixHex(P[1], "#FFFFFF", 0.8)] } } },
+    { id: "double donut: colour set for a category still uses up its theme colour",
+      v: visual("d2", DONUT, { value: ["S.Sales"], category: ["S.Region"], subcategory: ["S.Segment"] }, { categoryColors: [fill(lit("#00FFFF"), item("S.Region", "South"))] }),
+      rows: [["Region", "Segment", "Sales"], ["North", "A", "1"], ["North", "B", "2"], ["South", "A", "3"], ["West", "A", "4"], ["West", "B", "5"], ["West", "C", "6"]],
+      expect: { keyCol: "Region", col: "Region", rows: [P[0], P[0], "#00FFFF", P[2], P[2], P[2]],
+        rings: { col: "Segment", rows: [mixHex(P[0], "#FFFFFF", 0.3), mixHex(P[0], "#FFFFFF", 0.8), mixHex("#00FFFF", "#FFFFFF", 0.3),
+          mixHex(P[2], "#FFFFFF", 0.3), mixHex(P[2], "#FFFFFF", 0.55), mixHex(P[2], "#FFFFFF", 0.8)] } } },
+    { id: "double donut without the report file: the grouped column is the category", noFile: true,
+      v: visual("d3", DONUT, { value: ["S.Supplied CBM"], category: ["S.Year"], subcategory: ["S.Quarter"] }),
+      rows: [["Supplied CBM", "Quarter", "Year"], ["181.26", "", ""], ["11126.49", "Qtr 2", "2021"], ["4995.39", "Qtr 3", "2021"], ["19875.18", "Qtr 4", "2021"]],
+      expect: { keyCol: "Year", col: "Year", rows: [P[0], P[1], P[1], P[1]],
+        rings: { col: "Quarter", rows: [mixHex(P[2], "#FFFFFF", 0.3), mixHex(P[1], "#FFFFFF", 0.3), mixHex(P[1], "#FFFFFF", 0.55), mixHex(P[1], "#FFFFFF", 0.8)] } } },
+    { id: "double donut: date categories take new theme colours on the outer ring",
+      v: visual("d4", DONUT, { value: ["S.Sales"], category: ["S.Date"], subcategory: ["S.Segment"] }),
+      rows: [["Date", "Segment", "Sales"], ["1/1/2024", "A", "1"], ["1/1/2024", "B", "2"], ["2/1/2024", "A", "3"]],
+      expect: { keyCol: "Date", col: "Date", rows: [P[0], P[0], P[1]],
+        rings: { col: "Segment", rows: [mixHex(P[2], "#FFFFFF", 0.3), mixHex(P[2], "#FFFFFF", 0.8), mixHex(P[3], "#FFFFFF", 0.3)] } } },
   ];
 
   const hexOf = (argb) => (argb ? "#" + String(argb).slice(2).toUpperCase() : null);
@@ -145,7 +168,7 @@
     const design = await buildReport(cases.map((c) => c.v));
     const results = [];
     for (const c of cases) {
-      const info = visualInfo(design, "page1", c.v.name);
+      const info = c.noFile ? null : visualInfo(design, "page1", c.v.name);
       const item = { rows: c.rows, type: c.v.visual.visualType, name: c.v.name, displayTitle: c.id };
       const colors = columnColors(item, design.theme.dataColors, info);
       const header = c.rows[0];
@@ -163,6 +186,12 @@
               : colors.dot ? hexOf(colors.dot.colorOf(String(row[colors.dot.keyCol]).trim())) : hexOf(colors.series[ci]);
             if (got !== c.expect.rows[ri].toUpperCase()) problems.push(`row ${ri + 1} ${got} ≠ ${c.expect.rows[ri]}`);
           });
+        }
+        if (c.expect.keyCol && (!colors.dot || header[colors.dot.keyCol] !== c.expect.keyCol)) problems.push(`colour key ${colors.dot ? header[colors.dot.keyCol] : "none"} ≠ ${c.expect.keyCol}`);
+        if (c.expect.rings) {
+          const rings = colors.rings;
+          if (!rings || header[rings.col] !== c.expect.rings.col) problems.push(`outer ring on ${rings ? header[rings.col] : "nothing"} ≠ ${c.expect.rings.col}`);
+          else c.expect.rings.rows.forEach((hex, ri) => { if (hexOf(rings.colors[ri]) !== hex.toUpperCase()) problems.push(`outer row ${ri + 1} ${hexOf(rings.colors[ri])} ≠ ${hex}`); });
         }
         if (c.expect.note && !colors.note) problems.push("no approximation note");
         for (const h of c.expect.uncoloured || []) if (colors.series[header.indexOf(h)]) problems.push(`${h} shouldn't be coloured`);
@@ -265,6 +294,7 @@
       visual("k1", "cardVisual", { Data: ["S.Sales", "S.Cost"] }, {
         value: [{ properties: { fontColor: solid(lit("#123456")) }, selector: meta("S.Sales") }, { properties: { fontColor: solid(cond([[cmp("S.Cost", 1, num(0)), "#00AA00"]])) }, selector: meta("S.Cost") }],
       }),
+      visual("dd", DONUT, { value: ["S.Supplied CBM"], category: ["S.Year"], subcategory: ["S.Quarter"] }),
     ];
     const zip = new JSZip();
     zip.file("Report/definition/report.json", JSON.stringify({ themeCollection: { baseTheme: { name: "CaseTheme" } } }));
@@ -285,6 +315,7 @@
       t4: [["Item", "Delta", "Score"], ["One", "-5", "1"], ["Two", "8", "2"]],
       s1: [["Region"], ["North"], ["South"]],
       c1: [["Units Sold", "Channel"], ["10", "Online"], ["20", "Retail"]],
+      dd: [["Supplied CBM", "Year", "Quarter"], ["181.26", "", ""], ["11126.49", "2021", "Qtr 2"], ["4995.39", "2021", "Qtr 3"], ["19875.18", "2021", "Qtr 4"]],
     };
     const page = { name: "page1", displayName: "Cases", visibility: 0, getFilters: async () => [], setActive: async () => {},
       getVisuals: async () => [
@@ -306,6 +337,7 @@
         { name: "h2", title: "Hidden chart", type: "lineChart", layout: { x: 0, y: 1500, width: 50, height: 50, displayState: { mode: 1 } }, exportData: async () => ({ data: csv(data.p2) }) },
         // a card split by category, untitled: its title comes from its fields
         { name: "c1", title: "", type: "cardVisual", layout: { x: 600, y: 1100, width: 300, height: 200 }, exportData: async () => ({ data: csv(data.c1) }) },
+        { name: "dd", title: "Supplied CBM by Year and Quarter", type: DONUT, layout: { x: 0, y: 1700, width: 600, height: 400 }, exportData: async () => ({ data: csv(data.dd) }) },
       ] };
     embeddedReport = { getActivePage: async () => page, getPages: async () => [page], getFilters: async () => [], getTheme: async () => ({ themeJson: THEME }), on() {}, off() {} };
     currentReport = { id: "cases", embedUrl: "https://x/?groupId=g" };
@@ -390,6 +422,24 @@
       allText.filter((x) => /FILTERS/.test(x)).join(" / "));
     t("hidden shape adds no note, hidden chart does", !result.notes.some((n) => /Toggle shape/.test(n)) && result.notes.some((n) => /Hidden chart/.test(n)), JSON.stringify(result.notes));
     t("untitled card split by category is titled from its fields", allText.includes("Units Sold by Channel"), allText.filter((x) => /Units Sold/.test(x)).join(" / "));
+    // Double donut: the category cells in the inner ring's colours, the subcategory cells in
+    // the outer ring's shades, the values neutral, the inner ring as the caption legend
+    const year = find("Year"), quarter = find("Quarter"), cbm = find("Supplied CBM");
+    const shade = (hex, amount) => mixHex(hex, "#FFFFFF", amount);
+    const yearFills = year ? [1, 2, 3, 4].map((k) => fillAt(year.r + k, year.c)) : [];
+    const quarterFills = quarter ? [1, 2, 3, 4].map((k) => fillAt(quarter.r + k, quarter.c)) : [];
+    t("double donut: category cells in the inner ring's colours", yearFills.join() === [P[0], P[1], P[1], P[1]].join(), yearFills.join(" "));
+    t("double donut: subcategory cells in the outer ring's shades",
+      quarterFills.join() === [shade(P[2], 0.3), shade(P[1], 0.3), shade(P[1], 0.55), shade(P[1], 0.8)].join(), quarterFills.join(" "));
+    t("double donut: values and their header stay neutral", cbm && !fillAt(cbm.r + 1, cbm.c) && fillAt(cbm.r, cbm.c) === "#F3F5F8", cbm && `${fillAt(cbm.r, cbm.c)} ${fillAt(cbm.r + 1, cbm.c)}`);
+    const donutCap = cbm ? ws.getCell(cbm.r - 1, cbm.c).value : null;
+    const capRuns = (donutCap && donutCap.richText) || [];
+    const keyColor = (label) => {
+      const at = capRuns.findIndex((x) => x.text.trim() === label);
+      return at > 0 ? hexOf(capRuns[at - 1].font.color.argb) : null;
+    };
+    t("double donut: caption legend lists the inner ring, blank as (Blank)", keyColor("(Blank)") === P[0] && keyColor("2021") === P[1],
+      capRuns.map((x) => x.text).join("|"));
     return res;
   }
 })();

@@ -18,6 +18,7 @@
  *  - COLOR_BY_ITEM_TYPES: visuals that give each category value its own colour.
  *  - SINGLE_COLOR_TYPES: visuals drawn in one colour unless a legend is used.
  *  - Funnels draw every bar in one colour unless colours are set per bar.
+ *  - CUSTOM_VISUALS: AppSource visuals whose colouring is known (their code isn't in the file).
  */
 const FALLBACK_THEME = {
   name: "Power BI classic",
@@ -33,6 +34,27 @@ const KEYWORD_DEFAULTS = { maximum: "#118DFF", minimum: "#DEEFFF", center: "#D9B
 const COLOR_BY_ITEM_TYPES = ["pieChart", "donutChart", "treemap"];
 const SINGLE_COLOR_TYPES = ["scatterChart", "map", "filledMap", "shapeMap", "azureMap", "funnel"];
 const MEASURE_ROLES = ["Y", "Y2", "Values", "ColumnY", "LineY", "Size"];   // roles whose fields are drawn as series
+
+/* Supported AppSource visuals, by type name:
+   - roles: each of the visual's own roles, as the built-in role it acts like
+   - colors: the visual's object that holds colours set per category (a "fill")
+   - rule: how it colours its data (columnColors in export.js) */
+const CUSTOM_VISUALS = {
+  // NeenOpal's Double Donut Chart: categories on the inner ring, their subcategories on the outer ring
+  doubleDonut2B2DE03D219E04DFF80684A45ECA4D25E: {
+    name: "Double donut chart",
+    rule: "rings",
+    roles: { category: "Category", subcategory: "Category", value: "Values" },
+    colors: "categoryColors",
+  },
+};
+
+/* A supported AppSource visual's description, or null */
+function customVisual(type) {
+  const t = String(type || "").toLowerCase();
+  const key = Object.keys(CUSTOM_VISUALS).find((k) => k.toLowerCase() === t);
+  return key ? CUSTOM_VISUALS[key] : null;
+}
 
 /* ── Small helpers ────────────────────────────────────────────────────── */
 
@@ -464,9 +486,12 @@ function tableFormats(objects, theme) {
 
 /* How a visual colours its data, with every colour set by hand resolved to a hex code */
 function visualColorInfo(visual, theme) {
+  const custom = customVisual(visual.type);
   const overrides = {};
   const rules = [];   // fx rules: { scope, rule }
-  const points = visual.dataPoint.map((d) => [d, (d.properties || {}).fill]);
+  // Colours set per data point, or in a custom visual's own colour object
+  const own = custom && custom.colors ? (visual.objects || {})[custom.colors] || [] : [];
+  const points = [...visual.dataPoint, ...own].map((d) => [d, (d.properties || {}).fill]);
   const bubbles = visual.bubbles.map((d) => [d, (d.properties || {}).fillColor]);
   const strokes = ((visual.objects || {}).lineStyles || []).filter((d) => d.properties && d.properties.strokeColor)
     .map((d) => [d, d.properties.strokeColor]);
@@ -517,11 +542,14 @@ function visualColorInfo(visual, theme) {
     decrease: colorFromFill(sp.decreaseFill, theme) || kw("bad"),
     total: colorFromFill(sp.totalFill, theme) || theme.dataColors[0],
   } : null;
-  const roles = visual.roles;
+  // A custom visual's roles as the built-in roles they act like (category, then subcategory…)
+  const roles = custom ? {} : visual.roles;
+  if (custom) for (const [name, role] of Object.entries(custom.roles)) roles[role] = [...(roles[role] || []), ...(visual.roles[name] || [])];
   const series = (roles.Series || [])[0] || null;
   const measures = MEASURE_ROLES.flatMap((r) => (roles[r] || []).map((m) => ({ ...m, role: r })));
   let rule = "measure";
-  if (COLOR_BY_ITEM_TYPES.includes(visual.type)) rule = "item";
+  if (custom) rule = custom.rule;
+  else if (COLOR_BY_ITEM_TYPES.includes(visual.type)) rule = "item";
   else if (series) rule = "legend";
   else if (SINGLE_COLOR_TYPES.includes(visual.type)) rule = "single";
   return {

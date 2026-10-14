@@ -195,6 +195,7 @@ exported when picked on purpose.
 | Branding → Table style *Classic blue* | Tables use Excel's blue table style (blue header, stripes) with no ink rules; category cells and series headers still in the report colours |
 | Branding → a very pale accent (e.g. `#FFF200`) | The top rule and KPI caps use a darker shade of the accent (deep gold) so they stay visible; the sheet tab keeps the pale accent |
 | Export options → *Number visuals* | Titles read `01  Sales and cost by month`, `02  …` |
+| A **Double Donut Chart** (NeenOpal, AppSource) in any report | Caption key lists the inner ring's categories in their colours (a blank one as `(Blank)`); each category cell is filled in its inner-ring colour and each subcategory cell in its outer-ring shade (30% to 80% lighter than its category), as in the chart; the values stay plain. Colours set per category (Format → Category Colors) need the exact-colours permission |
 | Open in desktop Excel | No repair prompt; every table's filter and sort buttons work |
 
 If a result differs, note the visual and what you saw, and copy the Diagnostics table and

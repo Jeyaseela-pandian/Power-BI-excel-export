@@ -195,6 +195,7 @@ const FRIENDLY_TYPES = {
 function friendlyType(type) {
   const t = String(type || "");
   if (FRIENDLY_TYPES[t]) return FRIENDLY_TYPES[t];
+  if (customVisual(t)) return customVisual(t).name;
   if (/^deneb/i.test(t)) return "Deneb visual";
   if (/[0-9A-F]{32}$/i.test(t)) return "Custom visual";
   const words = t.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
@@ -425,6 +426,96 @@ function colorRuleRows(rules, t) {
   return { series, rowCols: Object.keys(perCol).map(Number), perCol, rowColors, rowKey: null, dot, legend, note };
 }
 
+/* d3's ordinal scale, as custom visuals use it: a value it doesn't know joins its list and
+   takes the next colour round */
+function ordinalScale(domain, range) {
+  const index = new Map();
+  for (const d of domain) if (!index.has(d)) index.set(d, index.size);
+  return (d) => {
+    if (!index.has(d)) index.set(d, index.size);
+    return range[index.get(d) % range.length];
+  };
+}
+
+/*
+ * A double donut chart (NeenOpal's Double Donut Chart), coloured as its code does it: the
+ * inner ring shows the categories, the outer ring their subcategories.
+ *  - Each category takes the next theme colour in the order the data lists them, unless a
+ *    colour is set for it.
+ *  - The visual stores a category's colour under its value as text ("null" for a blank, a
+ *    number or date unformatted) but looks it up by its label ("(Blank)", the formatted
+ *    number or date). Where the two differ, the inner slice takes the colour of the 1st,
+ *    2nd … category, and the outer ring asks the theme for a new colour.
+ *  - An outer slice is its category's colour mixed with white: 30% for the first
+ *    subcategory, evenly up to 80% for the last.
+ * Without the report file, the category is the text column the rows are grouped by (the
+ * one with the fewest values), the subcategory the other. Returns null without a category.
+ */
+function ringColors(t) {
+  const { data, cols, numeric, hex, findCol, palette, info } = t;
+  const text = (row, ci) => String(row[ci] ?? "").trim();
+  let catCol = info && info.categories.length ? findCol(info.categories[0]) : -1;
+  let subCol = catCol >= 0 && info.categories[1] ? findCol(info.categories[1], { [catCol]: true }) : -1;
+  if (catCol < 0) {
+    const yearLike = (ci) => data.every((row) => !text(row, ci) || /^(19|20)\d\d$/.test(text(row, ci)));
+    const textCols = cols.filter((ci) => !hex[ci] && (!numeric[ci] || yearLike(ci)));
+    const distinct = (ci) => new Set(data.map((row) => text(row, ci))).size;
+    const runs = (ci) => data.filter((row, ri) => !ri || text(row, ci) !== text(data[ri - 1], ci)).length;
+    const grouped = textCols.filter((ci) => runs(ci) === distinct(ci));
+    catCol = [...(grouped.length ? grouped : textCols)].sort((a, b) => distinct(a) - distinct(b))[0] ?? -1;
+    subCol = textCols.find((ci) => ci !== catCol) ?? -1;
+  }
+  if (catCol < 0) return null;
+
+  // A value's label, and the text the visual stores its colour under
+  const label = (v) => (v === "" ? "(Blank)" : v);
+  const asTyped = (v) => {   // raw and formatted text agree: plain text, unformatted numbers
+    if (v === "" || /^(true|false)$/i.test(v) || /^\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}/.test(v)) return false;
+    const n = toCellValue(v).value;
+    return typeof n !== "number" || String(n) === v;
+  };
+  const key = (v) => (v === "" ? "null" : asTyped(v) ? v : "\u0001" + v);
+  // Theme colours, handed out in the order they are asked for (the visual's colour palette)
+  const handed = new Map();
+  const themeColor = (k) => {
+    if (!handed.has(k)) handed.set(k, palette[handed.size % palette.length]);
+    return handed.get(k);
+  };
+  const overrides = (info && info.overrides) || {};
+  const cats = [...new Set(data.map((row) => text(row, catCol)))];
+  const colorOf = new Map();
+  for (const v of cats) {
+    const theme = themeColor(key(v));   // asked for even when a colour is set
+    colorOf.set(key(v), overrides["i:" + (v === "" ? "null" : normalizeValue(v))] || theme);
+  }
+  const inner = ordinalScale(cats.map(key), cats.map((v) => colorOf.get(key(v))));
+  const innerColor = Object.fromEntries(cats.map((v) => [v, toArgb(inner(label(v)))]));
+
+  let rings = null;
+  if (subCol >= 0) {
+    const labels = data.map((row) => `${label(text(row, catCol))} - ${label(text(row, subCol))}`);
+    // Slices are grouped by their label's text before the first " - ", as the visual splits it
+    const groups = new Map();
+    for (const l of labels) {
+      const [parent, child] = l.split(" - ");
+      if (!groups.has(parent)) groups.set(parent, []);
+      groups.get(parent).push(child);
+    }
+    const shade = new Map();
+    for (const [parent, kids] of groups) {
+      const base = colorOf.get(parent) || themeColor(parent);
+      kids.forEach((child, k) => shade.set(`${parent} - ${child}`, mixHex(base, "#FFFFFF", 0.3 + k / Math.max(kids.length - 1, 1) * 0.5)));
+    }
+    const outer = ordinalScale(labels, labels.map((l) => shade.get(l)));
+    rings = { col: subCol, colors: labels.map((l) => toArgb(outer(l) || "#000000")) };   // a slice it finds no colour for is black
+  }
+  return {
+    series: {}, rowCols: [], rowKey: { col: catCol, colorOf: innerColor }, rings,
+    legend: { entries: cats.map((v) => ({ label: label(v), argb: innerColor[v] })) },
+    dot: { keyCol: catCol, colorOf: (v) => innerColor[v] || null },
+  };
+}
+
 /*
  * Works out the colours of a chart's table, to match the chart. Returns null for cards,
  * table / matrix visuals, or when there is no palette. Sources, best first:
@@ -437,12 +528,15 @@ function colorRuleRows(rules, t) {
  *     (helper columns such as sort keys, ranks and IDs are skipped); treemap / pie /
  *     donut colour each value of their first field; one series beside one text column
  *     is split by a legend.
+ * Supported AppSource visuals (colors.js CUSTOM_VISUALS) are coloured as their code does
+ * it: a double donut by ringColors.
  * Series take the theme's data colours in field order, legend values in series order
  * (seriesOrder) and pie / treemap categories in the order they appear, as Power BI does.
- * Returns { series, rowCols, hexCols, rowKey, dot, exact }:
+ * Returns { series, rowCols, hexCols, rowKey, rings, dot, exact }:
  *  - series: { col: argb } columns drawn in one colour (header band, filled cells)
  *  - rowCols: columns whose cells take their row's colour (rows coloured by key or hex)
  *  - rowKey: { col, colorOf: { value: argb } } legend / category colours, for the caption
+ *  - rings: { col, colors: [argb per row] } a double donut's outer ring (subcategory cells)
  *  - dot: { keyCol, colorOf(value) } the column that decides each row's colour
  *  - exact: true when the report file described this visual
  */
@@ -462,6 +556,13 @@ function columnColors(item, palette, info) {
     const byLabel = field.label ? free.find((ci) => lower[ci] === field.label) : undefined;
     return byLabel !== undefined ? byLabel : free.find((ci) => norm[ci] === field.ref) ?? -1;
   };
+
+  // A double donut: both rings coloured as the visual's code does it
+  const custom = customVisual(item.type);
+  if (custom && custom.rule === "rings") {
+    const rings = ringColors({ data, cols, numeric, hex, findCol, palette, info });
+    if (rings) return { ...rings, hexCols, exact: !!info };
+  }
 
   // Series columns: the report file's value fields when they match, else every number column
   let seriesCols = [];
@@ -1244,8 +1345,9 @@ function textOn(argb) {
 /*
  * Paints a chart table in the chart's colours, where the chart's legend puts them:
  *  - a colour that names a series goes on the cell that names it, so the numbers stay
- *    neutral: each row's legend value, slice or tile (category cell), or the header of a
- *    measure drawn as one series (also a combo chart's line values)
+ *    neutral: each row's legend value, slice or tile (category cell; a double donut's
+ *    outer ring on the subcategory cell), or the header of a measure drawn as one series
+ *    (also a combo chart's line values)
  *  - a colour that comes from the value (colour scales, rules, waterfall increase /
  *    decrease, colours from a field) stays on the value cells it describes
  * Text on a filled cell is white or ink, whichever reads better. Excel moves fills along
@@ -1281,9 +1383,11 @@ function applyVisualColors(ws, hr, col, item, colors, lay) {
   // category cell in each row, like the chart's legend
   if (colors.rowKey) {
     const k = colors.rowKey.col;
+    const rings = colors.rings;
     data.forEach((row, ri) => {
       const argb = colors.rowKey.colorOf[(row[k] ?? "").trim()];
       if (argb) fillCell(ws.getCell(first + ri, col + k), argb);
+      if (rings && rings.colors[ri]) fillCell(ws.getCell(first + ri, col + rings.col), rings.colors[ri]);
     });
     return;
   }
