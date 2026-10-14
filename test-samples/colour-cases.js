@@ -196,7 +196,7 @@
     downloadDesignFile = async () => buf;
     let href; const orig = HTMLAnchorElement.prototype.click; HTMLAnchorElement.prototype.click = function () { href = this.href; };
     try {
-      await exportToExcel([page], { pages: "current", layout: "report", collapse: true, visibleRows: 8, includeFilters: true, includeNotes: true, matchColors: true, colorCells: true },
+      await exportToExcel([page], { pages: "current", layout: "report", collapse: true, visibleRows: 8, includeFilters: true, includeNotes: true, matchColors: true },
         { accent: "#0B7F56", tableStyle: "Executive", titleFont: "Calibri Light" }, () => {}, () => false);
     } finally { HTMLAnchorElement.prototype.click = orig; }
     const out = await (await fetch(href)).arrayBuffer();

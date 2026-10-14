@@ -163,7 +163,7 @@
     let href, name;
     const original = HTMLAnchorElement.prototype.click;
     HTMLAnchorElement.prototype.click = function () { href = this.href; name = this.download; };
-    const options = { pages: "current", layout: "report", collapse: true, visibleRows: 8, includeFilters: true, includeNotes: true, matchColors: true, colorCells: true, exhibitNumbers: false, ...opts };
+    const options = { pages: "current", layout: "report", collapse: true, visibleRows: 8, includeFilters: true, includeNotes: true, matchColors: true, exhibitNumbers: false, ...opts };
     try {
       const res = await exportToExcel(pageIdx.map((i) => all[i]), options,
         { companyName: "", accent: "#0B7F56", tableStyle: "Executive", titleFont: "Calibri Light", footer: "", ...branding }, () => {}, () => false);

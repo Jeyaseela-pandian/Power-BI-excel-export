@@ -1120,8 +1120,8 @@ function textOn(argb) {
 
 /*
  * Paints a chart table in the chart's colours:
- *  - series drawn in one colour: the header cell becomes a band in that colour and, with
- *    `lay.colorCells`, every value cell below is filled with it
+ *  - series drawn in one colour: the header cell becomes a band in that colour and every
+ *    value cell below is filled with it
  *  - rows coloured by a field (legend, pie, treemap) or a hex column: each row's value
  *    cells are filled with the row's colour (Excel moves fills along when sorting), and
  *    the row gets a colour tab in the column left of the table, painted by paintRowTabs
@@ -1152,7 +1152,7 @@ function applyVisualColors(ws, hr, col, item, colors, lay) {
     const h = ws.getCell(hr, c);
     h.fill = styleOf(argb).fill;
     h.font = styleOf(argb).headFont;
-    if (lay.colorCells) for (let r = first; r <= last; r++) fillCell(ws.getCell(r, c), argb);
+    for (let r = first; r <= last; r++) fillCell(ws.getCell(r, c), argb);
   }
 
   const dot = colors.dot;
@@ -1161,11 +1161,9 @@ function applyVisualColors(ws, hr, col, item, colors, lay) {
   data.forEach((row, ri) => {
     const key = dot ? (row[dot.keyCol] ?? "").trim() : "";
     const argb = colors.tabColors ? colors.tabColors[ri] : key ? dot.colorOf(key) : null;
-    if (lay.colorCells) {
-      for (const ci of colors.rowCols) {
-        const cellColor = colors.perCol && colors.perCol[ci] ? colors.perCol[ci][ri] : argb;
-        if (cellColor) fillCell(ws.getCell(first + ri, col + ci), cellColor);
-      }
+    for (const ci of colors.rowCols) {
+      const cellColor = colors.perCol && colors.perCol[ci] ? colors.perCol[ci][ri] : argb;
+      if (cellColor) fillCell(ws.getCell(first + ri, col + ci), cellColor);
     }
     if (!argb) return;
     if (!tabs) return;
@@ -1637,7 +1635,6 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
     tableStyle: branding.tableStyle || EXECUTIVE,
     palette: options.matchColors ? options.palette : null,
     reportColors: options.matchColors ? options.reportColors || null : null,
-    colorCells: options.colorCells !== false,
     pendingTabs: [],   // row colour tabs, painted once column widths are known
   };
   const ws = wb.addWorksheet(sheetName, {

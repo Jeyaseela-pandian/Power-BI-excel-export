@@ -164,7 +164,7 @@ exported when picked on purpose.
    If the theme line says *not readable, using Power BI defaults* and exact colours aren't
    available, the colour tests below show Power BI's default colours (blue `#118DFF`, navy
    `#12239E`, orange `#E66C37`…) instead of red/blue/green.
-4. Export **Colour test** (current page, Layout: Like the report, both colour options on).
+4. Export **Colour test** (current page, Layout: Like the report, Colours on).
 5. Export again with **All visible pages**, then with **Choose pages** including the hidden page.
 
 ### Expected results – page "Colour test"
@@ -192,7 +192,6 @@ exported when picked on purpose.
 | Test | Expected |
 | --- | --- |
 | *Match the report's chart colours* off | No colours at all: no keys, fills or tabs; captions read `Line chart · 24 rows` etc. |
-| *Fill value cells with the chart colour* off | Keys, coloured series headers and row tabs only; value cells stay white |
 | Branding → Table style *Classic blue* | Tables use Excel's blue table style (blue header, stripes) with no ink rules; series headers, value fills and tabs still in the report colours |
 | Branding → a very pale accent (e.g. `#FFF200`) | The top rule and KPI caps turn ink-dark so they stay visible; the sheet tab keeps the pale accent |
 | Export options → *Number visuals* | Titles read `01  Sales and cost by month`, `02  …` |

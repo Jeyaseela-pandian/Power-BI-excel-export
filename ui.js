@@ -19,7 +19,6 @@ const DEFAULT_OPTIONS = {
   includeFilters: true,
   includeNotes: true,
   matchColors: true,
-  colorCells: true,        // fill value cells with the chart colour (else keys only)
   exhibitNumbers: false,   // "01  Title" numbering of visuals
 };
 const DEFAULT_BRANDING = {
@@ -148,8 +147,6 @@ async function openOptionsDrawer() {
   $("optFilters").checked = exportOptions.includeFilters;
   $("optNotes").checked = exportOptions.includeNotes;
   $("optMatchColors").checked = exportOptions.matchColors;
-  $("optColorCells").checked = exportOptions.colorCells;
-  $("optColorCells").disabled = !exportOptions.matchColors;
   $("optExhibitNumbers").checked = exportOptions.exhibitNumbers;
   showExactColorsHint();
 
@@ -256,7 +253,6 @@ function readDrawerOptions() {
     includeFilters: $("optFilters").checked,
     includeNotes: $("optNotes").checked,
     matchColors: $("optMatchColors").checked,
-    colorCells: $("optColorCells").checked,
     exhibitNumbers: $("optExhibitNumbers").checked,
   };
   saveJson(OPTIONS_KEY, exportOptions);
@@ -474,10 +470,7 @@ $("scrim").addEventListener("click", closeOptionsDrawer);
 document.querySelectorAll("[data-close-drawer]").forEach((b) => b.addEventListener("click", () => { readDrawerOptions(); closeOptionsDrawer(); }));
 document.querySelectorAll('input[name="optPages"]').forEach((r) => r.addEventListener("change", updateDrawerVisibility));
 $("optCollapse").addEventListener("change", () => { $("optVisibleRows").disabled = !$("optCollapse").checked; });
-$("optMatchColors").addEventListener("change", () => {
-  $("optColorCells").disabled = !$("optMatchColors").checked;
-  showExactColorsHint();
-});
+$("optMatchColors").addEventListener("change", showExactColorsHint);
 $("grantExactColors").addEventListener("click", allowExactColors);
 $("visualsAll").addEventListener("click", () => setAllVisuals(true));
 $("visualsNone").addEventListener("click", () => setAllVisuals(false));
