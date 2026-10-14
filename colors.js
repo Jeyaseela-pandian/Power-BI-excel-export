@@ -346,13 +346,33 @@ async function readTheme(zip, themeCollection) {
  * { type, roles: { Category: [{ ref, label }], Series: [...], Y: [...] … }, dataPoint: [...] }
  * ref is the normalised field name; label the visual's own name for it when renamed.
  */
+/* A query field's name: "Month", "Sum(Sales.Sales)" → "sales", a hierarchy level's name */
+function fieldName(f) {
+  if (!f) return null;
+  if (f.Column && f.Column.Property) return f.Column.Property;
+  if (f.Measure && f.Measure.Property) return f.Measure.Property;
+  if (f.Aggregation && f.Aggregation.Expression) return fieldName(f.Aggregation.Expression);
+  if (f.HierarchyLevel && f.HierarchyLevel.Level) return f.HierarchyLevel.Level;
+  return null;
+}
+
+/*
+ * The classic format names each projection by a query alias. Usually that is
+ * "Table.Field", but it can be "select", "select1"… (hierarchy levels, fields added in
+ * some ways), so the real field comes from the visual's query (prototypeQuery.Select).
+ */
 function legacyVisual(config) {
   const sv = config.singleVisual || {};
   const props = sv.columnProperties || {};
+  const aliases = {};
+  for (const sel of ((sv.prototypeQuery || {}).Select || [])) {
+    const name = fieldName(sel);
+    if (sel.Name && name) aliases[sel.Name] = name;
+  }
   const roles = {};
   for (const [role, list] of Object.entries(sv.projections || {})) {
     roles[role] = (list || []).map((p) => ({
-      ref: normalizeField(p.queryRef),
+      ref: normalizeField(aliases[p.queryRef] || p.queryRef),
       label: props[p.queryRef] && props[p.queryRef].displayName ? String(props[p.queryRef].displayName).toLowerCase() : null,
     }));
   }
@@ -365,7 +385,7 @@ function pbirVisual(json) {
   const roles = {};
   for (const [role, state] of Object.entries((v.query && v.query.queryState) || {})) {
     roles[role] = ((state && state.projections) || []).map((p) => ({
-      ref: normalizeField(p.queryRef || p.nativeQueryRef),
+      ref: normalizeField(fieldName(p.field) || p.queryRef || p.nativeQueryRef),
       label: p.displayName ? String(p.displayName).toLowerCase() : null,
     }));
   }
@@ -415,12 +435,29 @@ function tableFormats(objects, theme) {
     if (back) out.push({ target: "header", kind: "back", color: back });
     if (font) out.push({ target: "header", kind: "font", color: font });
   }
+  // Formatting of one column ("Specific column"): its font / background colour, data bars
+  const flag = (x) => !!(x && x.expr && x.expr.Literal && x.expr.Literal.Value === "true");
   for (const d of (objects && objects.columnFormatting) || []) {
-    const bars = (d.properties || {}).dataBars;
-    if (!bars || !d.selector || !d.selector.metadata) continue;
-    const color = colorFromFill(bars.positiveColor, theme);
-    const hide = bars.hideText && bars.hideText.expr && bars.hideText.expr.Literal && bars.hideText.expr.Literal.Value === "true";
-    if (color) out.push({ target: "m:" + normalizeField(d.selector.metadata), kind: "bar", bar: { color, showValue: !hide } });
+    const props = d.properties || {};
+    if (!d.selector || !d.selector.metadata) continue;
+    const target = "m:" + normalizeField(d.selector.metadata);
+    for (const [prop, kind] of [["backColor", "back"], ["fontColor", "font"]]) {
+      if (!props[prop]) continue;
+      const color = colorFromFill(props[prop], theme);
+      const rule = color ? null : parseColorRule(props[prop], theme);
+      if (color || rule) out.push({ target, kind, color, rule });
+    }
+    const bars = props.dataBars;
+    const color = bars && colorFromFill(bars.positiveColor, theme);
+    if (color) {
+      out.push({ target, kind: "bar", bar: {
+        color,
+        negative: colorFromFill(bars.negativeColor, theme),
+        axis: colorFromFill(bars.axisColor, theme),
+        reverse: flag(bars.reverseDirection),
+        showValue: !flag(bars.hideText),
+      } });
+    }
   }
   return out;
 }
@@ -431,13 +468,16 @@ function visualColorInfo(visual, theme) {
   const rules = [];   // fx rules: { scope, rule }
   const points = visual.dataPoint.map((d) => [d, (d.properties || {}).fill]);
   const bubbles = visual.bubbles.map((d) => [d, (d.properties || {}).fillColor]);
-  // An Azure Map draws its bubble layer's colour; its data point colour is a leftover
-  const entries = visual.type === "azureMap" ? [...bubbles, ...points] : [...points, ...bubbles];
+  const strokes = ((visual.objects || {}).lineStyles || []).filter((d) => d.properties && d.properties.strokeColor)
+    .map((d) => [d, d.properties.strokeColor]);
+  // Where colours compete, the one drawn wins: a line's colour under "Lines" over its data
+  // colour, an Azure Map's bubble colour over its leftover data point colour
+  const entries = visual.type === "azureMap" ? [...bubbles, ...points] : [...strokes, ...points, ...bubbles];
   for (const [d, fill] of entries) {
     const props = d.properties || {};
     const key = selectorKey(d.selector);
     const color = colorFromFill(fill, theme);
-    if (color && key) overrides[key] = color;
+    if (color && key && !(key in overrides)) overrides[key] = color;
     const rule = color ? null : parseColorRule(fill, theme);
     if (rule) rules.push({ scope: ruleScope(d.selector), rule });
     const fallback = colorFromFill(props.defaultColor, theme);
@@ -457,6 +497,17 @@ function visualColorInfo(visual, theme) {
     if (rule && !valueRules[key]) valueRules[key] = rule;
   }
   if (visual.type === "gauge" && overrides.all && !valueColors.all) valueColors.all = overrides.all;
+  // The new card's accent bar and the multi-row card's bar: a fixed colour or a rule
+  let accent = null;
+  const o = visual.objects || {};
+  for (const d of [...(o.accentBar || []), ...(o.card || [])]) {
+    const props = d.properties || {};
+    const fill = props.color || props.barColor;
+    if (!fill || (props.show && props.show.expr && props.show.expr.Literal && props.show.expr.Literal.Value === "false")) continue;
+    const color = colorFromFill(fill, theme);
+    const rule = color ? null : parseColorRule(fill, theme);
+    if (color || rule) { accent = { color, rule }; break; }
+  }
   // Waterfall: increase / decrease / total colours (theme good / bad / first colour by default)
   const sentiment = ((visual.objects || {}).sentimentColors || [])[0];
   const sp = (sentiment && sentiment.properties) || {};
@@ -468,7 +519,7 @@ function visualColorInfo(visual, theme) {
   } : null;
   const roles = visual.roles;
   const series = (roles.Series || [])[0] || null;
-  const measures = MEASURE_ROLES.flatMap((r) => roles[r] || []);
+  const measures = MEASURE_ROLES.flatMap((r) => (roles[r] || []).map((m) => ({ ...m, role: r })));
   let rule = "measure";
   if (COLOR_BY_ITEM_TYPES.includes(visual.type)) rule = "item";
   else if (series) rule = "legend";
@@ -484,9 +535,29 @@ function visualColorInfo(visual, theme) {
     rules,
     valueColors,
     valueRules,
+    accent,
     waterfall,
     tableFormats: ["tableEx", "pivotTable", "table", "matrix"].includes(visual.type) ? tableFormats(visual.objects, theme) : [],
   };
+}
+
+/* Visuals are found by page and name: report authors often reuse names on other pages */
+function visualKey(page, name) {
+  return `${page || ""}\u0001${name}`;
+}
+
+/* Visuals whose name is used on only one page, for lookups without the page */
+function uniqueByName(visuals) {
+  const count = {}, out = {};
+  for (const key of Object.keys(visuals)) { const name = key.split("\u0001")[1]; count[name] = (count[name] || 0) + 1; }
+  for (const [key, info] of Object.entries(visuals)) { const name = key.split("\u0001")[1]; if (count[name] === 1) out[name] = info; }
+  return out;
+}
+
+/* One visual's colour information in loaded report colours, or null */
+function visualInfo(rc, pageName, visualName) {
+  if (!rc || !visualName) return null;
+  return rc.visuals[visualKey(pageName, visualName)] || (rc.byName && rc.byName[visualName]) || null;
 }
 
 /* The theme to use when the report names a theme the file doesn't hold: the colours
@@ -511,11 +582,11 @@ async function readDesign(zip, embedTheme) {
       for (const vc of section.visualContainers || []) {
         try {
           const c = JSON.parse(vc.config);
-          if (c.name && c.singleVisual) visuals[c.name] = visualColorInfo(legacyVisual(c), theme);
+          if (c.name && c.singleVisual) visuals[visualKey(section.name, c.name)] = visualColorInfo(legacyVisual(c), theme);
         } catch (e) { /* skip an unreadable visual */ }
       }
     }
-    return { theme, visuals, format: "classic" };
+    return { theme, visuals, byName: uniqueByName(visuals), format: "classic" };
   }
 
   // PBIR format: report.json, then one visual.json per visual (its folder is the visual's name)
@@ -523,15 +594,21 @@ async function readDesign(zip, embedTheme) {
   if (!report) throw new Error("UNKNOWN_FORMAT");
   const theme = await themeOrFallback(zip, report.themeCollection, embedTheme);
   const visuals = {};
+  const pageNames = {};   // page folder → the page's name (what the embed API calls it)
+  for (const path of Object.keys(zip.files).filter((n) => /^Report\/definition\/pages\/[^/]+\/page\.json$/.test(n))) {
+    const page = await readJson(zip, path).catch(() => null);
+    if (page && page.name) pageNames[path.split("/")[3]] = page.name;
+  }
   const paths = Object.keys(zip.files).filter((n) => /^Report\/definition\/pages\/[^/]+\/visuals\/[^/]+\/visual\.json$/.test(n));
   for (const path of paths) {
     try {
       const json = await readJson(zip, path);
+      const folder = path.split("/")[3];
       const name = json.name || path.split("/").slice(-2)[0];
-      if (json.visual) visuals[name] = visualColorInfo(pbirVisual(json), theme);
+      if (json.visual) visuals[visualKey(pageNames[folder] || folder, name)] = visualColorInfo(pbirVisual(json), theme);
     } catch (e) { /* skip an unreadable visual */ }
   }
-  return { theme, visuals, format: "PBIR" };
+  return { theme, visuals, byName: uniqueByName(visuals), format: "PBIR" };
 }
 
 /*
@@ -554,7 +631,7 @@ function loadReportColors(report, embedTheme) {
       const design = await readDesign(zip, embedTheme);
       log(`Exact report colours: theme "${design.theme.name}" (${design.theme.dataColors.slice(0, 3).join(", ")}…), ` +
         `${Object.keys(design.visuals).length} visual(s), ${design.format} format, ${Math.round(performance.now() - started)} ms`);
-      return { palette: design.theme.dataColors, theme: design.theme, visuals: design.visuals, format: design.format };
+      return { palette: design.theme.dataColors, theme: design.theme, visuals: design.visuals, byName: design.byName, format: design.format };
     })();
     job.abort = () => controller.abort();
     reportColorCache.set(report.id, job);

@@ -17,9 +17,11 @@
  *     Every other visual is an "exhibit": a title, a caption row (legend of the chart's
  *     colours, or "Table · 24 rows"), and a real Excel Table with filter / sort
  *     buttons, styled only with ink rules and hairlines (or a built-in table style).
- *  3. Chart tables show the chart's exact colours: a colour key in the caption, the
- *     series colour on each series header, and value cells filled with the colour of
- *     their bar / line / slice (Excel moves the fills with the rows when sorting).
+ *  3. Chart tables show the chart's exact colours where the chart's legend would: on the
+ *     cell naming the series (each row's legend value, slice or tile; the header of a
+ *     measure drawn as a series), with a colour key in the caption. Colours that depend
+ *     on the value (colour scales, rules, waterfall steps) stay on the value cells.
+ *     Excel moves the fills with the rows when sorting.
  *     Colours come from the report file when it can be read (colors.js: exact theme and
  *     colours set by hand), else from the theme the embed API reports. The accent
  *     appears only in the top rule, KPI tile caps and the sheet tab.
@@ -35,6 +37,7 @@
 
 const KPI_TYPES = ["card", "multiRowCard", "kpi", "cardVisual", "gauge"];
 const PX_TOLERANCE = 10;       // overlap smaller than this does not count as overlapping
+const OVERLAP_SHARE = 0.25;    // …nor overlap under a quarter of the smaller visual (padding, not placement)
 const PAGE_RENDER_TIMEOUT_MS = 20000;
 
 /* ── Design tokens ────────────────────────────────────────────────────── */
@@ -224,13 +227,16 @@ function classifyColumns(rows) {
 
 /* A title built from the columns, for visuals whose own title is generic */
 function describeTitle(item) {
-  const { header, numeric, helper, hex } = classifyColumns(item.rows);
+  const { header, filled, numeric, helper, hex } = classifyColumns(item.rows);
   if (TABLE_VISUAL_TYPES.includes(item.type)) {
     const shown = header.slice(0, 3).join(", ");
     return header.length > 3 ? `${shown} +${header.length - 3}` : shown;
   }
-  const series = header.filter((_, ci) => ci > 0 && numeric[ci] && !helper[ci] && !hex[ci]);
-  const texts = header.filter((_, ci) => !numeric[ci] && !hex[ci]);
+  // Measures can come first in the export (a card split by category, an area chart);
+  // whole years (2024) are an axis, not a series
+  const yearLike = (ci) => numeric[ci] && filled(ci).every((x) => /^(19|20)\d\d$/.test(x));
+  const series = header.filter((_, ci) => numeric[ci] && !yearLike(ci) && !helper[ci] && !hex[ci]);
+  const texts = header.filter((_, ci) => (!numeric[ci] || yearLike(ci)) && !hex[ci]);
   if (!series.length) return `${friendlyType(item.type)} data`;
   const s = series.length <= 2 ? series.join(" and ") : `${series.slice(0, 2).join(", ")} and ${series.length - 2} more`;
   return texts.length ? `${s} by ${texts.slice(0, 2).join(" and ")}` : s;
@@ -315,13 +321,20 @@ function colorRuleRows(rules, t) {
   const categoryCol = findCol(info.category);
   const levels = (info.categories || []).map((f) => findCol(f)).filter((ci) => ci >= 0);
   const grouped = levels.length > 1 && levels[0] === categoryCol;
-  const approx = [];
+  const approx = [];    // rule fields matched to a similar column, or approximated
+  const skipped = [];   // rule fields not in the exported data at all
+  // A rule's field: its column; else a column whose name holds all its words ("Profit %" →
+  // "Profit Margin %"); else one with the same words apart from little ones ("Var Plan %" →
+  // "Var to Plan %"). The last two are approximations and add a note.
+  const LITTLE = new Set(["to", "of", "the", "a", "an", "by", "vs", "and", "in", "for"]);
+  const wordKey = (s) => s.split(/\s+/).filter((w) => w && !LITTLE.has(w)).sort().join(" ");
   const columnFor = (name) => {
     const low = String(name).toLowerCase();
     let ci = findCol({ ref: normalizeField(low) });
     if (ci < 0) {
       const words = low.split(/\s+/).filter(Boolean);
-      const close = cols.filter((c) => words.every((w) => lower[c].split(/\s+/).includes(w)));
+      let close = cols.filter((c) => words.every((w) => lower[c].split(/\s+/).includes(w)));
+      if (close.length !== 1) close = cols.filter((c) => wordKey(lower[c]) === wordKey(low));
       if (close.length === 1) { ci = close[0]; if (!approx.includes(name)) approx.push(name); }
     }
     return ci;
@@ -331,7 +344,17 @@ function colorRuleRows(rules, t) {
     if (ci < 0) return null;
     const raw = data.map((r) => String(r[ci] ?? "").trim());
     let v = raw.map((x) => (x ? toCellValue(x).value : null));
-    if (grouped && scope !== "series" && numeric[ci] && !NON_ADDITIVE.test(header[ci]) && !raw.some((x) => x.endsWith("%"))) {
+    const additive = !NON_ADDITIVE.test(header[ci]) && !raw.some((x) => x.endsWith("%"));
+    // A rule per legend value reads the field once per legend value (its total), so every
+    // row of one legend value shares a colour; for a ratio the average stands in (a note)
+    if (scope === "series" && legendCol >= 0 && numeric[ci]) {
+      const sum = {}, count = {};
+      const keyOf = (r) => String(r[legendCol] ?? "").trim();
+      data.forEach((r, ri) => { const k = keyOf(r); sum[k] = (sum[k] || 0) + (typeof v[ri] === "number" ? v[ri] : 0); count[k] = (count[k] || 0) + 1; });
+      if (!additive && !approx.includes(name)) approx.push(name);
+      return data.map((r) => (additive ? sum[keyOf(r)] : sum[keyOf(r)] / count[keyOf(r)]));
+    }
+    if (grouped && scope !== "series" && numeric[ci] && additive) {
       const totals = {};
       const groupOf = (r) => String(r[categoryCol] ?? "").trim();
       data.forEach((r, ri) => { totals[groupOf(r)] = (totals[groupOf(r)] || 0) + (typeof v[ri] === "number" ? v[ri] : 0); });
@@ -346,21 +369,33 @@ function colorRuleRows(rules, t) {
   // (an Azure Map's bubble colour is listed before its leftover data point colour)
   const ordered = [...rules].sort((a, b) => Number(b.scope.startsWith("m:")) - Number(a.scope.startsWith("m:")));
   for (const r of ordered) {
-    const targets = (r.scope.startsWith("m:") ? seriesCols.filter((ci) => "m:" + norm[ci] === r.scope) : seriesCols)
+    // A map whose measures are all tooltips colours by a rule on one of them: that column
+    // shows the colours (Power BI paints the regions with it)
+    const inputCol = !seriesCols.length && r.rule.input ? columnFor(r.rule.input) : -1;
+    const targets = (r.scope.startsWith("m:") ? seriesCols.filter((ci) => "m:" + norm[ci] === r.scope)
+      : seriesCols.length ? seriesCols : inputCol >= 0 && numeric[inputCol] ? [inputCol] : [])
       .filter((ci) => !perCol[ci]);
-    if (!targets.length) continue;
+    if (!targets.length) {
+      // nothing to colour because the rule's field isn't exported either: say so
+      if (!seriesCols.length && inputCol < 0 && r.rule.input && !skipped.includes(r.rule.input)) skipped.push(r.rule.input);
+      continue;
+    }
     let { colors, missing } = evaluateColorRule(r.rule, column(r.scope), n);
     if (missing.length && r.rule.kind === "gradient" && r.scope === "series" && legendCol >= 0) {
       const order = seriesOrder(data, legendCol, cols.filter((ci) => ci !== legendCol && !seriesCols.includes(ci) && !hex[ci]));
       ({ colors } = evaluateColorRule(r.rule, () => data.map((row) => order.indexOf(String(row[legendCol] ?? "").trim())), n));
       approx.push(r.rule.input);
     } else if (missing.length) {
+      missing.forEach((m) => { if (!skipped.includes(m)) skipped.push(m); });
       continue;
     }
     for (const ci of targets) perCol[ci] = colors.map((c) => (c ? toArgb(c) : null));
     if (!first) first = { rule: r.rule, scope: r.scope, col: targets[0] };
   }
-  if (!first) return null;
+  const skippedNote = skipped.length
+    ? `"${t.title || "A chart"}" is coloured by ${skipped.join(", ")} in the report, which isn't in the exported data, so its default colours are shown.`
+    : null;
+  if (!first) return skippedNote ? { none: true, note: skippedNote } : null;
   for (const ci of Object.keys(perCol)) perCol[ci] = perCol[ci].map((c) => c || seriesColor(Number(ci)));
   const series = {};
   for (const ci of seriesCols) if (!perCol[ci]) series[ci] = seriesColor(ci);
@@ -384,9 +419,9 @@ function colorRuleRows(rules, t) {
     : rule.kind === "conditional"
       ? { entries: rule.cases.map((c) => ({ label: `${inputName} ${describeTest(c.test)}`, argb: toArgb(c.color) })) }
       : { text: `Colours from ${inputName}` };
-  const note = approx.length
-    ? `Colours of "${t.title || "a chart"}" follow a rule on ${approx.join(", ")}, which isn't in the exported data, so they are approximated.`
-    : null;
+  const note = [approx.length
+    ? `Colours of "${t.title || "a chart"}" follow a rule on ${approx.join(", ")}, which isn't in the exported data as such, so they are approximated.`
+    : null, skippedNote].filter(Boolean).join(" ") || null;
   return { series, rowCols: Object.keys(perCol).map(Number), perCol, rowColors, rowKey: null, dot, legend, note };
 }
 
@@ -445,7 +480,8 @@ function columnColors(item, palette, info) {
     seriesCols = cols.filter((ci) => ci > 0 && !hex[ci] && !helper[ci] && numeric[ci] && !yearLike[ci] && !tooltips.has(norm[ci]));
     seriesCols.forEach((ci, i) => { indexOf[ci] = i; });
   }
-  if (!seriesCols.length && !hexCols.length) return null;
+  const hasRules = !!(info && (info.rules || []).length);
+  if (!seriesCols.length && !hexCols.length && !hasRules) return null;
   const exact = !!info;
 
   // 1. A hex colour column: every row in its own colour (one band colour when they all agree)
@@ -464,13 +500,13 @@ function columnColors(item, palette, info) {
 
   const overrides = (info && info.overrides) || {};
   const itemOverride = (v) => overrides["i:" + normalizeValue(v)];
-  const seriesColor = (ci) => {
+  const seriesColor = (ci, slot = indexOf[ci] ?? 0) => {
     const f = fieldOf[ci];
     const set = overrides["m:" + norm[ci]] || (f && (overrides["m:" + f.ref] || (f.label && overrides["m:" + f.label])));
     if (set) return toArgb(set);
     if (overrides.all) return toArgb(overrides.all);
     if (info && info.rule === "single") return color(0);
-    return color(indexOf[ci]);
+    return color(slot);
   };
   const keyedRows = (keyCol, colorOfValue, bySeries) => {
     const values = bySeries
@@ -493,10 +529,15 @@ function columnColors(item, palette, info) {
   }
 
   // 3. Conditional formatting (fx) in the report file: colour scales, rules, colours from a field
-  const fxRules = info ? (info.rules || []).filter((r) => r.scope === "all" || r.scope === "series" || seriesCols.some((ci) => "m:" + norm[ci] === r.scope)) : [];
+  let ruleNote = null;
+  // With a legend, Power BI applies colour rules per legend value only; a rule for every
+  // data point is a leftover from before the legend was added, and isn't drawn
+  const hasLegend = !!(info && info.series && findCol(info.series) >= 0);
+  const fxRules = info ? (info.rules || []).filter((r) => (r.scope === "all" && !hasLegend) || r.scope === "series" || seriesCols.some((ci) => "m:" + norm[ci] === r.scope)) : [];
   if (fxRules.length) {
     const result = colorRuleRows(fxRules, { header, data, cols, norm, lower, numeric, hex, seriesCols, findCol, info, seriesColor, title: item.displayTitle || item.title });
-    if (result) return { ...result, hexCols, exact };
+    if (result && !result.none) return { ...result, hexCols, exact };
+    if (result) ruleNote = result.note;   // the rule couldn't be applied: default colours, with a note
   }
 
   // 4. Rows coloured by a field: the legend (Series) or, for pie / donut / treemap, the category
@@ -526,10 +567,16 @@ function columnColors(item, palette, info) {
 
   if (rowKey) {
     const dot = { keyCol: rowKey.col, colorOf: (v) => rowKey.colorOf[v] || null };
-    return { series: {}, rowCols: seriesCols, hexCols, rowKey, dot, exact };
+    // A combo chart's legend splits its column values only: line values (Y2) stay one series
+    // each, in their own colour (set by hand, else the theme colours after the legend's)
+    const lines = info && info.rule === "legend" ? seriesCols.filter((ci) => fieldOf[ci] && fieldOf[ci].role === "Y2") : [];
+    const legendCount = Object.keys(rowKey.colorOf).length;
+    const series = Object.fromEntries(lines.map((ci, k) => [ci, seriesColor(ci, legendCount + k)]));
+    return { series, rowCols: seriesCols.filter((ci) => !lines.includes(ci)), hexCols, rowKey, dot, exact, note: ruleNote };
   }
+  if (!seriesCols.length && !ruleNote) return null;
   const series = Object.fromEntries(seriesCols.map((ci) => [ci, seriesColor(ci)]));
-  return { series, rowCols: [], hexCols, rowKey: null, dot: null, exact };
+  return { series, rowCols: [], hexCols, rowKey: null, dot: null, exact, note: ruleNote };
 }
 
 /* ── CSV → cells ──────────────────────────────────────────────────────── */
@@ -683,6 +730,38 @@ function uniqueHeaders(header) {
 }
 
 /* ── Column widths ────────────────────────────────────────────────────── */
+
+/*
+ * Excel width units a text needs in its cell, measured in the cell's own font (a column
+ * of w units is about w × 7 + 5 pixels at 100%; an indent level is about 9 pixels).
+ * Where the browser doesn't have the font (Office fonts on a Mac), the fallback font is
+ * wider, so the column comes out roomier, never too narrow. The 15% margin covers the
+ * way Excel rounds text to whole pixels, more so when zoomed in or out.
+ */
+const TEXT_MARGIN = 1.15;
+let measureContext = null;
+function cellUnits(text, font, indent = 0) {
+  const s = String(text ?? "");
+  if (!s) return 0;
+  const px = ((font && font.size) || 11) * 96 / 72;
+  let width;
+  try {
+    if (!measureContext) measureContext = document.createElement("canvas").getContext("2d");
+    measureContext.font = `${font && font.bold ? "bold " : ""}${px}px "${(font && font.name) || "Calibri"}", Calibri, Carlito, Arial, sans-serif`;
+    width = measureContext.measureText(s).width;
+  } catch (e) {
+    width = s.length * px * 0.6 * (font && font.bold ? 1.06 : 1);   // no canvas: a generous average
+  }
+  return Math.max(0, (width * TEXT_MARGIN + 6 + indent * 9 - 5) / 7);
+}
+
+/* The text a compact KPI format (2.52M) shows */
+function compactText(value, fmt) {
+  const prefix = ((fmt || "").match(/^"([^"]*)"/) || [])[1] || "";
+  const a = Math.abs(value);
+  const [scale, unit] = a >= 1e12 ? [1e12, "T"] : a >= 1e9 ? [1e9, "B"] : [1e6, "M"];
+  return `${value < 0 ? "-" : ""}${prefix}${(a / scale).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${unit}`;
+}
 function stepUp(units) {
   if (units > 60) return Math.ceil(units);
   return WIDTH_STEPS.find((s) => s >= units) ?? 60;
@@ -764,7 +843,7 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
   const formats = readableFormats(header, [cells]);
   const fmtOf = (i) => formats[i] || cells[i].numFmt || null;
   // The value colours set on the card in the report, when the report file was read
-  const info = lay.reportColors && item.name ? lay.reportColors.visuals[item.name] : null;
+  const info = visualInfo(lay.reportColors, item.page, item.name);
   const valueColor = (i) => {
     const vc = (info && info.valueColors) || {}, vr = (info && info.valueRules) || {};
     const key = "m:" + normalizeField(header[i]);
@@ -781,8 +860,16 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
     return hex ? toArgb(hex) : null;
   };
   const tinted = (font, i) => (valueColor(i) ? { ...font, color: { argb: valueColor(i) } } : font);
-  // The cap takes the card's own colour from the report, so the tile reads as one unit
-  const cap = valueColor(0) ? readableOnWhite(valueColor(0)) : lay.accent.cap;
+  // The cap takes the card's own colour from the report (its accent bar, else its value
+  // colour), so the tile reads as one unit; otherwise the brand accent
+  const fieldValues = (name) => {
+    const k = header.findIndex((h) => normalizeField(h) === normalizeField(name));
+    return k >= 0 ? [cells[k].value ?? null] : null;
+  };
+  const accentBar = info && info.accent
+    ? (info.accent.color || evaluateColorRule(info.accent.rule, fieldValues, 1).colors[0]) : null;
+  const capSource = accentBar ? toArgb(accentBar) : valueColor(0);
+  const cap = capSource ? readableOnWhite(capSource) : lay.accent.cap;
 
   let top = r;
   if (kpiHasTitle(item)) {
@@ -790,7 +877,7 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
     t.value = item.displayTitle;
     t.font = fonts.exTitle;
     t.alignment = { vertical: "bottom" };
-    widths.span(col, col + 1, Math.ceil(item.displayTitle.length * (fonts.exTitle.name === "Georgia" ? 1.2 : 1.1)) + 2);
+    widths.span(col, col + 1, cellUnits(item.displayTitle, fonts.exTitle));
     top = r + 1;
   } else if (strip && strip.titleRow) {
     top = r + 1;
@@ -834,8 +921,8 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
     if (fmtOf(i)) sv.numFmt = fmtOf(i);
     sv.font = tinted(fonts.kpiSubValue, i);
     sv.alignment = { horizontal: "right", vertical: "middle", indent: 1 };
-    widths.want(col, Math.min(30, String(header[i]).length + 3));
-    widths.want(col + 1, displayText(cells[i].value, fmtOf(i)).length + 3);
+    widths.want(col, Math.min(60, cellUnits(header[i], fonts.kpiSubLabel, 1)));
+    widths.want(col + 1, cellUnits(displayText(cells[i].value, fmtOf(i)), fonts.kpiSubValue, 1));
   }
 
   const last = Math.max(next - 1, strip ? r + strip.height - 1 : 0);
@@ -851,10 +938,14 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
     }
   }
 
-  const heroLen = compact ? 9 : displayText(hero.value, heroFmt).length;
+  // The tile is as wide as its widest text: the label, the large value, the exact value
+  const heroText = compact ? compactText(hero.value, heroFmt) : displayText(hero.value, heroFmt);
   widths.want(col, 12);
   widths.want(col + 1, 10);
-  widths.span(col, col + 1, Math.max(24, labelText.length + 4, Math.ceil(heroLen * 2.1) + 4));
+  widths.span(col, col + 1, Math.max(24,
+    cellUnits(labelText, fonts.kpiLabel, 1),
+    cellUnits(heroText, v.font, 1),
+    compact ? cellUnits(displayText(hero.value, heroFmt || "#,##0.00"), fonts.kpiExact, 1) : 0));
 }
 
 /* Caption runs: a legend of the chart's colours, or "Table · 24 rows" */
@@ -887,7 +978,10 @@ function captionRuns(item, colors, header, fonts, units) {
   }
 
   if (colors.rowKey) {
-    const entries = Object.entries(colors.rowKey.colorOf).map(([label, argb]) => ({ label, argb }));
+    const entries = [
+      ...Object.entries(colors.rowKey.colorOf).map(([label, argb]) => ({ label, argb })),
+      ...Object.entries(colors.series).map(([ci, argb]) => ({ label: header[ci], argb })),   // combo line values
+    ];
     const { runs, shown } = legend(entries);
     if (shown === entries.length) return runs;
     const few = entries.slice(0, 4).map((e) => [KEY_GLYPH + " ", fonts.dot(e.argb)]);
@@ -955,8 +1049,7 @@ function writeDataTable(ws, r, col, item, tableName, widths, lay, number) {
   const totalUnits = units.reduce((a, b) => a + b, 0);
   // The title overflows to the right, up to the next visual's title one gutter along:
   // widen the table's last column when the title needs more (capped, so it stays a table)
-  const titleLen = (number ? 4 : 0) + String(item.displayTitle || "").length;
-  const titleUnits = Math.ceil(titleLen * (fonts.exTitle.name === "Georgia" ? 1.2 : 1.1)) + 1 - GUTTER_W;
+  const titleUnits = cellUnits(item.displayTitle, fonts.exTitle) + (number ? cellUnits(String(number).padStart(2, "0") + "  ", fonts.exNum) : 0) - GUTTER_W;
   widths.span(col, col + header.length - 1, Math.min(titleUnits, totalUnits + 40));
 
   // Title and caption
@@ -1037,14 +1130,36 @@ function iconRank(name) {
 function applyTableFormats(ws, hr, col, item, header, data, lay) {
   const info = item.tableFormat;
   const norm = header.map((h) => normalizeField(h));
+  const lowerHeader = header.map((h) => String(h).trim().toLowerCase());
   const values = info.measures || [];
+  // Each value field's column: its renamed label, else its name; matrices export the row
+  // fields, the column field and the values in varying order, so a field matched by neither
+  // (e.g. two fields both renamed "YoY") is placed by the offset the matched ones show
+  const valueCol = values.map(() => -1);
+  const taken = new Set();
+  values.forEach((m, k) => {
+    const ci = m.label ? lowerHeader.findIndex((h, c) => !taken.has(c) && h === m.label) : -1;
+    if (ci >= 0) { valueCol[k] = ci; taken.add(ci); }
+  });
+  values.forEach((m, k) => {
+    if (valueCol[k] >= 0) return;
+    const ci = norm.findIndex((h, c) => !taken.has(c) && h === m.ref);
+    if (ci >= 0) { valueCol[k] = ci; taken.add(ci); }
+  });
+  const offsets = {};
+  valueCol.forEach((ci, k) => { if (ci >= 0) offsets[ci - k] = (offsets[ci - k] || 0) + 1; });
+  const offset = Object.keys(offsets).sort((a, b) => offsets[b] - offsets[a])[0];
+  if (offset !== undefined) {
+    valueCol.forEach((ci, k) => {
+      const c = k + Number(offset);
+      if (ci < 0 && c >= 0 && c < header.length && !taken.has(c)) { valueCol[k] = c; taken.add(c); }
+    });
+  }
   const columnOf = (name) => {
-    const n = String(name || "").toLowerCase();
-    const byName = norm.indexOf(normalizeField(n));
-    if (byName >= 0) return byName;
-    const k = values.findIndex((m) => m.ref === n || m.ref === normalizeField(n));
-    const ci = k >= 0 ? header.length - values.length + k : -1;
-    return ci >= 0 && ci < header.length ? ci : -1;
+    const n = normalizeField(String(name || "").toLowerCase());
+    const k = values.findIndex((m) => m.ref === n);
+    if (k >= 0 && valueCol[k] >= 0) return valueCol[k];
+    return norm.indexOf(n);
   };
   const first = hr + 1, last = hr + data.length;
   if (!data.length) return;
@@ -1094,11 +1209,12 @@ function applyTableFormats(ws, hr, col, item, header, data, lay) {
           }
         });
       } else if (f.kind === "bar") {
-        ws.addConditionalFormatting({
-          ref: `${L}${first}:${L}${last}`,
-          rules: [{ type: "dataBar", gradient: false, border: false, showValue: f.bar.showValue, minLength: 0, maxLength: 100,
-            cfvo: [{ type: "min" }, { type: "max" }], color: { argb: toArgb(f.bar.color) } }],
-        });
+        const bar = { type: "dataBar", gradient: false, border: false, showValue: f.bar.showValue, minLength: 0, maxLength: 100,
+          cfvo: [{ type: "min" }, { type: "max" }], color: { argb: toArgb(f.bar.color) } };
+        if (f.bar.negative) { bar.negativeBarColorSameAsPositive = false; bar.negativeFillColor = { argb: toArgb(f.bar.negative) }; }
+        if (f.bar.axis) bar.axisColor = { argb: toArgb(f.bar.axis) };
+        if (f.bar.reverse) bar.direction = "rightToLeft";
+        ws.addConditionalFormatting({ ref: `${L}${first}:${L}${last}`, rules: [bar] });
       } else if (f.kind === "icon") {
         // Excel thresholds: % of range, a number or a percentile, like the report's
         const cfvo = (at) => (at.num !== undefined ? { type: "num", value: at.num }
@@ -1126,17 +1242,19 @@ function textOn(argb) {
 }
 
 /*
- * Paints a chart table in the chart's colours:
- *  - series drawn in one colour: the header cell becomes a band in that colour and every
- *    value cell below is filled with it
- *  - rows coloured by a field (legend, pie, treemap), a rule or a hex column: each row's
- *    value cells are filled with the row's colour (Excel moves fills along when sorting)
- * Text on a filled cell is white or ink, whichever reads better.
+ * Paints a chart table in the chart's colours, where the chart's legend puts them:
+ *  - a colour that names a series goes on the cell that names it, so the numbers stay
+ *    neutral: each row's legend value, slice or tile (category cell), or the header of a
+ *    measure drawn as one series (also a combo chart's line values)
+ *  - a colour that comes from the value (colour scales, rules, waterfall increase /
+ *    decrease, colours from a field) stays on the value cells it describes
+ * Text on a filled cell is white or ink, whichever reads better. Excel moves fills along
+ * with their rows when sorting.
  */
 function applyVisualColors(ws, hr, col, item, colors, lay) {
   const fonts = lay.fonts;
   const data = item.rows.slice(1);
-  const first = hr + 1, last = hr + data.length;
+  const first = hr + 1;
   const styles = new Map();   // argb → shared fill / font objects (big tables stay fast)
   const styleOf = (argb) => {
     if (!styles.has(argb)) {
@@ -1152,14 +1270,25 @@ function applyVisualColors(ws, hr, col, item, colors, lay) {
     cell.border = GAP_BORDER;
   };
 
+  // Series drawn in one colour: the header naming the series
   for (const [ci, argb] of Object.entries(colors.series)) {
-    const c = col + Number(ci);
-    const h = ws.getCell(hr, c);
+    const h = ws.getCell(hr, col + Number(ci));
     h.fill = styleOf(argb).fill;
     h.font = styleOf(argb).headFont;
-    for (let r = first; r <= last; r++) fillCell(ws.getCell(r, c), argb);
   }
 
+  // Colour that identifies a category (legend value, slice, tile, a bar set by hand): the
+  // category cell in each row, like the chart's legend
+  if (colors.rowKey) {
+    const k = colors.rowKey.col;
+    data.forEach((row, ri) => {
+      const argb = colors.rowKey.colorOf[(row[k] ?? "").trim()];
+      if (argb) fillCell(ws.getCell(first + ri, col + k), argb);
+    });
+    return;
+  }
+
+  // Colour that comes from the value (rules, scales, waterfall steps, a colour field): the values
   const dot = colors.dot;
   if (!dot && !colors.perCol) return;
   data.forEach((row, ri) => {
@@ -1174,6 +1303,12 @@ function applyVisualColors(ws, hr, col, item, colors, lay) {
 
 /* ── Page layout ──────────────────────────────────────────────────────── */
 
+/* Visuals overlap only by a real share of the smaller one: report authors leave visuals
+   touching or overlapping by a few pixels of padding, which isn't a placement */
+function overlapsEnough(overlap, sizeA, sizeB) {
+  return overlap > Math.max(PX_TOLERANCE, Math.min(sizeA, sizeB) * OVERLAP_SHARE);
+}
+
 /* Bands: visuals whose vertical extents overlap, i.e. one "row" of the page */
 function groupIntoBands(items) {
   const sorted = [...items].sort((a, b) => (a.layout.y - b.layout.y) || (a.layout.x - b.layout.x));
@@ -1181,11 +1316,11 @@ function groupIntoBands(items) {
   for (const item of sorted) {
     const band = bands[bands.length - 1];
     const bottom = item.layout.y + item.layout.height;
-    if (band && item.layout.y < band.bottom - PX_TOLERANCE) {
+    if (band && overlapsEnough(band.bottom - item.layout.y, item.layout.height, band.bottom - band.top)) {
       band.items.push(item);
       band.bottom = Math.max(band.bottom, bottom);
     } else {
-      bands.push({ items: [item], bottom });
+      bands.push({ items: [item], top: item.layout.y, bottom });
     }
   }
   return bands;
@@ -1197,7 +1332,7 @@ function groupIntoStacks(items) {
   const stacks = [];
   for (const item of sorted) {
     const left = item.layout.x, right = item.layout.x + item.layout.width;
-    const stack = stacks.find((s) => left < s.right - PX_TOLERANCE && right > s.left + PX_TOLERANCE);
+    const stack = stacks.find((s) => overlapsEnough(Math.min(right, s.right) - Math.max(left, s.left), item.layout.width, s.right - s.left));
     if (stack) {
       stack.items.push(item);
       stack.left = Math.min(stack.left, left);
@@ -1242,13 +1377,35 @@ function shiftStack(plan, p, delta) {
 /*
  * Excel hides whole rows, so side-by-side blocks must not get in each other's way:
  *  1. A table's collapsible rows must not sit next to a neighbour's visible rows.
- *     The table first shows a few more rows (up to `maxExtend`), so band tops stay
- *     level; if that isn't enough it moves down instead.
- *  2. A table's note row must not sit inside a neighbour's collapsible rows,
- *     otherwise it splits the neighbour. The note moves down below them, so both
- *     notes share one row and one [+] / [–] button.
+ *     The table first shows a few more rows (up to `maxExtend`), so band tops stay level.
+ *     If that isn't enough:
+ *     - a neighbour that sits below a long table of its own column moves down instead,
+ *       below this table's extra rows (it is already far from the band top, and the rows
+ *       it skips are hidden, so nothing visibly moves);
+ *     - otherwise this table moves down below the neighbour's visible rows, at most a
+ *       few times per column: two columns of long tables could otherwise keep pushing
+ *       each other down. When that limit is reached, the rows beside the neighbour simply
+ *       stay visible.
+ *  2. A table's note row must not sit inside a neighbour's collapsible rows, otherwise it
+ *     splits the neighbour. The note moves down below them, so both notes share one row
+ *     and one [+] / [–] button; what follows in its column moves only as far as it must.
  */
+const MAX_STACK_SHIFTS = 3;
 function alignNoteRows(plan, maxExtend) {
+  const shifts = {};
+  const firstInStack = (q) => !plan.some((x) => x !== q && x.stackIndex === q.stackIndex && x.r < q.r);
+  // Moves the blocks of a column below `row`, keeping one blank row between blocks
+  const pushBelow = (stackIndex, fromR, row) => {
+    let next = row;
+    for (const q of plan.filter((x) => x.stackIndex === stackIndex && x.r >= fromR).sort((a, b) => a.r - b.r)) {
+      if (q.r < next) {
+        const d = next - q.r;
+        q.r += d;
+        if (q.noteRow) q.noteRow += d;
+      }
+      next = q.r + q.size.height + 1;
+    }
+  };
   for (let guard = 0; guard < 200; guard++) {
     let moved = false;
     for (const p of plan) {
@@ -1262,8 +1419,13 @@ function alignNoteRows(plan, maxExtend) {
           if (p.extra + need <= maxExtend) {
             p.extra += need;
             p.vis += need;
-          } else {
+          } else if (!firstInStack(o)) {
+            pushBelow(o.stackIndex, o.r, myRange[1] + 1);
+          } else if ((shifts[p.stackIndex] || 0) < MAX_STACK_SHIFTS) {
+            shifts[p.stackIndex] = (shifts[p.stackIndex] || 0) + 1;
             shiftStack(plan, p, need);
+          } else {
+            continue;
           }
           moved = true;
           break;
@@ -1274,12 +1436,7 @@ function alignNoteRows(plan, maxExtend) {
           const delta = range[1] + 1 - p.noteRow;
           p.noteRow += delta;
           p.size.height += delta;
-          for (const q of plan) {
-            if (q.stackIndex === p.stackIndex && q.r > p.r) {
-              q.r += delta;
-              if (q.noteRow) q.noteRow += delta;
-            }
-          }
+          pushBelow(p.stackIndex, p.r + 1, p.noteRow + 2);
           moved = true;
           break;
         }
@@ -1314,7 +1471,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
       if (usedTitles[key] > 1) title = `${title} (${usedTitles[key]})`;
     }
     item.displayTitle = title;
-    const info = lay.reportColors && item.name ? lay.reportColors.visuals[item.name] || null : null;
+    const info = visualInfo(lay.reportColors, item.page, item.name);
     item.colors = lay.palette && !item.isKpi ? columnColors(item, lay.palette, info) : null;
     item.tableFormat = info && info.tableFormats && info.tableFormats.length ? info : null;
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
@@ -1446,7 +1603,7 @@ function isHiddenVisual(v) {
 async function listDataVisuals(page) {
   const visuals = await page.getVisuals();
   return visuals
-    .filter((v) => v.type !== "slicer" && !NON_DATA_TYPES.includes(v.type) && !isHiddenVisual(v))
+    .filter((v) => !isSlicerType(v.type) && !NON_DATA_TYPES.includes(v.type) && !isHiddenVisual(v))
     .sort((a, b) => (a.layout.y - b.layout.y) || (a.layout.x - b.layout.x))
     .map((v) => ({ name: v.name, title: v.title || v.type, type: v.type }));
 }
@@ -1493,11 +1650,9 @@ async function collectPage(page, options, onProgress, isCancelled) {
     const title = v.title || `${v.type} (${v.name})`;
     onProgress(i + 1, visuals.length, title);
 
-    if (isHiddenVisual(v)) { notes.push(`Skipped hidden visual: ${title}`); continue; }
-    if (options.excludedVisuals && options.excludedVisuals.has(v.name)) continue;
-
-    // Slicers become filter chips: "Field  selection", or "Field  All"
-    if (v.type === "slicer") {
+    // Slicers become filter chips: "Field  selection", or "Field  All". A hidden slicer still
+    // filters the page (bookmarks often hide them), so it gets a chip too.
+    if (isSlicerType(v.type)) {
       if (!options.includeFilters) continue;
       try {
         const state = await v.getSlicerState();
@@ -1511,10 +1666,20 @@ async function collectPage(page, options, onProgress, isCancelled) {
           filterChips.push({ field, value: "All", all: true });
         }
       } catch (e) {
-        notes.push(`Could not read the selection of "${title}": ${errorText(e)}`);
+        // Newer slicer types may not report their selection: name the field, say so in the bar
+        log(`Could not read the selection of "${title}": ${errorText(e)}`);
+        filterChips.push({ field: await slicerFieldNames(v, title), value: "selection not readable", all: true });
       }
       continue;
     }
+
+    // Hidden visuals aren't exported; only hidden data visuals are worth a note (decorative
+    // ones are routinely hidden to drive bookmarks)
+    if (isHiddenVisual(v)) {
+      if (!NON_DATA_TYPES.includes(v.type)) notes.push(`Skipped hidden visual: ${title}`);
+      continue;
+    }
+    if (options.excludedVisuals && options.excludedVisuals.has(v.name)) continue;
 
     // Every other visual: try to export. Decorative ones (text box, shape, button…)
     // usually have no data; they are included only if Power BI returns some.
@@ -1532,7 +1697,7 @@ async function collectPage(page, options, onProgress, isCancelled) {
         }
         continue;
       }
-      items.push({ title, name: v.name, type: v.type, layout: v.layout, rows, isKpi });
+      items.push({ title, name: v.name, page: page.name, type: v.type, layout: v.layout, rows, isKpi });
       log(`Exported "${title}" (${rows.length - 1} rows)`);
     } catch (e) {
       if (NON_DATA_TYPES.includes(v.type)) continue;
@@ -1869,17 +2034,23 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
   const nameSheet = makeSheetNamer();
   const nameTable = makeTableNamer();
   const totals = { tables: 0, kpis: 0, notes: [] };
-  collected.forEach(({ page, data }, i) => {
-    const ctx = { pageIndex: i + 1, pageCount: collected.length, dateText };
+  // With several pages, one with nothing to show (a cover or info page of images and text)
+  // isn't given an empty sheet; the first sheet's notes name it
+  const filled = collected.filter(({ data }) => data.items.length || data.notes.length);
+  const sheets = collected.length > 1 && filled.length ? filled : collected;
+  const left = collected.filter((c) => !sheets.includes(c)).map(({ page }) => `"${page.displayName}"`);
+  if (left.length) sheets[0].data.notes.push(`Not included: ${left.join(", ")} – no visuals with data.`);
+  sheets.forEach(({ page, data }, i) => {
+    const ctx = { pageIndex: i + 1, pageCount: sheets.length, dateText };
     const counts = writePageSheet(wb, nameSheet(page.displayName), page, data, options, branding, logo, nameTable, ctx);
     totals.tables += counts.tables;
     totals.kpis += counts.kpis;
-    data.notes.forEach((n) => totals.notes.push(collected.length > 1 ? `${page.displayName}: ${n}` : n));
+    data.notes.forEach((n) => totals.notes.push(sheets.length > 1 ? `${page.displayName}: ${n}` : n));
   });
 
   const buffer = await wb.xlsx.writeBuffer();
   const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-  const baseName = collected.length === 1 ? `${currentReportName} - ${collected[0].page.displayName}` : currentReportName;
+  const baseName = sheets.length === 1 ? `${currentReportName} - ${sheets[0].page.displayName}` : currentReportName;
   const fileName = (baseName.replace(/[\\/:*?"<>|]/g, "").trim() || "Power BI export") + ".xlsx";
   const link = document.createElement("a");
   link.href = URL.createObjectURL(blob);
@@ -1889,6 +2060,6 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
   document.body.removeChild(link);
   setTimeout(() => URL.revokeObjectURL(link.href), 10000);
 
-  log(`Saved "${fileName}" – ${collected.length} sheet(s), ${totals.tables} table(s), ${totals.kpis} KPI(s), ${totals.notes.length} note(s)`);
-  return { fileName, sheets: collected.length, tables: totals.tables, kpis: totals.kpis, notes: totals.notes };
+  log(`Saved "${fileName}" – ${sheets.length} sheet(s), ${totals.tables} table(s), ${totals.kpis} KPI(s), ${totals.notes.length} note(s)`);
+  return { fileName, sheets: sheets.length, tables: totals.tables, kpis: totals.kpis, notes: totals.notes };
 }

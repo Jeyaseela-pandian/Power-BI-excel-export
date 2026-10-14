@@ -101,7 +101,20 @@
     { id: "colour from a field in the data", v: visual("c17", "clusteredBarChart", { Category: ["S.Category"], Y: ["S.Sales"], Tooltips: ["S.Bar Color"] }, { dataPoint: [fill(measure("S.Bar Color"), all)] }),
       rows: [["Category", "Sales", "Bar Color"], ["A", "1", "#111111"], ["B", "2", "#222222"]], expect: { col: "Sales", rows: ["#111111", "#222222"] } },
     { id: "colour from a field not exported: series colour", v: visual("c18", "clusteredBarChart", { Category: ["S.Category"], Y: ["S.Sales"] }, { dataPoint: [fill(measure("S.Hidden Color"), all)] }),
-      rows: [["Category", "Sales"], ["A", "1"]], expect: { series: { Sales: P[0] } } },
+      rows: [["Category", "Sales"], ["A", "1"]], expect: { series: { Sales: P[0] }, note: true } },
+    { id: "map: the rule on a tooltip measure colours that measure",
+      v: visual("c26", "azureMap", { Category: ["S.Country"], Tooltips: ["S.Revenue"] }, { dataPoint: [fill(grad("S.Revenue", "#000000", "#FFFFFF"), all)] }),
+      rows: [["Country", "Revenue"], ["A", "0"], ["B", "10"]], expect: { col: "Revenue", rows: ["#000000", "#FFFFFF"] } },
+    { id: "rule per legend value reads each legend value's total",
+      v: visual("c27", "stackedAreaChart", { Category: ["S.Month"], Series: ["S.Area"], Y: ["S.Actual"] }, { dataPoint: [fill(grad("S.Actual", "#000000", "#FFFFFF"), { data: [{ roles: ["Series"] }] })] }),
+      rows: [["Month", "Area", "Actual"], ["Jan", "A", "1"], ["Feb", "A", "1"], ["Jan", "B", "5"], ["Feb", "B", "5"]], expect: { col: "Actual", rows: ["#000000", "#000000", "#FFFFFF", "#FFFFFF"] } },
+    { id: "rule on a measure named alike apart from little words (+ note)",
+      v: visual("c28", "clusteredBarChart", { Category: ["S.Region"], Y: ["S.Var Plan %"] }, { dataPoint: [fill(cond([[cmp("S.Var to Plan %", 1, num(0)), "#00FF00"]]), all)] }),
+      rows: [["Region", "Var Plan %"], ["A", "5%"], ["B", "-3%"]], expect: { col: "Var Plan %", rows: ["#00FF00", P[0]], note: true } },
+    { id: "a line's colour under Lines wins over its data colour",
+      v: visual("c29", "lineChart", { Category: ["S.Month"], Y: ["S.Sales"] }, {
+        dataPoint: [fill(lit("#111111"), meta("S.Sales"))], lineStyles: [{ properties: { strokeColor: solid(lit("#222222")) }, selector: meta("S.Sales") }] }),
+      rows: [["Month", "Sales"], ["Jan", "1"]], expect: { series: { Sales: "#222222" } } },
     { id: "waterfall default colours", v: visual("c19", "waterfallChart", { Category: ["S.Month"], Y: ["S.Sales"] }),
       rows: [["Month", "Sales"], ["Jan", "5"], ["Feb", "-3"]], expect: { col: "Sales", rows: [THEME.good, THEME.bad] } },
     { id: "waterfall colours set by hand", v: visual("c20", "waterfallChart", { Category: ["S.Month"], Y: ["S.Sales"] }, { sentimentColors: [{ properties: { increaseFill: solid(lit("#0000AA")), decreaseFill: solid(lit("#AA0000")) } }] }),
@@ -113,6 +126,15 @@
         bubbleLayer: [{ properties: { fillColor: solid(grad("S.Customers", "#000000", "#FFFFFF")) }, selector: all }],
         dataPoint: [fill(grad("S.Customers", "#FF0000", "#0000FF"), all)] }),
       rows: [["Country", "Customers"], ["A", "0"], ["B", "10"]], expect: { col: "Customers", rows: ["#000000", "#FFFFFF"] } },
+    { id: "combo chart: line values aren't split by the legend",
+      v: visual("c24", "lineStackedColumnComboChart", { Category: ["S.Month"], Y: ["S.Seps"], Y2: ["S.Seps SPLY"], Series: ["S.Reason"] },
+        { dataPoint: [fill(lit("#AA0000"), item("S.Reason", "Voluntary")), fill(themeColor(1, 0.1), meta("S.Seps SPLY"))] }),
+      rows: [["Month", "Seps", "Seps SPLY", "Reason"], ["Jan", "1", "2", "Involuntary"], ["Jan", "3", "4", "Voluntary"]],
+      expect: { col: "Seps", rows: [P[0], "#AA0000"], series: { "Seps SPLY": "#1A1A1A" } } },
+    { id: "legend chart ignores a leftover rule for every data point",
+      v: visual("c25", "clusteredColumnChart", { Category: ["S.Month"], Series: ["S.Gender"], Y: ["S.Sales"] },
+        { dataPoint: [fill(cond([[cmp("S.Sales", 1, num(0)), "#00FF00"]]), all), fill(lit("#F5C869"), item("S.Gender", "Female"))] }),
+      rows: [["Month", "Gender", "Sales"], ["Jan", "Male", "5"], ["Jan", "Female", "6"]], expect: { col: "Sales", rows: [P[0], "#F5C869"] } },
     { id: "tooltip measures aren't series", v: visual("c22", "clusteredBarChart", { Category: ["S.Category"], Y: ["S.Sales"], Tooltips: ["S.Cost"] }),
       rows: [["Category", "Sales", "Cost"], ["A", "1", "2"]], expect: { series: { Sales: P[0] }, uncoloured: ["Cost"] } },
   ];
@@ -123,7 +145,7 @@
     const design = await buildReport(cases.map((c) => c.v));
     const results = [];
     for (const c of cases) {
-      const info = design.visuals[c.v.name];
+      const info = visualInfo(design, "page1", c.v.name);
       const item = { rows: c.rows, type: c.v.visual.visualType, name: c.v.name, displayTitle: c.id };
       const colors = columnColors(item, design.theme.dataColors, info);
       const header = c.rows[0];
@@ -149,9 +171,70 @@
     }
 
     // Tables, matrices and cards: a full export, read back
+    results.push(...await pageCases());
     results.push(...await tableCases());
     return { passed: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results: results.filter((r) => !r.ok).length ? results : results.map((r) => r.id) };
   };
+
+  /*
+   * Visual names repeat across pages (VisualContainer1 on several pages), in both formats;
+   * the classic format can name projections by query alias ("select") instead of the field.
+   */
+  async function pageCases() {
+    const res = [];
+    const t = (id, ok, detail) => res.push({ id, ok, problems: ok ? [] : [detail] });
+    const rows = [["Month", "Segment", "Sales"], ["Jan", "A", "1"], ["Jan", "B", "2"]];
+
+    // PBIR: the same visual name on two pages, coloured differently
+    const zip = new JSZip();
+    zip.file("Report/definition/report.json", JSON.stringify({ themeCollection: { baseTheme: { name: "CaseTheme" } } }));
+    zip.file("Report/StaticResources/SharedResources/BaseThemes/CaseTheme.json", JSON.stringify(THEME));
+    const sameName = (color) => visual("VisualContainer1", "clusteredColumnChart", { Category: ["S.Month"], Series: ["S.Segment"], Y: ["S.Sales"] }, { dataPoint: [fill(lit(color), item("S.Segment", "B"))] });
+    zip.file("Report/definition/pages/aaa/page.json", JSON.stringify({ name: "ReportSectionA" }));
+    zip.file("Report/definition/pages/aaa/visuals/VisualContainer1/visual.json", JSON.stringify(sameName("#111111")));
+    zip.file("Report/definition/pages/bbb/page.json", JSON.stringify({ name: "ReportSectionB" }));
+    zip.file("Report/definition/pages/bbb/visuals/VisualContainer1/visual.json", JSON.stringify(sameName("#222222")));
+    const pbir = await readDesign(await JSZip.loadAsync(await zip.generateAsync({ type: "arraybuffer" })), null);
+    const colourOn = (design, page) => {
+      const c = columnColors({ rows, type: "clusteredColumnChart" }, design.theme.dataColors, visualInfo(design, page, "VisualContainer1"));
+      return c && c.dot ? hexOf(c.dot.colorOf("B")) : null;
+    };
+    t("PBIR: same visual name on two pages", colourOn(pbir, "ReportSectionA") === "#111111" && colourOn(pbir, "ReportSectionB") === "#222222",
+      `${colourOn(pbir, "ReportSectionA")} / ${colourOn(pbir, "ReportSectionB")}`);
+
+    // Classic: the same name on two sections, and a pie whose category is the alias "select"
+    const col = (table, prop) => ({ Column: { Expression: { SourceRef: { Source: "s" } }, Property: prop } });
+    const vc = (name, visualType, select, projections, dataPoint) => ({ config: JSON.stringify({ name, singleVisual: {
+      visualType, projections, prototypeQuery: { Select: select }, objects: { dataPoint } } }) });
+    const legacySel = [{ ...col("S", "Month"), Name: "S.Month" }, { ...col("S", "Segment"), Name: "S.Segment" }, { Measure: { Expression: { SourceRef: { Source: "s" } }, Property: "Sales" }, Name: "S.Sales" }];
+    const itemFill = (v, color) => fill(lit(color), item("S.Segment", v));
+    const layout = {
+      config: JSON.stringify({ themeCollection: { baseTheme: { name: "CaseTheme" } } }),
+      sections: [
+        { name: "ReportSection1", visualContainers: [vc("VisualContainer1", "clusteredColumnChart", legacySel, { Category: [{ queryRef: "S.Month" }], Series: [{ queryRef: "S.Segment" }], Y: [{ queryRef: "S.Sales" }] }, [itemFill("B", "#333333")])] },
+        { name: "ReportSection2", visualContainers: [
+          vc("VisualContainer1", "clusteredColumnChart", legacySel, { Category: [{ queryRef: "S.Month" }], Series: [{ queryRef: "S.Segment" }], Y: [{ queryRef: "S.Sales" }] }, [itemFill("B", "#444444")]),
+          vc("VisualContainer9", "pieChart", [{ ...col("S", "Segment"), Name: "select" }, { Measure: { Expression: { SourceRef: { Source: "s" } }, Property: "Sales" }, Name: "S.Sales" }],
+            { Category: [{ queryRef: "select" }], Y: [{ queryRef: "S.Sales" }] }, [itemFill("B", "#555555")]),
+        ] },
+      ],
+    };
+    const text = JSON.stringify(layout);
+    const utf16 = new Uint8Array(text.length * 2);
+    for (let i = 0; i < text.length; i++) { const ch = text.charCodeAt(i); utf16[2 * i] = ch & 255; utf16[2 * i + 1] = ch >> 8; }
+    const lz = new JSZip();
+    lz.file("Report/Layout", utf16);
+    lz.file("Report/StaticResources/SharedResources/BaseThemes/CaseTheme.json", JSON.stringify(THEME));
+    const classic = await readDesign(await JSZip.loadAsync(await lz.generateAsync({ type: "arraybuffer" })), null);
+    t("classic: same visual name on two pages", colourOn(classic, "ReportSection1") === "#333333" && colourOn(classic, "ReportSection2") === "#444444",
+      `${colourOn(classic, "ReportSection1")} / ${colourOn(classic, "ReportSection2")}`);
+    // The pie's category is the alias "select": it must still find the Segment column, even when it isn't first
+    const pieRows = [["Sales", "Segment"], ["1", "A"], ["2", "B"]];
+    const pie = columnColors({ rows: pieRows, type: "pieChart" }, classic.theme.dataColors, visualInfo(classic, "ReportSection2", "VisualContainer9"));
+    t("classic: field named by query alias", pie && pie.dot && pie.dot.keyCol === 1 && hexOf(pie.dot.colorOf("B")) === "#555555" && hexOf(pie.dot.colorOf("A")) === P[0],
+      pie && pie.dot ? `key ${pie.dot.keyCol} A ${hexOf(pie.dot.colorOf("A"))} B ${hexOf(pie.dot.colorOf("B"))}` : "no colours");
+    return res;
+  }
 
   async function tableCases() {
     const visuals = [
@@ -167,6 +250,18 @@
       visual("t2", "pivotTable", { Rows: ["S.Category"], Values: [{ ref: "S.Total Sales", label: "Revenue" }] }, {
         values: [{ properties: { backColor: solid(lit("#FFFF00")) }, selector: { metadata: "S.Total Sales" } }],
       }),
+      visual("t3", "pivotTable", { Rows: ["S.Region"], Values: [{ ref: "S.Seps YoY", label: "YoY" }, { ref: "S.Actives YoY", label: "YoY" }], Columns: ["S.Reason"] }, {
+        values: [{ properties: { backColor: solid(lit("#00FFFF")) }, selector: { metadata: "S.Actives YoY" } }],
+      }),
+      // Where colours land: legend → category cells, measures → headers, scales → values
+      visual("p1", "clusteredColumnChart", { Category: ["S.Week"], Series: ["S.FP"], Y: ["S.Hires"] }, { dataPoint: [fill(lit("#F5C869"), item("S.FP", "Part-Time"))] }),
+      visual("p2", "lineChart", { Category: ["S.Day"], Y: ["S.Revenue2", "S.Spend"] }),
+      visual("p3", "clusteredBarChart", { Category: ["S.Store"], Y: ["S.Amount"] }, { dataPoint: [fill(grad("S.Amount", "#000000", "#FFFFFF"), all)] }),
+      visual("k2", "cardVisual", { Data: ["S.Profit"] }, { accentBar: [{ properties: { color: solid(themeColor(3)) }, selector: { id: "default" } }] }),
+      visual("t4", "tableEx", { Values: ["S.Item", "S.Delta", "S.Score"] }, { columnFormatting: [
+        { properties: { fontColor: solid(lit("#AA00AA")) }, selector: meta("S.Item") },
+        { properties: { dataBars: { positiveColor: solid(lit("#00AA00")), negativeColor: solid(lit("#EA1313")), axisColor: solid(lit("#333333")), reverseDirection: { expr: { Literal: { Value: "true" } } } } }, selector: meta("S.Delta") },
+      ] }),
       visual("k1", "cardVisual", { Data: ["S.Sales", "S.Cost"] }, {
         value: [{ properties: { fontColor: solid(lit("#123456")) }, selector: meta("S.Sales") }, { properties: { fontColor: solid(cond([[cmp("S.Cost", 1, num(0)), "#00AA00"]])) }, selector: meta("S.Cost") }],
       }),
@@ -181,13 +276,36 @@
     const data = {
       t1: [["Category", "Sales", "Cost", "Margin"], ["A", "0", "90", "10"], ["B", "100", "20", "20"]],
       t2: [["Category", "Revenue"], ["A", "5"], ["B", "6"]],
+      t3: [["Region", "YoY", "YoY", "Reason"], ["North", "1", "2", "Voluntary"]],
       k1: [["Sales", "Cost"], ["100", "7"]],
+      p1: [["Week", "FP", "Hires"], ["W1", "Full-Time", "3"], ["W1", "Part-Time", "4"]],
+      p2: [["Day", "Revenue2", "Spend"], ["D1", "1", "2"]],
+      p3: [["Store", "Amount"], ["A", "0"], ["B", "10"]],
+      k2: [["Profit"], ["42"]],
+      t4: [["Item", "Delta", "Score"], ["One", "-5", "1"], ["Two", "8", "2"]],
+      s1: [["Region"], ["North"], ["South"]],
+      c1: [["Units Sold", "Channel"], ["10", "Online"], ["20", "Retail"]],
     };
     const page = { name: "page1", displayName: "Cases", visibility: 0, getFilters: async () => [], setActive: async () => {},
       getVisuals: async () => [
         { name: "t1", title: "Table case", type: "tableEx", layout: { x: 0, y: 200, width: 500, height: 200 }, exportData: async () => ({ data: csv(data.t1) }) },
         { name: "t2", title: "Matrix case", type: "pivotTable", layout: { x: 600, y: 200, width: 300, height: 200 }, exportData: async () => ({ data: csv(data.t2) }) },
+        { name: "t3", title: "Matrix with repeated names", type: "pivotTable", layout: { x: 0, y: 500, width: 500, height: 200 }, exportData: async () => ({ data: csv(data.t3) }) },
         { name: "k1", title: "Card", type: "cardVisual", layout: { x: 0, y: 0, width: 300, height: 100 }, exportData: async () => ({ data: csv(data.k1) }) },
+        { name: "p1", title: "Legend chart", type: "clusteredColumnChart", layout: { x: 0, y: 800, width: 300, height: 200 }, exportData: async () => ({ data: csv(data.p1) }) },
+        { name: "p2", title: "Measure chart", type: "lineChart", layout: { x: 400, y: 800, width: 300, height: 200 }, exportData: async () => ({ data: csv(data.p2) }) },
+        { name: "p3", title: "Scale chart", type: "clusteredBarChart", layout: { x: 800, y: 800, width: 300, height: 200 }, exportData: async () => ({ data: csv(data.p3) }) },
+        { name: "k2", title: "Card", type: "cardVisual", layout: { x: 320, y: 0, width: 200, height: 100 }, exportData: async () => ({ data: csv(data.k2) }) },
+        { name: "t4", title: "Column formats", type: "tableEx", layout: { x: 0, y: 1100, width: 300, height: 200 }, exportData: async () => ({ data: csv(data.t4) }) },
+        // a button slicer: a filter chip, not a table
+        { name: "s1", title: "Region", type: "advancedSlicerVisual", layout: { x: 900, y: 0, width: 200, height: 80 },
+          getSlicerState: async () => ({ filters: [{ target: { table: "S", column: "Region" }, filterType: 1, operator: "In", values: ["North"] }], targets: [{ column: "Region" }] }),
+          exportData: async () => ({ data: csv(data.s1) }) },
+        // hidden: a shape (no note) and a chart (a note)
+        { name: "h1", title: "Toggle shape", type: "shape", layout: { x: 0, y: 1400, width: 50, height: 50, displayState: { mode: 1 } }, exportData: async () => { throw { message: "no data" }; } },
+        { name: "h2", title: "Hidden chart", type: "lineChart", layout: { x: 0, y: 1500, width: 50, height: 50, displayState: { mode: 1 } }, exportData: async () => ({ data: csv(data.p2) }) },
+        // a card split by category, untitled: its title comes from its fields
+        { name: "c1", title: "", type: "cardVisual", layout: { x: 600, y: 1100, width: 300, height: 200 }, exportData: async () => ({ data: csv(data.c1) }) },
       ] };
     embeddedReport = { getActivePage: async () => page, getPages: async () => [page], getFilters: async () => [], getTheme: async () => ({ themeJson: THEME }), on() {}, off() {} };
     currentReport = { id: "cases", embedUrl: "https://x/?groupId=g" };
@@ -195,8 +313,9 @@
     reportColorCache.clear();
     downloadDesignFile = async () => buf;
     let href; const orig = HTMLAnchorElement.prototype.click; HTMLAnchorElement.prototype.click = function () { href = this.href; };
+    let result;
     try {
-      await exportToExcel([page], { pages: "current", layout: "report", collapse: true, visibleRows: 8, includeFilters: true, includeNotes: true, matchColors: true },
+      result = await exportToExcel([page], { pages: "current", layout: "report", collapse: true, visibleRows: 8, includeFilters: true, includeNotes: true, matchColors: true },
         { accent: "#0B7F56", tableStyle: "Executive", titleFont: "Calibri Light" }, () => {}, () => false);
     } finally { HTMLAnchorElement.prototype.click = orig; }
     const out = await (await fetch(href)).arrayBuffer();
@@ -227,6 +346,18 @@
     t("table: data bars", /<dataBar>[\s\S]*?FF00AA00/.test(xml), "no green data bar");
     t("table: icon set with number thresholds", /iconSet iconSet="3Arrows"[^>]*>(<cfvo type="min"\/>)<cfvo type="num" val="33"\/><cfvo type="num" val="66"\/>/.test(xml), (xml.match(/<iconSet[\s\S]*?<\/iconSet>/) || ["none"])[0]);
     t("matrix: renamed value found by position", revenue && fillAt(revenue.r + 1, revenue.c) === "#FFFF00", revenue && fillAt(revenue.r + 1, revenue.c));
+    const yoy2 = find("YoY (2)"), yoy1 = find("YoY");
+    t("matrix: second of two values renamed alike, column field last", yoy2 && fillAt(yoy2.r + 1, yoy2.c) === "#00FFFF" && fillAt(yoy1.r + 1, yoy1.c) !== "#00FFFF",
+      yoy2 ? `${fillAt(yoy1.r + 1, yoy1.c)} ${fillAt(yoy2.r + 1, yoy2.c)}` : "no YoY (2) column");
+    const fp = find("FP"), hires = find("Hires"), rev = find("Revenue2"), spend = find("Spend"), store = find("Store"), amount = find("Amount");
+    t("legend colours on the category cells", fp && fillAt(fp.r + 1, fp.c) === P[0] && fillAt(fp.r + 2, fp.c) === "#F5C869",
+      fp && `${fillAt(fp.r + 1, fp.c)} ${fillAt(fp.r + 2, fp.c)}`);
+    t("legend charts keep the numbers neutral", hires && !fillAt(hires.r + 1, hires.c) && !fillAt(hires.r + 2, hires.c), hires && `${fillAt(hires.r + 1, hires.c)}`);
+    t("measure series colour their headers, numbers neutral",
+      rev && fillAt(rev.r, rev.c) === P[0] && fillAt(spend.r, spend.c) === P[1] && !fillAt(rev.r + 1, rev.c) && !fillAt(spend.r + 1, spend.c),
+      rev && `${fillAt(rev.r, rev.c)} ${fillAt(spend.r, spend.c)} values ${fillAt(rev.r + 1, rev.c)} ${fillAt(spend.r + 1, spend.c)}`);
+    t("colour scales stay on the values", amount && fillAt(amount.r + 1, amount.c) === "#000000" && fillAt(amount.r + 2, amount.c) === "#FFFFFF" && !fillAt(store.r + 1, store.c),
+      amount && `${fillAt(amount.r + 1, amount.c)} ${fillAt(amount.r + 2, amount.c)} store ${fillAt(store.r + 1, store.c)}`);
     let salesValue = null, costValue = null;
     ws.eachRow((row) => row.eachCell((cell) => {
       if (cell.value === 100 && cell.font && cell.font.size >= 20) salesValue = hexOf(cell.font.color.argb);
@@ -241,6 +372,24 @@
     }));
     t("card: tile cap in the card's colour", capColor === "#123456", capColor);
     t("card: value colour from a rule", costValue === "#00AA00", costValue);
+    // The new card's accent bar colours its tile's cap
+    let profitCap = null;
+    ws.eachRow((row) => row.eachCell((cell) => {
+      const b = cell.border && cell.border.top;
+      if (cell.value === "PROFIT" && b && b.style === "medium") profitCap = hexOf(b.color.argb);
+    }));
+    t("card: accent bar colours the tile cap", profitCap === P[1], profitCap);
+    // Column formats: a column's font colour; data bars with negative colour, axis, direction
+    const itemCol = find("Item");
+    t("table: a column's own font colour", itemCol && ws.getCell(itemCol.r + 1, itemCol.c).font.color.argb === "FFAA00AA", itemCol && ws.getCell(itemCol.r + 1, itemCol.c).font.color.argb);
+    t("table: data bars keep negative colour, axis and direction",
+      /negativeBarColorSameAsPositive="0"[^>]*direction="rightToLeft"[\s\S]*?FFEA1313[\s\S]*?axisColor rgb="FF333333"/.test(xml), (xml.match(/<x14:dataBar[\s\S]*?<\/x14:dataBar>/g) || []).join(" ").slice(0, 300));
+    // Slicers of every kind become filter chips; hidden decorative visuals add no note
+    const allText = []; ws.eachRow((row) => row.eachCell((cell) => allText.push(cell.value && cell.value.richText ? cell.value.richText.map((x) => x.text).join("") : String(cell.value ?? ""))));
+    t("button slicer becomes a filter chip", allText.some((x) => /Region\s+North/.test(x)) && !Object.values(ws.tables).some((x) => x.table.columns.length === 1 && x.table.columns[0].name === "Region"),
+      allText.filter((x) => /FILTERS/.test(x)).join(" / "));
+    t("hidden shape adds no note, hidden chart does", !result.notes.some((n) => /Toggle shape/.test(n)) && result.notes.some((n) => /Hidden chart/.test(n)), JSON.stringify(result.notes));
+    t("untitled card split by category is titled from its fields", allText.includes("Units Sold by Channel"), allText.filter((x) => /Units Sold/.test(x)).join(" / "));
     return res;
   }
 })();

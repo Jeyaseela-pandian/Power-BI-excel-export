@@ -15,7 +15,9 @@
   <!-- Reads the report's design file for exact chart colours -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 
-  <link rel="stylesheet" href="styles.css">
+  <!-- The app's own files load fresh every time (?v=…), so a browser never runs an old copy
+       after an update; the libraries above stay cached, as their addresses carry versions -->
+  <script>document.write('<link rel="stylesheet" href="styles.css?v=' + Date.now() + '">');</script>
 </head>
 
 <body>
@@ -164,7 +166,7 @@
       <fieldset>
         <legend>Colours</legend>
         <label class="choice"><input type="checkbox" id="optMatchColors">
-          <span>Match the report's chart colours<small>Values are filled with the colour of their bar, line or slice, with a colour key above each chart table.</small></span></label>
+          <span>Match the report's chart colours<small>Colours appear where the chart's legend puts them: on each row's category or the series header, with a colour key above the table. Colours that depend on a value (colour scales, rules) stay on the value.</small></span></label>
         <p class="muted" id="exactColorsHint" hidden>Colours set by hand on a visual are read from the report file, which needs one more permission.
           <button type="button" class="link" id="grantExactColors">Allow exact colours</button></p>
       </fieldset>
@@ -270,11 +272,15 @@
 
   <div class="toasts" id="toasts" aria-live="polite"></div>
 
-  <script src="config.js"></script>
-  <script src="app.js"></script>
-  <script src="colors.js"></script>
-  <script src="export.js"></script>
-  <script src="ui.js"></script>
+  <script>
+    // In order, each loaded fresh (see the stylesheet above); ui.js starts the app
+    ["config.js", "app.js", "colors.js", "export.js", "ui.js"].forEach((file) => {
+      const script = document.createElement("script");
+      script.src = file + "?v=" + Date.now();
+      script.async = false;
+      document.body.appendChild(script);
+    });
+  </script>
 </body>
 
 </html>

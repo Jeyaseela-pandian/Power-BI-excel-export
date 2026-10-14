@@ -139,7 +139,7 @@ exported when picked on purpose.
 | --- | --- |
 | Export options → **Choose pages** | Lists *Colour test*, *Long table*, and *Hidden page* marked **hidden page** |
 | Export options → **All visible pages** | 2 sheets: *Colour test*, *Long table*. No *Hidden page* sheet |
-| **Choose pages** → tick *Hidden page* only | 1 sheet *Hidden page* with "Orders by category": caption key `■ Total Orders` in **red**, and the Total Orders header and values filled red (blue if the theme couldn't be read) |
+| **Choose pages** → tick *Hidden page* only | 1 sheet *Hidden page* with "Orders by category": caption key `■ Total Orders` in **red**, and the *Total Orders* header filled red; the numbers stay plain (blue if the theme couldn't be read) |
 | After any multi-page export | The report in the app is back on the page you were viewing |
 
 ## 5. Publish
@@ -174,12 +174,12 @@ exported when picked on purpose.
 | Masthead | Thin accent rule across the top, `EXPORT COLOUR TEST` eyebrow, page title `Colour test` (Calibri Light 24), meta line with export time and `2 filters applied`, closed by a thin ink rule |
 | Filter bar | Pale grey bar: `FILTERS  Region North │ Date 6/1/2024 – 8/31/2025` (untouched slicers show `All` in grey) |
 | Total Sales (card) | A scorecard tile: accent cap on top, `TOTAL SALES` label, large value `2,517,775.17`; no "Card" title. Cards on one row join into one strip |
-| All tables | Same frame everywhere: pale header with an ink rule above it, hairlines between rows, a closing ink rule; numbers with thousands separators (e.g. `93,687.30`); Month Sort stays `202401`. Only chart values are coloured, never text columns |
-| Sales and cost by month | Caption key **■ red** Total Sales, **■ blue** Total Cost. The *Total Sales* header and every value under it are filled **red** with white text; *Total Cost* **blue** |
-| Sales by segment | Caption key **■ red** Consumer, **■ blue** Corporate, **■ green** Home Office. Each *Total Sales* value is filled in its segment's colour. Sort the table: the fills move with their rows |
-| Sales by category (custom colour) | With exact colours: the *Total Sales* header and values filled **black** (`#000000`) with white text, as in the report. Without the permission: **red** (theme colour 1) and a note at the bottom: *Chart colours follow the report theme…* |
-| Deneb sales | Title built from the data (e.g. *Total Sales by Month*, as "Deneb" says nothing); caption `■ Total Sales · row colours from Bar Color` in **green**; the *Total Sales* header and values filled green |
-| Sales by category tiles (treemap) | Each *Total Sales* value filled in its tile's colour: **Apparel red, Electronics blue, Furniture green, Office Supplies purple** (in the order the categories appear in the export) |
+| All tables | Same frame everywhere: pale header with an ink rule above it, hairlines between rows, a closing ink rule; numbers with thousands separators (e.g. `93,687.30`); Month Sort stays `202401`. Chart colours sit where the chart's legend puts them: on each row's category, or on the header of a measure; numbers stay plain unless their colour depends on the value (colour scales, rules) |
+| Sales and cost by month | Caption key **■ red** Total Sales, **■ blue** Total Cost. The *Total Sales* header is filled **red** with white text and *Total Cost* **blue**; the numbers stay plain |
+| Sales by segment | Caption key **■ red** Consumer, **■ blue** Corporate, **■ green** Home Office. Each *Segment* cell is filled in its colour (Consumer red, Corporate blue, Home Office green); *Total Sales* stays plain. Sort the table: the fills move with their rows |
+| Sales by category (custom colour) | With exact colours: the *Total Sales* header filled **black** (`#000000`) with white text, as in the report; the numbers stay plain. Without the permission: **red** (theme colour 1) and a note at the bottom: *Chart colours follow the report theme…* |
+| Deneb sales | Title built from the data (e.g. *Total Sales by Month*, as "Deneb" says nothing); caption `■ Total Sales · row colours from Bar Color` in **green**; the *Total Sales* header filled green |
+| Sales by category tiles (treemap) | Each *Category* cell filled in its tile's colour: **Apparel red, Electronics blue, Furniture green, Office Supplies purple** (in the order the categories appear in the export); *Total Sales* stays plain |
 | Category summary (table) | Caption `Table · 4 rows`, no colour keys |
 | Sales by category and year (matrix) | Caption `Matrix · 4 rows`, flat rows (matrix layout isn't rebuilt) |
 | Footer and print | Footer line `Source: Power BI · Export colour test`; File → Print shows landscape, one page wide, page numbers in the footer |
@@ -192,7 +192,7 @@ exported when picked on purpose.
 | Test | Expected |
 | --- | --- |
 | *Match the report's chart colours* off | No colours at all: no keys or fills; captions read `Line chart · 24 rows` etc. |
-| Branding → Table style *Classic blue* | Tables use Excel's blue table style (blue header, stripes) with no ink rules; series headers and value fills still in the report colours |
+| Branding → Table style *Classic blue* | Tables use Excel's blue table style (blue header, stripes) with no ink rules; category cells and series headers still in the report colours |
 | Branding → a very pale accent (e.g. `#FFF200`) | The top rule and KPI caps use a darker shade of the accent (deep gold) so they stay visible; the sheet tab keeps the pale accent |
 | Export options → *Number visuals* | Titles read `01  Sales and cost by month`, `02  …` |
 | Open in desktop Excel | No repair prompt; every table's filter and sort buttons work |
