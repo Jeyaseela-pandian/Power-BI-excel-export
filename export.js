@@ -739,6 +739,7 @@ function kpiHasTitle(item) {
  *    doubles as the "rows grouped" note when collapsing is on)
  */
 function blockSize(item, options) {
+  if (item.chart) return chartBlockSize(item);   // charts mode: the chart's own size
   if (item.isKpi) {
     const [header, values = []] = item.rows;
     const hero = toCellValue(values[0]);
@@ -1212,7 +1213,7 @@ function groupIntoStacks(items) {
 
 /* Rows of a planned table that may collapse: data rows past its visible rows, plus padding before its note */
 function collapsibleRange(p) {
-  if (p.item.isKpi) return null;
+  if (p.item.isKpi || p.item.chart) return null;
   const n = p.item.rows.length - 1;
   if (n <= p.vis) return null;
   const end = p.noteRow ? p.noteRow - 1 : p.r + HEAD_ROWS + n - 1;
@@ -1222,7 +1223,7 @@ function collapsibleRange(p) {
 /* Rows of a planned block that must always stay visible: a whole tile, or a table's
    head and first rows (and its closing row when nothing of it collapses) */
 function topRange(p) {
-  if (p.item.isKpi) return [p.r, p.r + p.size.height - 1];
+  if (p.item.isKpi || p.item.chart) return [p.r, p.r + p.size.height - 1];
   const n = p.item.rows.length - 1;
   if (n <= p.vis) return [p.r, p.r + HEAD_ROWS + n];
   return [p.r, p.r + HEAD_ROWS - 1 + p.vis];
@@ -1317,6 +1318,8 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     const info = lay.reportColors && item.name ? lay.reportColors.visuals[item.name] || null : null;
     item.colors = lay.palette && !item.isKpi ? columnColors(item, lay.palette, info) : null;
     item.tableFormat = info && info.tableFormats && info.tableFormats.length ? info : null;
+    item.colorInfo = info;
+    item.chart = options.visualsAs === "charts" ? chartPlan(item) : null;   // charts mode only
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
   }
   const executive = !BUILT_IN_STYLES.includes(lay.tableStyle);
@@ -1378,7 +1381,13 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     for (const p of plan) {
       const { item, col, r, size } = p;
       lastCol = Math.max(lastCol, col + size.width - 1);
-      if (item.isKpi) {
+      if (item.chart) {
+        // Charts mode: reserve the chart's place; the chart itself is added to the file at the end
+        const { w, h } = chartSizePx(item);
+        widths.span(col, col + size.width - 1, Math.ceil(w / UNIT_PX));
+        (lay.charts = lay.charts || []).push({ plan: item.chart, col, row: r, wPx: w, hPx: h });
+        for (let i = 0; i < size.height; i++) mark(r + i, "other");
+      } else if (item.isKpi) {
         writeKpiBlock(ws, r, col, item, widths, lay, p.divider, p.strip);
         for (let i = 0; i < size.height; i++) mark(r + i, "other");
       } else {
@@ -1769,7 +1778,423 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
     `&C&"Calibri,Regular"&9&K5B6B7FPage &P of &N&R&"Calibri,Regular"&9&K5B6B7FSource: Power BI`;
   ws.headerFooter = { differentFirst: true, oddHeader: header, oddFooter: footer, firstFooter: footer };
 
-  return { tables: layout.tableCount, kpis: data.items.length - layout.tableCount };
+    return {
+    tables: layout.tableCount,
+    kpis: data.items.filter((it) => it.isKpi).length,
+    charts: lay.charts || [],   // charts mode: charts to add to this sheet (Step 9)
+  };
+}
+
+/* ── Charts mode ("Visuals as: Charts") ───────────────────────────────────
+ * Chart visuals become real Excel charts, placed like the report. ExcelJS can't write
+ * charts, so: the page sheet reserves each chart's place, the chart's numbers go on the
+ * page's "Data" sheet, and addChartsToFile() adds the chart parts to the finished .xlsx
+ * (with JSZip). Only used when options.visualsAs === "charts"; the data tables mode
+ * never runs this code. Visuals without an Excel chart equivalent stay data tables.
+ */
+const EXCEL_CHARTS = {
+  clusteredColumnChart: { kind: "bar", dir: "col", grouping: "clustered" },
+  columnChart: { kind: "bar", dir: "col", grouping: "stacked" },
+  hundredPercentStackedColumnChart: { kind: "bar", dir: "col", grouping: "percentStacked" },
+  clusteredBarChart: { kind: "bar", dir: "bar", grouping: "clustered" },
+  barChart: { kind: "bar", dir: "bar", grouping: "stacked" },
+  hundredPercentStackedBarChart: { kind: "bar", dir: "bar", grouping: "percentStacked" },
+  lineChart: { kind: "line" },
+  areaChart: { kind: "area", grouping: "standard" },
+  stackedAreaChart: { kind: "area", grouping: "stacked" },
+  hundredPercentStackedAreaChart: { kind: "area", grouping: "percentStacked" },
+  lineClusteredColumnComboChart: { kind: "combo", dir: "col", grouping: "clustered" },
+  lineStackedColumnComboChart: { kind: "combo", dir: "col", grouping: "stacked" },
+  pieChart: { kind: "pie" },
+  donutChart: { kind: "doughnut" },
+};
+const CHART_SCALE = 1;          // Power BI page pixels → chart pixels
+const CHART_MIN_W = 360;        // smallest chart, in pixels
+const CHART_MIN_H = 220;
+const CHART_PX_TO_EMU = 9525;   // Excel drawing units per pixel
+const ROW_PX = ROW_H * 4 / 3;   // one sheet row, in pixels
+const UNIT_PX = 7;              // about one Excel column width unit, in pixels
+
+/* The chart's size in pixels: the visual's size on the report page */
+function chartSizePx(item) {
+  const w = Math.max(CHART_MIN_W, Math.round(((item.layout && item.layout.width) || 400) * CHART_SCALE));
+  const h = Math.max(CHART_MIN_H, Math.round(((item.layout && item.layout.height) || 260) * CHART_SCALE));
+  return { w, h };
+}
+
+/* Rows and columns a chart covers on the page sheet */
+function chartBlockSize(item) {
+  const { w, h } = chartSizePx(item);
+  return { width: Math.max(2, Math.round(w / 90)), height: Math.ceil(h / ROW_PX) + 1, note: false };
+}
+
+/*
+ * What a chart visual draws, from its exported rows: categories (the axis), one series
+ * per measure (or per legend value), and colours when "Match the report's chart colours"
+ * is on. Returns null when the visual can't be an Excel chart (it then stays a table).
+ */
+function chartPlan(item) {
+  const spec = EXCEL_CHARTS[item.type];
+  if (!spec || item.isKpi) return null;
+  const { header, data, numeric, hex, helper } = classifyColumns(item.rows);
+  if (!data.length) return null;
+  const cols = header.map((_, ci) => ci);
+  const textCols = cols.filter((ci) => !numeric[ci] && !hex[ci]);
+  const catCol = textCols.length ? textCols[0] : 0;
+  const valueCols = cols.filter((ci) => ci !== catCol && numeric[ci] && !hex[ci] && !helper[ci]);
+  if (!valueCols.length) return null;
+  const colors = item.colors || null;
+  const info = item.colorInfo || null;
+  const key = (r, ci) => String(r[ci] ?? "").trim();
+  const num = (raw) => { const v = toCellValue(raw).value; return typeof v === "number" ? v : null; };
+  const formatOf = (ci) => {
+    const cells = data.map((r) => [toCellValue(r[ci])]);
+    const readable = readableFormats([header[ci]], cells)[0];
+    const exported = cells.map((c) => c[0]).find((c) => typeof c.value === "number" && c.numFmt);
+    return readable || (exported && exported.numFmt) || "General";
+  };
+  const categories = [...new Set(data.map((r) => key(r, catCol)))];
+  const firstRowOf = (c) => data.findIndex((r) => key(r, catCol) === c);
+  // One value per category; a category with several rows (a hierarchy) is totalled
+  const valuesFor = (ci, rows) => {
+    const additive = !NON_ADDITIVE.test(header[ci]) && !data.some((r) => key(r, ci).endsWith("%"));
+    return categories.map((c) => {
+      const vals = rows.filter((r) => key(r, catCol) === c).map((r) => num(r[ci])).filter((v) => v !== null);
+      if (!vals.length) return null;
+      return additive ? vals.reduce((a, b) => a + b, 0) : vals[0];
+    });
+  };
+  const base = { spec, title: item.displayTitle || item.title, catName: header[catCol], categories, pointColors: null };
+
+  // Pie / donut: one series, a colour per slice
+  if (spec.kind === "pie" || spec.kind === "doughnut") {
+    const vc = valueCols[0];
+    const byKey = colors && colors.rowKey && colors.rowKey.col === catCol ? colors.rowKey.colorOf : null;
+    return {
+      ...base,
+      series: [{ name: header[vc], values: valuesFor(vc, data), fmt: formatOf(vc), color: null }],
+      pointColors: byKey ? categories.map((c) => byKey[c] || null) : null,
+    };
+  }
+
+  // A legend splits one measure into one series per legend value
+  let legendCol = -1;
+  if (info && info.rule === "legend" && info.series) {
+    legendCol = header.findIndex((h) => normalizeField(h) === info.series.ref || String(h).trim().toLowerCase() === info.series.label);
+  } else if (!info && textCols.length === 2 && valueCols.length === 1) {
+    legendCol = textCols[1];
+  }
+  if (legendCol >= 0 && legendCol !== catCol) {
+    const vc = valueCols[0];
+    const byKey = colors && colors.rowKey && colors.rowKey.col === legendCol ? colors.rowKey.colorOf : null;
+    const legends = byKey ? Object.keys(byKey) : seriesOrder(data, legendCol, [catCol]);
+    return {
+      ...base,
+      series: legends.map((name) => ({
+        name,
+        values: valuesFor(vc, data.filter((r) => key(r, legendCol) === name)),
+        fmt: formatOf(vc),
+        color: (byKey && byKey[name]) || null,
+      })),
+    };
+  }
+
+  // One series per measure; a combo draws its last measure as a line on a second axis
+  const series = valueCols.map((ci, i) => ({
+    name: header[ci],
+    values: valuesFor(ci, data),
+    fmt: formatOf(ci),
+    color: (colors && colors.series && colors.series[ci]) || null,
+    line: spec.kind === "combo" && valueCols.length > 1 && i === valueCols.length - 1,
+  }));
+  // One measure coloured per bar (colours set by hand, or a colour rule)
+  let pointColors = null;
+  if (series.length === 1 && colors) {
+    const ci = valueCols[0];
+    if (colors.perCol && colors.perCol[ci]) pointColors = categories.map((c) => colors.perCol[ci][firstRowOf(c)] || null);
+    else if (colors.rowKey && colors.rowKey.col === catCol) pointColors = categories.map((c) => colors.rowKey.colorOf[c] || null);
+    else if (colors.tabColors) pointColors = categories.map((c) => colors.tabColors[firstRowOf(c)] || null);
+  }
+  return { ...base, series, pointColors };
+}
+
+/* Writes every chart's numbers on the page's "Data" sheet and records the cell ranges */
+function writeChartDataSheet(wb, name, charts) {
+  const ws = wb.addWorksheet(name, { views: [{ showGridLines: false }] });
+    // The chart numbers stay in the file (Excel charts need them) but the sheet is invisible:
+  // "veryHidden" also keeps it out of Excel's Unhide list, so users see only the visual sheet
+  ws.state = "veryHidden";
+  const sheetRef = `'${name.replace(/'/g, "''")}'`;
+  const abs = (r, c) => `$${ws.getColumn(c).letter}$${r}`;
+  let row = 2, widest = 1;
+  for (const ch of charts) {
+    const p = ch.plan;
+    const t = ws.getCell(row, 2);
+    t.value = p.title;
+    t.font = { name: "Calibri", size: 12, bold: true, color: { argb: C.INK } };
+    const hr = row + 1;
+    const h0 = ws.getCell(hr, 2);
+    h0.value = p.catName || "Category";
+    h0.font = { name: "Calibri", size: 10, bold: true, color: { argb: C.INK } };
+    h0.fill = SURFACE_FILL;
+    p.series.forEach((s, i) => {
+      const h = ws.getCell(hr, 3 + i);
+      h.value = s.name;
+      h.font = { name: "Calibri", size: 10, bold: true, color: { argb: C.INK } };
+      h.fill = SURFACE_FILL;
+      h.alignment = { horizontal: "right" };
+    });
+    p.categories.forEach((c, ri) => {
+      ws.getCell(hr + 1 + ri, 2).value = c;
+      p.series.forEach((s, i) => {
+        const cell = ws.getCell(hr + 1 + ri, 3 + i);
+        cell.value = s.values[ri];
+        if (s.fmt && s.fmt !== "General") cell.numFmt = s.fmt;
+      });
+    });
+    const first = hr + 1, last = hr + p.categories.length;
+    p.refs = {
+      catRef: `${sheetRef}!${abs(first, 2)}:${abs(last, 2)}`,
+      series: p.series.map((s, i) => ({
+        nameRef: `${sheetRef}!${abs(hr, 3 + i)}`,
+        valRef: `${sheetRef}!${abs(first, 3 + i)}:${abs(last, 3 + i)}`,
+      })),
+    };
+    widest = Math.max(widest, p.series.length);
+    row = last + 3;
+  }
+  ws.getColumn(1).width = 3;
+  ws.getColumn(2).width = 30;
+  for (let c = 3; c < 3 + widest; c++) ws.getColumn(c).width = 18;
+  return ws;
+}
+
+/* ── Chart XML (DrawingML) ── */
+function xmlEsc(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+function fillXml(argb) {
+  return argb ? `<a:solidFill><a:srgbClr val="${String(argb).slice(-6).toUpperCase()}"/></a:solidFill>` : "";
+}
+function strCacheXml(values) {
+  return `<c:strCache><c:ptCount val="${values.length}"/>` +
+    values.map((v, i) => `<c:pt idx="${i}"><c:v>${xmlEsc(v)}</c:v></c:pt>`).join("") + `</c:strCache>`;
+}
+function numCacheXml(values, fmt) {
+  return `<c:numCache><c:formatCode>${xmlEsc(fmt || "General")}</c:formatCode><c:ptCount val="${values.length}"/>` +
+    values.map((v, i) => (v === null || v === undefined ? "" : `<c:pt idx="${i}"><c:v>${v}</c:v></c:pt>`)).join("") + `</c:numCache>`;
+}
+
+function chartSeriesXml(kind, s, i, plan, ref) {
+  const head = `<c:idx val="${i}"/><c:order val="${i}"/>` +
+    `<c:tx><c:strRef><c:f>${xmlEsc(ref.nameRef)}</c:f>${strCacheXml([s.name])}</c:strRef></c:tx>`;
+  const cat = `<c:cat><c:strRef><c:f>${xmlEsc(plan.refs.catRef)}</c:f>${strCacheXml(plan.categories)}</c:strRef></c:cat>`;
+  const val = `<c:val><c:numRef><c:f>${xmlEsc(ref.valRef)}</c:f>${numCacheXml(s.values, s.fmt)}</c:numRef></c:val>`;
+  const points = (plan.pointColors || []).map((c, pi) => (c
+    ? `<c:dPt><c:idx val="${pi}"/>${kind === "bar" ? '<c:invertIfNegative val="0"/>' : ""}<c:bubble3D val="0"/><c:spPr>${fillXml(c)}</c:spPr></c:dPt>`
+    : "")).join("");
+  if (kind === "line") {
+    const ln = s.color ? `<c:spPr><a:ln w="28575" cap="rnd">${fillXml(s.color)}<a:round/></a:ln></c:spPr>` : "";
+    return `<c:ser>${head}${ln}<c:marker><c:symbol val="none"/></c:marker>${cat}${val}<c:smooth val="0"/></c:ser>`;
+  }
+  const sp = s.color ? `<c:spPr>${fillXml(s.color)}</c:spPr>` : "";
+  if (kind === "bar") return `<c:ser>${head}${sp}<c:invertIfNegative val="0"/>${points}${cat}${val}</c:ser>`;
+  if (kind === "area") return `<c:ser>${head}${sp}${cat}${val}</c:ser>`;
+  return `<c:ser>${head}${sp}${points}${cat}${val}</c:ser>`;   // pie, doughnut
+}
+
+function catAxXml(id, crossId, pos, { reverse = false, hidden = false } = {}) {
+  return `<c:catAx><c:axId val="${id}"/><c:scaling><c:orientation val="${reverse ? "maxMin" : "minMax"}"/></c:scaling>` +
+    `<c:delete val="${hidden ? 1 : 0}"/><c:axPos val="${pos}"/><c:numFmt formatCode="General" sourceLinked="1"/>` +
+    `<c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/>` +
+    `<c:spPr><a:ln w="9525">${fillXml(C.RULE)}</a:ln></c:spPr>` +
+    `<c:crossAx val="${crossId}"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/><c:noMultiLvlLbl val="0"/></c:catAx>`;
+}
+
+function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true } = {}) {
+  return `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="${pos}"/>` +
+    (grid ? `<c:majorGridlines><c:spPr><a:ln w="6350">${fillXml(C.HAIR)}</a:ln></c:spPr></c:majorGridlines>` : "") +
+    `<c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/>` +
+    `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:crossAx val="${crossId}"/><c:crosses val="${crosses}"/><c:crossBetween val="between"/></c:valAx>`;
+}
+
+function chartXml(plan) {
+  const { spec, series } = plan;
+  const kind = spec.kind;
+  const refs = plan.refs;
+  let body;
+  if (kind === "pie" || kind === "doughnut") {
+    const ser = chartSeriesXml("pie", series[0], 0, plan, refs.series[0]);
+    body = kind === "pie"
+      ? `<c:pieChart><c:varyColors val="1"/>${ser}<c:firstSliceAng val="0"/></c:pieChart>`
+      : `<c:doughnutChart><c:varyColors val="1"/>${ser}<c:firstSliceAng val="0"/><c:holeSize val="55"/></c:doughnutChart>`;
+  } else {
+    const indexed = series.map((s, i) => [s, i]);
+    const main = indexed.filter(([s]) => !s.line);
+    const lines = indexed.filter(([s]) => s.line);
+    const horizontal = spec.dir === "bar";
+    const pct = spec.grouping === "percentStacked";
+    const valFmt = pct ? "0%" : (main[0] ? main[0][0].fmt : series[0].fmt);
+    const A1 = 50010, A2 = 50020, A3 = 50030, A4 = 50040;
+    let groups = "";
+    if (kind === "bar" || kind === "combo") {
+      const grouping = spec.grouping || "clustered";
+      groups += `<c:barChart><c:barDir val="${horizontal ? "bar" : "col"}"/><c:grouping val="${grouping}"/><c:varyColors val="0"/>` +
+        main.map(([s, i]) => chartSeriesXml("bar", s, i, plan, refs.series[i])).join("") +
+        `<c:gapWidth val="60"/>${grouping !== "clustered" ? '<c:overlap val="100"/>' : ""}<c:axId val="${A1}"/><c:axId val="${A2}"/></c:barChart>`;
+    } else if (kind === "line") {
+      groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
+        main.map(([s, i]) => chartSeriesXml("line", s, i, plan, refs.series[i])).join("") +
+        `<c:marker val="1"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:lineChart>`;
+    } else if (kind === "area") {
+      groups += `<c:areaChart><c:grouping val="${spec.grouping || "standard"}"/><c:varyColors val="0"/>` +
+        main.map(([s, i]) => chartSeriesXml("area", s, i, plan, refs.series[i])).join("") +
+        `<c:axId val="${A1}"/><c:axId val="${A2}"/></c:areaChart>`;
+    }
+    let axes = catAxXml(A1, A2, horizontal ? "l" : "b", { reverse: horizontal }) +
+      valAxXml(A2, A1, horizontal ? "b" : "l", valFmt, { crosses: horizontal ? "max" : "autoZero" });
+    if (lines.length) {
+      groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
+        lines.map(([s, i]) => chartSeriesXml("line", s, i, plan, refs.series[i])).join("") +
+        `<c:marker val="1"/><c:axId val="${A3}"/><c:axId val="${A4}"/></c:lineChart>`;
+      axes += catAxXml(A3, A4, "b", { hidden: true }) + valAxXml(A4, A3, "r", lines[0][0].fmt, { crosses: "max", grid: false });
+    }
+    body = groups + axes;
+  }
+  const round = kind === "pie" || kind === "doughnut";
+  const legend = series.length > 1 || round
+    ? `<c:legend><c:legendPos val="${round ? "r" : "t"}"/><c:overlay val="0"/></c:legend>` : "";
+  const title = `<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="1200" b="1"/></a:pPr>` +
+    `<a:r><a:rPr lang="en-US" sz="1200" b="1">${fillXml(C.INK)}</a:rPr><a:t>${xmlEsc(plan.title)}</a:t></a:r></a:p></c:rich></c:tx>` +
+    `<c:overlay val="0"/></c:title><c:autoTitleDeleted val="0"/>`;
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">` +
+    `<c:roundedCorners val="0"/><c:chart>${title}<c:plotArea><c:layout/>${body}</c:plotArea>${legend}<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart>` +
+    `<c:spPr>${fillXml(C.WHITE)}<a:ln w="9525">${fillXml(C.HAIR)}</a:ln></c:spPr>` +
+    `<c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="900">${fillXml(C.SLATE)}<a:latin typeface="Calibri"/></a:defRPr></a:pPr><a:endParaRPr lang="en-US"/></a:p></c:txPr>` +
+    `</c:chartSpace>`;
+}
+
+/* A chart's frame on the page sheet: its top-left cell and its size */
+function chartAnchorXml(ch, rid, id) {
+  const cx = Math.round(ch.wPx * CHART_PX_TO_EMU), cy = Math.round(ch.hPx * CHART_PX_TO_EMU);
+  return `<xdr:oneCellAnchor><xdr:from><xdr:col>${ch.col - 1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${ch.row - 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>` +
+    `<xdr:ext cx="${cx}" cy="${cy}"/><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="${id}" name="Chart ${id}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
+    `<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">` +
+    `<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="${rid}"/>` +
+    `</a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:oneCellAnchor>`;
+}
+
+/* ── Adding the charts to the finished .xlsx ── */
+const REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
+const EMPTY_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`;
+
+function addRel(rels, type, target) {
+  const ids = [...rels.matchAll(/Id="rId(\d+)"/g)].map((m) => Number(m[1]));
+  const id = "rId" + ((ids.length ? Math.max(...ids) : 0) + 1);
+  const rel = `<Relationship Id="${id}" Type="${REL_TYPE}${type}" Target="${target}"/>`;
+  const xml = /<Relationships[^>]*\/>/.test(rels)
+    ? rels.replace(/<Relationships([^>]*)\/>/, `<Relationships$1>${rel}</Relationships>`)
+    : rels.replace("</Relationships>", rel + "</Relationships>");
+  return { xml, id };
+}
+
+function relTarget(rels, id) {
+  const tag = (rels.match(new RegExp(`<Relationship\\b[^>]*\\bId="${id}"[^>]*>`)) || [])[0] || "";
+  return (tag.match(/\bTarget="([^"]+)"/) || [])[1] || null;
+}
+
+function unescapeXml(s) {
+  return s.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+
+/* "../drawings/drawing1.xml" relative to a file in xl/<folder>/ → "xl/drawings/drawing1.xml" */
+function xlPath(target) {
+  if (target.startsWith("/")) return target.slice(1);
+  return "xl/" + target.replace(/^\.\.\//, "").replace(/^\.\//, "");
+}
+
+function insertDrawing(sheetXml, rid) {
+  if (!/<worksheet[^>]*xmlns:r=/.test(sheetXml)) {
+    sheetXml = sheetXml.replace("<worksheet", '<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"');
+  }
+  // <drawing> must come before these elements in a worksheet
+  const after = ["<legacyDrawing", "<legacyDrawingHF", "<picture", "<oleObjects", "<controls", "<webPublishItems", "<tableParts", "<extLst"];
+  const found = after.map((t) => sheetXml.indexOf(t)).filter((i) => i >= 0);
+  const at = found.length ? Math.min(...found) : sheetXml.lastIndexOf("</worksheet>");
+  return sheetXml.slice(0, at) + `<drawing r:id="${rid}"/>` + sheetXml.slice(at);
+}
+
+/* chartSheets: [{ sheetName, charts: [{ plan, col, row, wPx, hPx }] }]. Returns the new file. */
+async function addChartsToFile(buffer, chartSheets) {
+  const zip = await JSZip.loadAsync(buffer);
+  const read = (p) => zip.file(p).async("string");
+  const workbookXml = await read("xl/workbook.xml");
+  const workbookRels = await read("xl/_rels/workbook.xml.rels");
+  let types = await read("[Content_Types].xml");
+  const addType = (part, type) => {
+    if (!types.includes(`PartName="/${part}"`)) types = types.replace("</Types>", `<Override PartName="/${part}" ContentType="${type}"/></Types>`);
+  };
+  let chartNo = Object.keys(zip.files).filter((n) => /^xl\/charts\/chart\d+\.xml$/.test(n)).length;
+  let drawingNo = Object.keys(zip.files).filter((n) => /^xl\/drawings\/drawing\d+\.xml$/.test(n)).length;
+
+  // Sheet name → its file
+  const sheetFiles = {};
+  for (const m of workbookXml.matchAll(/<sheet\b[^>]*>/g)) {
+    const name = unescapeXml((m[0].match(/\bname="([^"]*)"/) || [])[1] || "");
+    const rid = (m[0].match(/\br:id="([^"]+)"/) || [])[1];
+    const target = rid && relTarget(workbookRels, rid);
+    if (target) sheetFiles[name] = xlPath(target);
+  }
+
+  for (const { sheetName, charts } of chartSheets) {
+    const sheetPath = sheetFiles[sheetName];
+    if (!sheetPath || !charts.length) continue;
+    const sheetRelsPath = sheetPath.replace(/([^/]+)$/, "_rels/$1.rels");
+    let sheetXml = await read(sheetPath);
+    let sheetRels = zip.file(sheetRelsPath) ? await read(sheetRelsPath) : EMPTY_RELS;
+
+    // The sheet's drawing: the one ExcelJS made for the logo, or a new one
+    let drawingPath, drawingXml;
+    const existing = sheetXml.match(/<drawing r:id="([^"]+)"\s*\/>/);
+    const existingTarget = existing && relTarget(sheetRels, existing[1]);
+    if (existingTarget) {
+      drawingPath = "xl/drawings/" + existingTarget.split("/").pop();
+      drawingXml = await read(drawingPath);
+    } else {
+      drawingNo++;
+      drawingPath = `xl/drawings/drawing${drawingNo}.xml`;
+      drawingXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+        `<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"></xdr:wsDr>`;
+      const rel = addRel(sheetRels, "drawing", `../drawings/drawing${drawingNo}.xml`);
+      sheetRels = rel.xml;
+      sheetXml = insertDrawing(sheetXml, rel.id);
+      addType(drawingPath, "application/vnd.openxmlformats-officedocument.drawing+xml");
+    }
+    const drawingRelsPath = drawingPath.replace(/([^/]+)$/, "_rels/$1.rels");
+    let drawingRels = zip.file(drawingRelsPath) ? await read(drawingRelsPath) : EMPTY_RELS;
+
+    let anchors = "";
+    for (const ch of charts) {
+      chartNo++;
+      const chartPath = `xl/charts/chart${chartNo}.xml`;
+      zip.file(chartPath, chartXml(ch.plan));
+      addType(chartPath, "application/vnd.openxmlformats-officedocument.drawingml.chart+xml");
+      const rel = addRel(drawingRels, "chart", `../charts/chart${chartNo}.xml`);
+      drawingRels = rel.xml;
+      anchors += chartAnchorXml(ch, rel.id, 1000 + chartNo);
+    }
+    drawingXml = drawingXml.includes("</xdr:wsDr>")
+      ? drawingXml.replace("</xdr:wsDr>", anchors + "</xdr:wsDr>")
+      : drawingXml.replace(/<xdr:wsDr([^>]*)\/>/, `<xdr:wsDr$1>${anchors}</xdr:wsDr>`);
+
+    zip.file(sheetPath, sheetXml);
+    zip.file(sheetRelsPath, sheetRels);
+    zip.file(drawingPath, drawingXml);
+    zip.file(drawingRelsPath, drawingRels);
+  }
+  zip.file("[Content_Types].xml", types);
+  return zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
 }
 
 /* ── Orchestrator ─────────────────────────────────────────────────────── */
@@ -1869,15 +2294,24 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
   const nameSheet = makeSheetNamer();
   const nameTable = makeTableNamer();
   const totals = { tables: 0, kpis: 0, notes: [] };
+  const chartSheets = [];   // charts mode: { sheetName, charts } for addChartsToFile
   collected.forEach(({ page, data }, i) => {
     const ctx = { pageIndex: i + 1, pageCount: collected.length, dateText };
-    const counts = writePageSheet(wb, nameSheet(page.displayName), page, data, options, branding, logo, nameTable, ctx);
+        const sheetName = nameSheet(page.displayName);
+    const counts = writePageSheet(wb, sheetName, page, data, options, branding, logo, nameTable, ctx);
+    // Charts mode: this page's chart numbers go on its own "Data" sheet, right after it
+    if (counts.charts.length) {
+      writeChartDataSheet(wb, nameSheet(`${page.displayName} – Data`), counts.charts);
+      chartSheets.push({ sheetName, charts: counts.charts });
+    }
     totals.tables += counts.tables;
     totals.kpis += counts.kpis;
     data.notes.forEach((n) => totals.notes.push(collected.length > 1 ? `${page.displayName}: ${n}` : n));
   });
 
-  const buffer = await wb.xlsx.writeBuffer();
+  let buffer = await wb.xlsx.writeBuffer();
+  // Charts mode: add the real Excel charts to the finished file
+  if (chartSheets.length) buffer = await addChartsToFile(buffer, chartSheets);
   const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
   const baseName = collected.length === 1 ? `${currentReportName} - ${collected[0].page.displayName}` : currentReportName;
   const fileName = (baseName.replace(/[\\/:*?"<>|]/g, "").trim() || "Power BI export") + ".xlsx";

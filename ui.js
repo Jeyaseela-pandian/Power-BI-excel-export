@@ -20,6 +20,7 @@ const DEFAULT_OPTIONS = {
   includeNotes: true,
   matchColors: true,
   exhibitNumbers: false,   // "01  Title" numbering of visuals
+  visualsAs: "tables",     // "tables" (data tables, as before) | "charts" (real Excel charts)
 };
 const DEFAULT_BRANDING = {
   companyName: "",
@@ -151,6 +152,7 @@ async function openOptionsDrawer() {
 
   document.querySelectorAll('input[name="optPages"]').forEach((r) => { r.checked = r.value === exportOptions.pages; });
   document.querySelectorAll('input[name="optLayout"]').forEach((r) => { r.checked = r.value === exportOptions.layout; });
+    document.querySelectorAll('input[name="optVisualsAs"]').forEach((r) => { r.checked = r.value === (exportOptions.visualsAs || "tables"); });
   $("optCollapse").checked = exportOptions.collapse;
   $("optVisibleRows").value = exportOptions.visibleRows;
   $("optVisibleRows").disabled = !exportOptions.collapse;
@@ -264,6 +266,7 @@ function readDrawerOptions() {
     includeNotes: $("optNotes").checked,
     matchColors: $("optMatchColors").checked,
     exhibitNumbers: $("optExhibitNumbers").checked,
+    visualsAs: document.querySelector('input[name="optVisualsAs"]:checked')?.value || "tables",
   };
   saveJson(OPTIONS_KEY, exportOptions);
 }
