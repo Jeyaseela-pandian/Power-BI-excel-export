@@ -1,2 +1,5 @@
 # Local Claude Code settings (preview server config)
 .claude/
+
+# Test samples (local test reports and data)
+test-samples/
