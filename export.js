@@ -2200,18 +2200,23 @@ function chartPlan(item) {
     }
   }
   if (!valueCols.length) return null;
-  const categories = [...new Set(data.map((r) => key(r, catCol)))];
-  const firstRowOf = (c) => data.findIndex((r) => key(r, catCol) === c);
+  // A category hierarchy Power BI shows expanded (Chain, then Name: a bar per store) is
+  // exported at its lowest level shown: every level in the export makes up the bar's label,
+  // joined as Power BI joins them, so the rows aren't totalled back up to the top level
+  const levelCols = info ? [catCol, ...(info.categories || []).slice(1).map((f) => colOf(f)).filter((c) => c >= 0)] : [catCol];
+  const catOf = (r) => levelCols.map((c) => key(r, c)).filter(Boolean).join(" ");
+  const categories = [...new Set(data.map((r) => catOf(r)))];
+  const firstRowOf = (c) => data.findIndex((r) => catOf(r) === c);
   // One value per category; a category with several rows (a hierarchy) is totalled
   const valuesFor = (ci, rows) => {
     const additive = !NON_ADDITIVE.test(header[ci]) && !data.some((r) => key(r, ci).endsWith("%"));
     return categories.map((c) => {
-      const vals = rows.filter((r) => key(r, catCol) === c).map((r) => num(r[ci])).filter((v) => v !== null);
+      const vals = rows.filter((r) => catOf(r) === c).map((r) => num(r[ci])).filter((v) => v !== null);
       if (!vals.length) return null;
       return additive ? vals.reduce((a, b) => a + b, 0) : vals[0];
     });
   };
-  const base = { spec, title: item.displayTitle || item.title, catName: header[catCol], categories, pointColors: null };
+  const base = { spec, title: item.displayTitle || item.title, catName: levelCols.map((c) => header[c]).join(" / "), categories, pointColors: null };
 
   // Pie / donut: one series, a colour per slice
   if (spec.kind === "pie" || spec.kind === "doughnut") {
