@@ -572,13 +572,13 @@ function visualColorInfo(visual, theme) {
     series,
     measures,
     tooltips: (roles.Tooltips || []).map((t) => t.ref),
-    roles,   // every role's fields, e.g. a scatter chart's X, Y and Size (charts mode)
     overrides,
     rules,
     valueColors,
     valueRules,
     accent,
     waterfall,
+    roles,   // every field well of the visual (X, Y, Size, Legend…), used by scatter charts
     tableFormats: ["tableEx", "pivotTable", "table", "matrix"].includes(visual.type) ? tableFormats(visual.objects, theme) : [],
     titleHidden: visual.titleShown === false,
     mainValue: KPI_VALUE_ROLE[visual.type] ? (roles[KPI_VALUE_ROLE[visual.type]] || [])[0] || null : null,

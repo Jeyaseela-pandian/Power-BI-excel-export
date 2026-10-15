@@ -1612,10 +1612,8 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     item.tableFormat = info && info.tableFormats && info.tableFormats.length ? info : null;
     item.colorInfo = info;
     item.chart = options.visualsAs === "charts" ? chartPlan(item) : null;   // charts mode only
+    if (item.chart && item.chart.note) colorNotes.push(item.chart.note);
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
-    if (options.visualsAs === "charts" && item.type === "scatterChart" && !item.chart && !lay.reportColors) {
-      colorNotes.push(`"${item.displayTitle}" stays a table: its X and Y fields are read from the report file, which couldn't be read.`);
-    }
   }
   const executive = !BUILT_IN_STYLES.includes(lay.tableStyle);
 
@@ -2113,7 +2111,10 @@ const EXCEL_CHARTS = {
   lineStackedColumnComboChart: { kind: "combo", dir: "col", grouping: "stacked" },
   pieChart: { kind: "pie" },
   donutChart: { kind: "doughnut" },
+  ribbonChart: { kind: "bar", dir: "col", grouping: "stacked" },   // drawn as stacked columns
   scatterChart: { kind: "scatter" },   // a bubble chart when the visual has a Size field
+  waterfallChart: { kind: "waterfall" },
+  funnel: { kind: "funnel" },
 };
 const CHART_SCALE = 1;          // Power BI page pixels → chart pixels
 const CHART_MIN_W = 360;        // smallest chart, in pixels
@@ -2143,6 +2144,15 @@ function chartBlockSize(item) {
 function chartPlan(item) {
   const spec = EXCEL_CHARTS[item.type];
   if (!spec || item.isKpi) return null;
+  // Scatter, waterfall and funnel have their own builders; any problem keeps the visual as a table
+  if (spec.kind === "scatter" || spec.kind === "waterfall" || spec.kind === "funnel") {
+    try {
+      return spec.kind === "scatter" ? scatterPlan(item) : spec.kind === "waterfall" ? waterfallPlan(item) : funnelPlan(item);
+    } catch (e) {
+      log(`Chart for "${item.title}" not drawn, kept as a table: ${errorText(e)}`);
+      return null;
+    }
+  }
   const { header, data, numeric, hex, helper } = classifyColumns(item.rows);
   if (!data.length) return null;
   const cols = header.map((_, ci) => ci);
@@ -2169,7 +2179,6 @@ function chartPlan(item) {
     taken.add(ci);
     return ci;
   };
-  if (spec.kind === "scatter") return scatterPlan(item, { header, data, info, colors, colOf, key, num, formatOf });
 
   const textCols = cols.filter((ci) => !numeric[ci] && !hex[ci]);
   let catCol = textCols.length ? textCols[0] : 0;
@@ -2262,41 +2271,286 @@ function chartPlan(item) {
   return { ...base, series, pointColors };
 }
 
-/*
- * A scatter chart: a point per row at its X and Y values, a bubble chart when the visual
- * sizes its points by a field; one series per legend value (in the legend's colours),
- * else one series in the visual's colour. Which field is X, Y and Size comes from the report
- * file: the exported columns come in the order the fields were added, so without the file
- * the visual stays a table.
- */
-function scatterPlan(item, t) {
-  const { header, data, info, colors, colOf, key, num, formatOf } = t;
-  const roles = info && info.roles;
-  if (!roles) return null;
-  const x = colOf((roles.X || [])[0]), y = colOf((roles.Y || [])[0]);
-  if (x < 0 || y < 0) return null;
-  const size = colOf((roles.Size || [])[0]);
-  const labelCol = colOf(info.category), legendCol = colOf(info.series);
-  const points = data.map((r) => ({
-    label: labelCol >= 0 ? key(r, labelCol) : "",
-    legend: legendCol >= 0 ? key(r, legendCol) : "",
-    x: num(r[x]), y: num(r[y]), size: size >= 0 ? num(r[size]) : null,
-  })).filter((p) => p.x !== null && p.y !== null);
-  if (!points.length) return null;
-  const byKey = legendCol >= 0 && colors && colors.rowKey && colors.rowKey.col === legendCol ? colors.rowKey.colorOf : null;
-  const series = legendCol >= 0
-    ? [...new Set(points.map((p) => p.legend))].map((v) => ({
-      name: v || "(Blank)", color: (byKey && byKey[v]) || null, points: points.filter((p) => p.legend === v) }))
-    : [{ name: header[y], color: (colors && colors.series && colors.series[y]) || null, points }];
-  return {
-    spec: { kind: size >= 0 ? "bubble" : "scatter" },
-    title: item.displayTitle || item.title,
-    labelName: labelCol >= 0 ? header[labelCol] : null,
-    legendName: legendCol >= 0 ? header[legendCol] : null,
-    xName: header[x], yName: header[y], sizeName: size >= 0 ? header[size] : null,
-    xFmt: formatOf(x), yFmt: formatOf(y), sizeFmt: size >= 0 ? formatOf(size) : null,
-    series,
+/* Shared helpers for the chart builders below */
+function chartColumns(item) {
+  const c = classifyColumns(item.rows);
+  const cols = c.header.map((_, ci) => ci);
+  const key = (r, ci) => String(r[ci] ?? "").trim();
+  const num = (raw) => { const v = toCellValue(raw).value; return typeof v === "number" ? v : null; };
+  const formatOf = (ci) => {
+    const cells = c.data.map((r) => [toCellValue(r[ci])]);
+    const readable = readableFormats([c.header[ci]], cells)[0];
+    const exported = cells.map((x) => x[0]).find((x) => typeof x.value === "number" && x.numFmt);
+    return readable || (exported && exported.numFmt) || "General";
   };
+  return {
+    ...c, cols, key, num, formatOf,
+    textCols: cols.filter((ci) => !c.numeric[ci] && !c.hex[ci]),
+    measureCols: cols.filter((ci) => c.numeric[ci] && !c.hex[ci] && !c.helper[ci]),
+  };
+}
+
+/* One value per category, in the order they appear ("Total" rows are left out) */
+function chartSteps(t, catCol, valueCol) {
+  const additive = !NON_ADDITIVE.test(t.header[valueCol]);
+  const steps = [];
+  for (const r of t.data) {
+    const label = t.key(r, catCol), v = t.num(r[valueCol]);
+    if (!label || v === null || /^total$/i.test(label)) continue;
+    const s = steps.find((x) => x.label === label);
+    if (!s) steps.push({ label, value: v });
+    else if (additive) s.value += v;
+  }
+  return steps;
+}
+
+/* Scatter (or bubble, when there is a Size field): one Excel series per legend value */
+function scatterPlan(item) {
+  const t = chartColumns(item);
+  const { header, data, textCols, key, num } = t;
+  const info = item.colorInfo || null, colors = item.colors || null;
+  const colOf = (f) => (f ? header.findIndex((h) => String(h).trim().toLowerCase() === f.label || normalizeField(h) === f.ref) : -1);
+  let legendCol = info && info.rule === "legend" ? colOf(info.series) : -1;
+  if (legendCol < 0 && !info && textCols.length >= 2) legendCol = textCols[1];
+  let labelCol = info ? colOf(info.category) : -1;
+  if (labelCol < 0 || labelCol === legendCol) labelCol = textCols.find((ci) => ci !== legendCol) ?? -1;
+  const nums = t.measureCols.filter((ci) => ci !== legendCol && ci !== labelCol);
+  if (nums.length < 2) return null;
+  const [xc, yc, sc] = scatterFields(t, item, info, nums);
+  if (xc === undefined || yc === undefined) return null;
+  const valueCols = sc !== undefined ? [xc, yc, sc] : [xc, yc];
+  const rows = data.filter((r) => num(r[xc]) !== null && num(r[yc]) !== null);
+  if (!rows.length) return null;
+  const groupOf = (r) => (legendCol >= 0 ? key(r, legendCol) : "");
+
+  // One bubble per name (and legend value). Power BI can export finer rows than the chart
+  // draws (a field in the tooltips, say): those rows are combined. Amounts are added up;
+  // averages, rates and percentages are averaged, weighted by the bubble size when there is one.
+  const fmts = valueCols.map((ci) => t.formatOf(ci));
+  const averaged = valueCols.map((ci, k) => NON_ADDITIVE.test(header[ci]) || /\bper\b/i.test(header[ci]) || fmts[k].includes("%"));
+  const weighted = sc !== undefined && !averaged[2];
+  const combine = (list, k) => {
+    const ci = valueCols[k];
+    const vals = list.map((r) => [num(r[ci]), weighted ? num(r[sc]) || 0 : 1]).filter(([v]) => v !== null);
+    if (!vals.length) return null;
+    if (!averaged[k]) return vals.reduce((a, [v]) => a + v, 0);
+    const w = vals.reduce((a, [, wt]) => a + wt, 0);
+    return w ? vals.reduce((a, [v, wt]) => a + v * wt, 0) / w : vals.reduce((a, [v]) => a + v, 0) / vals.length;
+  };
+  let merged = false;
+  let points;
+  if (labelCol >= 0) {
+    const byKey = new Map();
+    for (const r of rows) {
+      const k = groupOf(r) + "\u0001" + key(r, labelCol);
+      if (!byKey.has(k)) byKey.set(k, []);
+      byKey.get(k).push(r);
+    }
+    points = [...byKey.values()].map((list) => {
+      if (list.length > 1) merged = true;
+      return { group: groupOf(list[0]), label: key(list[0], labelCol), values: valueCols.map((_, k) => combine(list, k)) };
+    });
+  } else {
+    points = rows.map((r, i) => ({ group: groupOf(r), label: String(i + 1), values: valueCols.map((ci) => num(r[ci])) }));
+  }
+  const names = [...new Set(points.map((p) => p.group))];
+  points = names.flatMap((n) => points.filter((p) => p.group === n));
+
+  const fallback = (colors && colors.series && Object.values(colors.series)[0]) || toArgb(DEFAULT_THEME_COLORS[0]);
+  const colorOf = (n) => (colors && colors.rowKey && colors.rowKey.colorOf[n]) || fallback;
+  // Without a legend, each bubble is its own Excel series, so its name shows beside it and in
+  // Excel's hover tooltip, like Power BI (up to 60 bubbles, to stay readable)
+  const perPoint = legendCol < 0 && labelCol >= 0 && points.length <= 60;
+  let groups;
+  if (perPoint) {
+    groups = points.map((p, i) => ({ name: p.label, start: i, end: i, color: colorOf(p.group) }));
+  } else {
+    let at = 0;
+    groups = names.map((n) => {
+      const count = points.filter((p) => p.group === n).length;
+      const g = { name: n || header[yc], start: at, end: at + count - 1, color: colorOf(n) };
+      at += count;
+      return g;
+    });
+  }
+  const title = item.displayTitle || item.title;
+  return {
+    spec: { kind: sc !== undefined ? "bubble" : "scatter" },
+    title,
+    catName: labelCol >= 0 ? header[labelCol] : "Point",
+    categories: points.map((p) => p.label),
+    series: valueCols.map((ci, k) => ({ name: header[ci], values: points.map((p) => p.values[k]), fmt: fmts[k], color: null })),
+    groups,
+    perPoint,
+    pointColors: null,
+    note: merged ? `"${title}" shows one bubble per ${header[labelCol]}, but Power BI exported several rows for some of them. They were combined, so averages and percentages in that chart are approximate.` : null,
+  };
+}
+/* Waterfall: stacked columns on an invisible base, in increase / decrease / total colours.
+   Steps that cross zero are split into a part above and a part below zero. */
+function waterfallPlan(item) {
+  const t = chartColumns(item);
+  const catCol = t.textCols.length ? t.textCols[0] : -1;
+  const valueCol = t.measureCols.find((ci) => ci !== catCol);
+  if (catCol < 0 || valueCol === undefined) return null;
+  const steps = chartSteps(t, catCol, valueCol);
+  if (!steps.length) return null;
+  const w = (item.colorInfo && item.colorInfo.waterfall) || {};
+  const up = toArgb(w.increase || "#1AAB40"), down = toArgb(w.decrease || "#D64554"), total = toArgb(w.total || "#118DFF");
+  const names = ["Base", "Increase", "Increase", "Decrease", "Decrease", "Total"];
+  const values = names.map(() => []);
+  let running = 0;
+  for (const s of steps) {
+    const a = running, b = running + s.value;
+    const lo = Math.min(a, b), hi = Math.max(a, b);
+    const row = [null, null, null, null, null, null];
+    const [pos, neg] = s.value >= 0 ? [1, 2] : [3, 4];
+    if (lo >= 0) { row[0] = lo || null; row[pos] = hi - lo; }
+    else if (hi <= 0) { row[0] = hi || null; row[neg] = lo - hi; }
+    else { row[pos] = hi; row[neg] = lo; }
+    row.forEach((v, i) => values[i].push(v));
+    running = b;
+  }
+  values.forEach((v, i) => v.push(i === 5 ? running : null));
+  const fmt = t.formatOf(valueCol);
+  return {
+    spec: { kind: "bar", dir: "col", grouping: "stacked" },
+    title: item.displayTitle || item.title,
+    catName: t.header[catCol],
+    categories: [...steps.map((s) => s.label), "Total"],
+    series: names.map((name, i) => ({
+      name, values: values[i], fmt,
+      color: [null, up, up, down, down, total][i],
+      hidden: i === 0,
+      noLegend: i === 0 || i === 2 || i === 4,
+    })),
+    pointColors: null,
+  };
+}
+
+/* Funnel: centred bars (an invisible offset pushes each bar to the middle), largest on top */
+function funnelPlan(item) {
+  const t = chartColumns(item);
+  const catCol = t.textCols.length ? t.textCols[0] : -1;
+  const valueCol = t.measureCols.find((ci) => ci !== catCol);
+  if (catCol < 0 || valueCol === undefined) return null;
+  const stages = chartSteps(t, catCol, valueCol);
+  if (!stages.length || stages.some((s) => s.value < 0)) return null;
+  const max = Math.max(...stages.map((s) => s.value));
+  const colors = item.colors || null;
+  const color = (colors && colors.series && colors.series[valueCol]) || null;
+  const pointColors = colors && colors.rowKey && colors.rowKey.col === catCol
+    ? stages.map((s) => colors.rowKey.colorOf[s.label] || color) : null;
+  const fmt = t.formatOf(valueCol);
+  return {
+    spec: { kind: "bar", dir: "bar", grouping: "stacked", hideValueAxis: true },
+    title: item.displayTitle || item.title,
+    catName: t.header[catCol],
+    categories: stages.map((s) => s.label),
+    series: [
+      { name: "Offset", values: stages.map((s) => (max - s.value) / 2), fmt, color: null, hidden: true, noLegend: true },
+      { name: t.header[valueCol], values: stages.map((s) => s.value), fmt, color, labels: true },
+    ],
+    pointColors,
+  };
+}
+
+/* Value labels in the middle of each bar (used by the funnel) */
+function dataLabelsXml(fmt) {
+  return `<c:dLbls><c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>` +
+    `<c:dLblPos val="ctr"/><c:showLegendKey val="0"/><c:showVal val="1"/><c:showCatName val="0"/><c:showSerName val="0"/>` +
+    `<c:showPercent val="0"/><c:showBubbleSize val="0"/></c:dLbls>`;
+}
+
+/* Scatter / bubble chart XML: each legend group reads its own block of rows on the Data sheet */
+function scatterXml(plan) {
+  const bubble = plan.spec.kind === "bubble";
+  const [xs, ys, ss] = plan.series;
+  const range = plan.refs.range;
+  const labels = plan.perPoint ? nameLabelsXml() : "";
+  const numRef = (i, g, s) => `<c:numRef><c:f>${xmlEsc(range(i, g.start, g.end))}</c:f>` +
+    `${numCacheXml(s.values.slice(g.start, g.end + 1), s.fmt)}</c:numRef>`;
+  const fill = (argb) => (argb ? `<a:solidFill><a:srgbClr val="${String(argb).slice(-6).toUpperCase()}"><a:alpha val="85000"/></a:srgbClr></a:solidFill>` : "");
+  const sers = plan.groups.map((g, i) => {
+    const head = `<c:idx val="${i}"/><c:order val="${i}"/><c:tx><c:v>${xmlEsc(g.name)}</c:v></c:tx>`;
+    const xv = `<c:xVal>${numRef(0, g, xs)}</c:xVal>`, yv = `<c:yVal>${numRef(1, g, ys)}</c:yVal>`;
+    const look = `<c:spPr>${fill(g.color)}<a:ln w="9525">${fillXml(C.WHITE)}</a:ln></c:spPr>`;
+    if (bubble) {
+      return `<c:ser>${head}${look}<c:invertIfNegative val="0"/>${labels}${xv}${yv}<c:bubbleSize>${numRef(2, g, ss)}</c:bubbleSize><c:bubble3D val="0"/></c:ser>`;
+    }
+    return `<c:ser>${head}<c:spPr><a:ln w="19050"><a:noFill/></a:ln></c:spPr>` +
+      `<c:marker><c:symbol val="circle"/><c:size val="8"/>${look}</c:marker>${labels}${xv}${yv}<c:smooth val="0"/></c:ser>`;
+  }).join("");
+  const A1 = 50110, A2 = 50120;
+  const chart = bubble
+    ? `<c:bubbleChart><c:varyColors val="0"/>${sers}<c:bubbleScale val="40"/><c:showNegBubbles val="0"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:bubbleChart>`
+    : `<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>${sers}<c:axId val="${A1}"/><c:axId val="${A2}"/></c:scatterChart>`;
+  // Axes along the bottom and left edges with their field names, as Power BI draws them
+  return chart +
+    valAxXml(A1, A2, "b", axisFormat(xs.fmt, xs.values), { crosses: "min", title: xs.name }) +
+    valAxXml(A2, A1, "l", axisFormat(ys.fmt, ys.values), { crosses: "min", title: ys.name });
+}
+
+/* Number format for axis labels, shortened the way Power BI does: "$4,000,000" → "$4.0M", "34.28%" → "34%" */
+function axisFormat(fmt, values) {
+  const f = String(fmt || "General");
+  const nums = (values || []).filter((v) => typeof v === "number" && isFinite(v));
+  const max = nums.length ? Math.max(...nums.map((v) => Math.abs(v))) : 0;
+  if (f.includes("%")) return max >= 0.05 ? "0%" : "0.0%";
+  const prefix = (f.match(/^"[^"]*"/) || [""])[0];
+  if (max >= 1e9) return `${prefix}#,##0.0,,,"B"`;
+  if (max >= 1e6) return `${prefix}#,##0.0,,"M"`;
+  if (max >= 1e4) return `${prefix}#,##0.0,"K"`;
+  return f;
+}
+
+/* A small grey axis title, like Power BI's */
+function axisTitleXml(text) {
+  return `<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="900" b="0"/></a:pPr>` +
+    `<a:r><a:rPr lang="en-US" sz="900" b="0">${fillXml(C.SLATE)}</a:rPr><a:t>${xmlEsc(text)}</a:t></a:r></a:p></c:rich></c:tx>` +
+    `<c:overlay val="0"/></c:title>`;
+}
+
+/* Bubble labels: each bubble's name beside it ("050-Shoes") */
+function nameLabelsXml() {
+  return `<c:dLbls><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>` +
+    `<c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="800">${fillXml(C.SLATE)}</a:defRPr></a:pPr><a:endParaRPr lang="en-US"/></a:p></c:txPr>` +
+    `<c:dLblPos val="r"/><c:showLegendKey val="0"/><c:showVal val="0"/><c:showCatName val="0"/><c:showSerName val="1"/>` +
+    `<c:showPercent val="0"/><c:showBubbleSize val="0"/></c:dLbls>`;
+}
+
+/* Pie labels: each slice's share (the value shows on hover) */
+function pieLabelsXml(pos) {
+  return `<c:dLbls><c:numFmt formatCode="0.00%" sourceLinked="0"/><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>` +
+    (pos ? `<c:dLblPos val="${pos}"/>` : "") +
+    `<c:showLegendKey val="0"/><c:showVal val="0"/><c:showCatName val="0"/><c:showSerName val="0"/>` +
+    `<c:showPercent val="1"/><c:showBubbleSize val="0"/><c:showLeaderLines val="1"/></c:dLbls>`;
+}
+
+/* Which columns are X, Y and Size: the report file's field wells when it could be read, else
+   Power BI's automatic title, which lists them in order ("X, Y and Size by Details"), else column order */
+function scatterFields(t, item, info, nums) {
+  const pick = (role) => {
+    const f = info && info.roles && (info.roles[role] || [])[0];
+    if (!f) return -1;
+    return nums.find((ci) => String(t.header[ci]).trim().toLowerCase() === f.label || normalizeField(t.header[ci]) === f.ref) ?? -1;
+  };
+  const x = pick("X"), y = pick("Y");
+  if (x >= 0 && y >= 0 && x !== y) {
+    const s = pick("Size");
+    return [x, y, s >= 0 && s !== x && s !== y ? s : undefined];
+  }
+  const title = String(item.title || "").toLowerCase();
+  const cut = title.lastIndexOf(" by ");
+  const head = cut > 0 ? title.slice(0, cut) : title;
+  const hits = nums.map((ci) => {
+    const name = String(t.header[ci] || "").trim().toLowerCase();
+    return { ci, name, at: name ? head.indexOf(name) : -1 };
+  }).filter((h) => h.at >= 0);
+  const found = hits.filter((h) => !hits.some((o) => o !== h && o.name.length > h.name.length && o.at <= h.at && h.at + h.name.length <= o.at + o.name.length))
+    .sort((a, b) => a.at - b.at);
+  if (found.length >= 2) return [found[0].ci, found[1].ci, found[2] ? found[2].ci : undefined];
+  return [nums[0], nums[1], nums[2]];
 }
 
 /* Writes every chart's numbers on the page's "Data" sheet and records the cell ranges */
@@ -2314,11 +2568,6 @@ function writeChartDataSheet(wb, name, charts) {
     t.value = p.title;
     t.font = { name: "Calibri", size: 12, bold: true, color: { argb: C.INK } };
     const hr = row + 1;
-    if (p.spec.kind === "scatter" || p.spec.kind === "bubble") {
-      row = writeScatterData(ws, p, hr, sheetRef, abs);
-      widest = Math.max(widest, 2 + (p.legendName ? 1 : 0) + (p.sizeName ? 1 : 0));
-      continue;
-    }
     const h0 = ws.getCell(hr, 2);
     h0.value = p.catName || "Category";
     h0.font = { name: "Calibri", size: 10, bold: true, color: { argb: C.INK } };
@@ -2346,6 +2595,8 @@ function writeChartDataSheet(wb, name, charts) {
         valRef: `${sheetRef}!${abs(first, 3 + i)}:${abs(last, 3 + i)}`,
       })),
     };
+    // Any block of rows in one Data column (scatter charts read one block per legend value)
+    p.refs.range = (i, from, to) => `${sheetRef}!${abs(first + from, 3 + i)}:${abs(first + to, 3 + i)}`;
     widest = Math.max(widest, p.series.length);
     row = last + 3;
   }
@@ -2353,42 +2604,6 @@ function writeChartDataSheet(wb, name, charts) {
   ws.getColumn(2).width = 30;
   for (let c = 3; c < 3 + widest; c++) ws.getColumn(c).width = 18;
   return ws;
-}
-
-/* A scatter chart's numbers: a row per point (label, legend value, X, Y, size), each
-   series' points together. Returns the row after the block's spacing. */
-function writeScatterData(ws, p, hr, sheetRef, abs) {
-  const head = { name: "Calibri", size: 10, bold: true, color: { argb: C.INK } };
-  const names = [p.labelName || "Point", ...(p.legendName ? [p.legendName] : []), p.xName, p.yName, ...(p.sizeName ? [p.sizeName] : [])];
-  const xc = 3 + (p.legendName ? 1 : 0), yc = xc + 1, sc = yc + 1;
-  names.forEach((n, i) => {
-    const h = ws.getCell(hr, 2 + i);
-    h.value = n;
-    h.font = head;
-    h.fill = SURFACE_FILL;
-    if (2 + i >= xc) h.alignment = { horizontal: "right" };
-  });
-  const put = (r, c, v, fmt) => {
-    const cell = ws.getCell(r, c);
-    cell.value = v;
-    if (fmt && fmt !== "General") cell.numFmt = fmt;
-  };
-  let r = hr + 1;
-  p.refs = { series: [] };
-  for (const s of p.series) {
-    const first = r;
-    for (const pt of s.points) {
-      put(r, 2, pt.label || null);
-      if (p.legendName) put(r, 3, pt.legend || null);
-      put(r, xc, pt.x, p.xFmt);
-      put(r, yc, pt.y, p.yFmt);
-      if (p.sizeName) put(r, sc, pt.size, p.sizeFmt);
-      r++;
-    }
-    const range = (c) => `${sheetRef}!${abs(first, c)}:${abs(r - 1, c)}`;
-    p.refs.series.push({ xRef: range(xc), yRef: range(yc), sizeRef: p.sizeName ? range(sc) : null });
-  }
-  return r + 2;
 }
 
 /* ── Chart XML (DrawingML) ── */
@@ -2412,67 +2627,49 @@ function chartSeriesXml(kind, s, i, plan, ref) {
     `<c:tx><c:strRef><c:f>${xmlEsc(ref.nameRef)}</c:f>${strCacheXml([s.name])}</c:strRef></c:tx>`;
   const cat = `<c:cat><c:strRef><c:f>${xmlEsc(plan.refs.catRef)}</c:f>${strCacheXml(plan.categories)}</c:strRef></c:cat>`;
   const val = `<c:val><c:numRef><c:f>${xmlEsc(ref.valRef)}</c:f>${numCacheXml(s.values, s.fmt)}</c:numRef></c:val>`;
-  const points = (plan.pointColors || []).map((c, pi) => (c
+  // Hidden helper series (waterfall base, funnel offset) take no bar colours
+  const points = s.hidden ? "" : (plan.pointColors || []).map((c, pi) => (c
     ? `<c:dPt><c:idx val="${pi}"/>${kind === "bar" ? '<c:invertIfNegative val="0"/>' : ""}<c:bubble3D val="0"/><c:spPr>${fillXml(c)}</c:spPr></c:dPt>`
     : "")).join("");
   if (kind === "line") {
     const ln = s.color ? `<c:spPr><a:ln w="28575" cap="rnd">${fillXml(s.color)}<a:round/></a:ln></c:spPr>` : "";
     return `<c:ser>${head}${ln}<c:marker><c:symbol val="none"/></c:marker>${cat}${val}<c:smooth val="0"/></c:ser>`;
   }
-  const sp = s.color ? `<c:spPr>${fillXml(s.color)}</c:spPr>` : "";
-  if (kind === "bar") return `<c:ser>${head}${sp}<c:invertIfNegative val="0"/>${points}${cat}${val}</c:ser>`;
+  const sp = s.hidden ? `<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>`
+    : s.color ? `<c:spPr>${fillXml(s.color)}</c:spPr>` : "";
+  const labels = s.labels ? dataLabelsXml(s.fmt) : "";
+  if (kind === "bar") return `<c:ser>${head}${sp}<c:invertIfNegative val="0"/>${points}${labels}${cat}${val}</c:ser>`;
   if (kind === "area") return `<c:ser>${head}${sp}${cat}${val}</c:ser>`;
-  return `<c:ser>${head}${sp}${points}${cat}${val}</c:ser>`;   // pie, doughnut
+  const pieLabels = s.pieLabels ? pieLabelsXml(s.pieLabelPos) : "";
+  return `<c:ser>${head}${sp}${points}${pieLabels}${cat}${val}</c:ser>`;   // pie, doughnut
 }
-
 function catAxXml(id, crossId, pos, { reverse = false, hidden = false } = {}) {
   return `<c:catAx><c:axId val="${id}"/><c:scaling><c:orientation val="${reverse ? "maxMin" : "minMax"}"/></c:scaling>` +
     `<c:delete val="${hidden ? 1 : 0}"/><c:axPos val="${pos}"/><c:numFmt formatCode="General" sourceLinked="1"/>` +
-    `<c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/>` +
+    `<c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="low"/>` +
     `<c:spPr><a:ln w="9525">${fillXml(C.RULE)}</a:ln></c:spPr>` +
     `<c:crossAx val="${crossId}"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/><c:noMultiLvlLbl val="0"/></c:catAx>`;
 }
 
-/* A value axis. Scatter charts have two: "midCat" crossing, and labels kept at the plot's
-   edge ("low") when the other axis crosses at zero inside the plot */
-function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true, crossBetween = "between", labels = "nextTo" } = {}) {
-  return `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="${pos}"/>` +
+function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true, hidden = false, title = null } = {}) {
+  return `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="${hidden ? 1 : 0}"/><c:axPos val="${pos}"/>` +
     (grid ? `<c:majorGridlines><c:spPr><a:ln w="6350">${fillXml(C.HAIR)}</a:ln></c:spPr></c:majorGridlines>` : "") +
-    `<c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="${labels}"/>` +
-    `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:crossAx val="${crossId}"/><c:crosses val="${crosses}"/><c:crossBetween val="${crossBetween}"/></c:valAx>`;
-}
-
-/* A scatter or bubble series: its points' X and Y (and size) values, marked in its colour */
-function scatterSeriesXml(kind, s, i, plan, ref) {
-  const values = (k) => s.points.map((p) => p[k]);
-  const numRef = (f, vals, fmt) => `<c:numRef><c:f>${xmlEsc(f)}</c:f>${numCacheXml(vals, fmt)}</c:numRef>`;
-  const head = `<c:idx val="${i}"/><c:order val="${i}"/><c:tx><c:v>${xmlEsc(s.name)}</c:v></c:tx>`;
-  const xy = `<c:xVal>${numRef(ref.xRef, values("x"), plan.xFmt)}</c:xVal><c:yVal>${numRef(ref.yRef, values("y"), plan.yFmt)}</c:yVal>`;
-  const look = s.color ? `<c:spPr>${fillXml(s.color)}<a:ln w="6350">${fillXml(C.WHITE)}</a:ln></c:spPr>` : "";
-  if (kind === "bubble") {
-    return `<c:ser>${head}${look}<c:invertIfNegative val="0"/>${xy}` +
-      `<c:bubbleSize>${numRef(ref.sizeRef, values("size"), plan.sizeFmt)}</c:bubbleSize><c:bubble3D val="0"/></c:ser>`;
-  }
-  // Points only: no line between them
-  return `<c:ser>${head}<c:spPr><a:ln w="19050"><a:noFill/></a:ln></c:spPr>` +
-    `<c:marker><c:symbol val="circle"/><c:size val="7"/>${look}</c:marker>${xy}<c:smooth val="0"/></c:ser>`;
+    (title ? axisTitleXml(title) : "") +
+    `<c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/>` +
+    `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:crossAx val="${crossId}"/><c:crosses val="${crosses}"/><c:crossBetween val="between"/></c:valAx>`;
 }
 
 function chartXml(plan) {
   const { spec, series } = plan;
   const kind = spec.kind;
   const refs = plan.refs;
-  const A1 = 50010, A2 = 50020, A3 = 50030, A4 = 50040;
+  const scatter = kind === "scatter" || kind === "bubble";
   let body;
-  if (kind === "scatter" || kind === "bubble") {
-    const sers = series.map((s, i) => scatterSeriesXml(kind, s, i, plan, refs.series[i])).join("");
-    body = (kind === "bubble"
-      ? `<c:bubbleChart><c:varyColors val="0"/>${sers}<c:bubbleScale val="50"/><c:showNegBubbles val="0"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:bubbleChart>`
-      : `<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>${sers}<c:axId val="${A1}"/><c:axId val="${A2}"/></c:scatterChart>`) +
-      valAxXml(A1, A2, "b", plan.xFmt, { grid: false, crossBetween: "midCat", labels: "low" }) +
-      valAxXml(A2, A1, "l", plan.yFmt, { crossBetween: "midCat", labels: "low" });
+  if (scatter) {
+    body = scatterXml(plan);
   } else if (kind === "pie" || kind === "doughnut") {
-    const ser = chartSeriesXml("pie", series[0], 0, plan, refs.series[0]);
+    const s0 = { ...series[0], pieLabels: true, pieLabelPos: kind === "pie" ? "outEnd" : null };
+    const ser = chartSeriesXml("pie", s0, 0, plan, refs.series[0]);
     body = kind === "pie"
       ? `<c:pieChart><c:varyColors val="1"/>${ser}<c:firstSliceAng val="0"/></c:pieChart>`
       : `<c:doughnutChart><c:varyColors val="1"/>${ser}<c:firstSliceAng val="0"/><c:holeSize val="55"/></c:doughnutChart>`;
@@ -2482,7 +2679,12 @@ function chartXml(plan) {
     const lines = indexed.filter(([s]) => s.line);
     const horizontal = spec.dir === "bar";
     const pct = spec.grouping === "percentStacked";
-    const valFmt = pct ? "0%" : (main[0] ? main[0][0].fmt : series[0].fmt);
+    // Axis labels shortened like Power BI ($4.0M, 30%); stacked bars are sized by their totals
+    const mainValues = main.flatMap(([s]) => s.values);
+    const stackTotals = spec.grouping === "stacked"
+      ? plan.categories.map((_, ci) => main.reduce((a, [s]) => a + Math.abs(s.values[ci] || 0), 0)) : [];
+    const valFmt = pct ? "0%" : axisFormat(main[0] ? main[0][0].fmt : series[0].fmt, [...mainValues, ...stackTotals]);
+    const A1 = 50010, A2 = 50020, A3 = 50030, A4 = 50040;
     let groups = "";
     if (kind === "bar" || kind === "combo") {
       const grouping = spec.grouping || "clustered";
@@ -2498,19 +2700,24 @@ function chartXml(plan) {
         main.map(([s, i]) => chartSeriesXml("area", s, i, plan, refs.series[i])).join("") +
         `<c:axId val="${A1}"/><c:axId val="${A2}"/></c:areaChart>`;
     }
+    // A funnel hides its value axis and gridlines: the offsets would make the numbers misleading
     let axes = catAxXml(A1, A2, horizontal ? "l" : "b", { reverse: horizontal }) +
-      valAxXml(A2, A1, horizontal ? "b" : "l", valFmt, { crosses: horizontal ? "max" : "autoZero" });
+      valAxXml(A2, A1, horizontal ? "b" : "l", valFmt, { crosses: horizontal ? "max" : "autoZero", grid: !spec.hideValueAxis, hidden: !!spec.hideValueAxis });
     if (lines.length) {
       groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
         lines.map(([s, i]) => chartSeriesXml("line", s, i, plan, refs.series[i])).join("") +
         `<c:marker val="1"/><c:axId val="${A3}"/><c:axId val="${A4}"/></c:lineChart>`;
-      axes += catAxXml(A3, A4, "b", { hidden: true }) + valAxXml(A4, A3, "r", lines[0][0].fmt, { crosses: "max", grid: false });
+      const lineFmt = axisFormat(lines[0][0].fmt, lines.flatMap(([s]) => s.values));
+      axes += catAxXml(A3, A4, "b", { hidden: true }) + valAxXml(A4, A3, "r", lineFmt, { crosses: "max", grid: false });
     }
     body = groups + axes;
   }
   const round = kind === "pie" || kind === "doughnut";
-  const legend = series.length > 1 || round
-    ? `<c:legend><c:legendPos val="${round ? "r" : "t"}"/><c:overlay val="0"/></c:legend>` : "";
+  // Legend: one entry per visible series (or per scatter group); helper series are left out
+  const entries = scatter ? (plan.perPoint ? 0 : plan.groups.length) : series.filter((s) => !s.noLegend).length;
+  const hiddenEntries = scatter ? "" : series.map((s, i) => (s.noLegend ? `<c:legendEntry><c:idx val="${i}"/><c:delete val="1"/></c:legendEntry>` : "")).join("");
+  const legend = entries > 1 || round
+    ? `<c:legend><c:legendPos val="${round ? "r" : "t"}"/>${hiddenEntries}<c:overlay val="0"/></c:legend>` : "";
   const title = `<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="1200" b="1"/></a:pPr>` +
     `<a:r><a:rPr lang="en-US" sz="1200" b="1">${fillXml(C.INK)}</a:rPr><a:t>${xmlEsc(plan.title)}</a:t></a:r></a:p></c:rich></c:tx>` +
     `<c:overlay val="0"/></c:title><c:autoTitleDeleted val="0"/>`;
@@ -2565,9 +2772,13 @@ function insertDrawing(sheetXml, rid) {
   if (!/<worksheet[^>]*xmlns:r=/.test(sheetXml)) {
     sheetXml = sheetXml.replace("<worksheet", '<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"');
   }
+  // Look only past the parts that come before <drawing>: data bars carry their own <extLst>
+  // inside <conditionalFormatting>, and a chart placed there is ignored by Excel
+  const from = Math.max(0, ...["</sheetData>", "</conditionalFormatting>", "</dataValidations>", "</hyperlinks>", "</ignoredErrors>"]
+    .map((t) => sheetXml.lastIndexOf(t)));
   // <drawing> must come before these elements in a worksheet
   const after = ["<legacyDrawing", "<legacyDrawingHF", "<picture", "<oleObjects", "<controls", "<webPublishItems", "<tableParts", "<extLst"];
-  const found = after.map((t) => sheetXml.indexOf(t)).filter((i) => i >= 0);
+  const found = after.map((t) => sheetXml.indexOf(t, from)).filter((i) => i >= 0);
   const at = found.length ? Math.min(...found) : sheetXml.lastIndexOf("</worksheet>");
   return sheetXml.slice(0, at) + `<drawing r:id="${rid}"/>` + sheetXml.slice(at);
 }
