@@ -485,6 +485,7 @@ function visualColorInfo(visual, theme) {
     valueColors,
     valueRules,
     waterfall,
+    roles,   // every field well of the visual (X, Y, Size, Legend…), used by scatter charts
     tableFormats: ["tableEx", "pivotTable", "table", "matrix"].includes(visual.type) ? tableFormats(visual.objects, theme) : [],
   };
 }
