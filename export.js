@@ -426,6 +426,31 @@ function colorRuleRows(rules, t) {
   return { series, rowCols: Object.keys(perCol).map(Number), perCol, rowColors, rowKey: null, dot, legend, note };
 }
 
+/* The Nested Bars visual's automatic subset colour, as its code works it out with d3: the
+   hue turned half way round, lightness moved 0.2 towards the middle, saturation raised 20% */
+function complementaryColor(hex) {
+  const n = parseInt(String(hex).replace("#", ""), 16);
+  if (!/^#?[0-9A-F]{6}$/i.test(String(hex))) return "#FD625E";
+  const r = (n >> 16 & 255) / 255, g = (n >> 8 & 255) / 255, b = (n & 255) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let h = NaN, s = max - min, l = (max + min) / 2;
+  if (s) {
+    h = r === max ? (g - b) / s + (g < b) * 6 : g === max ? (b - r) / s + 2 : (r - g) / s + 4;
+    s /= l < 0.5 ? max + min : 2 - max - min;
+    h *= 60;
+  } else s = l > 0 && l < 1 ? 0 : h;
+  h = (h + 180) % 360;
+  l = l > 0.6 ? Math.max(0.3, l - 0.2) : Math.min(0.7, l + 0.2);
+  s = Math.min(0.9, 1.2 * s);
+  // back to RGB (d3.hsl → rgb)
+  h = h % 360 + (h < 0) * 360;
+  const sat = isNaN(h) || isNaN(s) ? 0 : s;
+  const m2 = l + (l < 0.5 ? l : 1 - l) * sat, m1 = 2 * l - m2;
+  const ch = (x) => (x < 60 ? m1 + (m2 - m1) * x / 60 : x < 180 ? m2 : x < 240 ? m1 + (m2 - m1) * (240 - x) / 60 : m1) * 255;
+  const hx = (v) => Math.max(0, Math.min(255, Math.round(v) || 0)).toString(16).padStart(2, "0");
+  return ("#" + hx(ch(h >= 240 ? h - 240 : h + 120)) + hx(ch(h)) + hx(ch(h < 120 ? h + 240 : h - 120))).toUpperCase();
+}
+
 /* d3's ordinal scale, as custom visuals use it: a value it doesn't know joins its list and
    takes the next colour round */
 function ordinalScale(domain, range) {
@@ -557,11 +582,26 @@ function columnColors(item, palette, info) {
     return byLabel !== undefined ? byLabel : free.find((ci) => norm[ci] === field.ref) ?? -1;
   };
 
-  // A double donut: both rings coloured as the visual's code does it
+  // Supported AppSource visuals, coloured as their code does it
   const custom = customVisual(item.type);
+  if (custom && custom.rule === "table") return null;   // its own formatting, as a table's (data bars)
   if (custom && custom.rule === "rings") {
     const rings = ringColors({ data, cols, numeric, hex, findCol, palette, info });
     if (rings) return { ...rings, hexCols, exact: !!info };
+  }
+  if (custom && custom.rule === "nested") {
+    // Nested bars: the category value in the outer colour, the subset value inside it in the
+    // subset colour (by default the outer colour's complement); the visual's own colours,
+    // not the theme's
+    const valueCols = cols.filter((ci) => numeric[ci] && !hex[ci]);
+    const outerCol = info ? findCol(info.measures.find((m) => m.role === "Y")) : valueCols[0] ?? -1;
+    const innerCol = info ? findCol(info.measures.find((m) => m.role === "Y2"), { [outerCol]: true }) : valueCols[1] ?? -1;
+    const outer = customSetting(item.type, info, "outer");
+    const inner = customSetting(item.type, info, "autoInner") === false ? customSetting(item.type, info, "inner") : complementaryColor(outer);
+    const series = {};
+    if (outerCol >= 0) series[outerCol] = toArgb(outer);
+    if (innerCol >= 0) series[innerCol] = toArgb(inner);
+    if (Object.keys(series).length) return { series, rowCols: [], hexCols, rowKey: null, dot: null, exact: !!info };
   }
 
   // Series columns: the report file's value fields when they match, else every number column
@@ -996,7 +1036,8 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
   };
   const accentBar = info && info.accent
     ? (info.accent.color || evaluateColorRule(info.accent.rule, fieldValues, 1).colors[0]) : null;
-  const capSource = accentBar ? toArgb(accentBar) : valueColor(0);
+  const ownAccent = customSetting(item.type, info, "accent");   // e.g. a progress icon's fill colour
+  const capSource = accentBar ? toArgb(accentBar) : ownAccent ? toArgb(ownAccent) : valueColor(0);
   const cap = capSource ? readableOnWhite(capSource) : lay.accent.cap;
 
   let top = r;
@@ -1825,6 +1866,7 @@ async function collectPage(page, options, onProgress, isCancelled) {
       continue;
     }
     if (options.excludedVisuals && options.excludedVisuals.has(v.name)) continue;
+    if ((customVisual(v.type) || {}).rule === "none") continue;   // an AppSource visual with no data (a button)
 
     // Every other visual: try to export. Decorative ones (text box, shape, button…)
     // usually have no data; they are included only if Power BI returns some.
@@ -1835,7 +1877,7 @@ async function collectPage(page, options, onProgress, isCancelled) {
         if (!NON_DATA_TYPES.includes(v.type)) notes.push(`No data in: ${title}`);
         continue;
       }
-      const isKpi = KPI_TYPES.includes(v.type) && rows.length === 2;
+      const isKpi = (KPI_TYPES.includes(v.type) || (customVisual(v.type) || {}).rule === "kpi") && rows.length === 2;
       if (!isKpi && rows[0].length === 1) {
         if (!NON_DATA_TYPES.includes(v.type)) {
           notes.push(`Skipped "${title}": a single list of values with no measures (for example a what-if parameter)`);

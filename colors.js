@@ -38,10 +38,13 @@ const SINGLE_COLOR_TYPES = ["scatterChart", "map", "filledMap", "shapeMap", "azu
 const MEASURE_ROLES = ["Y", "Y2", "Values", "ColumnY", "LineY", "Size"];   // roles whose fields are drawn as series
 const KPI_VALUE_ROLE = { gauge: "Y", kpi: "Indicator" };   // the main value; the other fields are its target, minimum…
 
-/* Supported AppSource visuals, by type name:
+/* Supported AppSource visuals, by type name (their defaults are taken from their code):
    - roles: each of the visual's own roles, as the built-in role it acts like
    - colors: the visual's object that holds colours set per category (a "fill")
-   - rule: how it colours its data (columnColors in export.js) */
+   - settings: { key: [object, property, default] } other settings read from the report
+   - rule: how the export shows it: "rings" (double donut), "nested" (outer / inner bars),
+     "table" (a table, with the visual's cell bars as data bars), "kpi" (a KPI tile; mainRole
+     is its main value), "slicer" (a filter chip), "none" (no data: skipped quietly) */
 const CUSTOM_VISUALS = {
   // NeenOpal's Double Donut Chart: categories on the inner ring, their subcategories on the outer ring
   doubleDonut2B2DE03D219E04DFF80684A45ECA4D25E: {
@@ -50,7 +53,50 @@ const CUSTOM_VISUALS = {
     roles: { category: "Category", subcategory: "Category", value: "Values" },
     colors: "categoryColors",
   },
+  // NeenOpal's Nested Bars: a bar per category with its selected subset's bar inside
+  nestedBars578293FC1D324F5CA7440FB9344A25E3: {
+    name: "Nested bars",
+    rule: "nested",
+    roles: { category: "Category", subset: "Subset", categoryValue: "Y", subsetValue: "Y2", tooltip: "Tooltips" },
+    settings: {
+      outer: ["columns", "outerColumnColor", "#12239E"],
+      inner: ["columns", "innerColumnColor", "#118DFF"],
+      autoInner: ["columns", "autoGenerateSubsetColor", true],   // the subset colour is the outer one's complement
+    },
+  },
+  // NeenOpal's Comparison Table: metrics against regions; benchmark cells hold a blue bar,
+  // value cells a green bar (red when negative)
+  comparisonTable97CE315D158843019602B15CF4A4063F: {
+    name: "Comparison table",
+    rule: "table",
+    roles: { metrics: "Rows", regions: "Columns", benchmark: "Values", values: "Values" },
+    bars: { benchmark: { color: "#2196F3" }, values: { color: "#4CAF50", negative: "#F44336" } },
+    settings: {
+      headerBack: ["columnHeaders", "headersBackgroundColor", null],
+      headerText: ["columnHeaders", "headersTextColor", null],
+    },
+  },
+  // NeenOpal's Progress Icon: a value against a benchmark, drawn as a filling icon
+  iconwithgraph7E9A1A432F2E4C9099F64BB88C889CA4: {
+    name: "Progress icon",
+    rule: "kpi",
+    roles: { Value: "Y", BenchmarkValue: "TargetValue" },
+    mainRole: "Y",
+    settings: { accent: ["iconSettings", "iconFillColor", "#2E7D32"] },
+  },
+  // NeenOpal's Date Range Picker: filters the page by a date range
+  datePicker7A12AE28E48C4004852BA7D1536C378E: { name: "Date range picker", rule: "slicer", roles: { DateField: "Values" } },
+  // Microsoft's Power Automate button: no data
+  FlowVisual_C29F1DCC_81F5_4973_94AD_0517D44CC06A: { name: "Power Automate button", rule: "none", roles: {} },
 };
+
+/* A supported visual's setting: from the report file when it sets one, else the visual's default */
+function customSetting(type, info, key) {
+  const c = customVisual(type);
+  if (!c || !c.settings || !c.settings[key]) return null;
+  const set = info && info.settings;
+  return set && key in set ? set[key] : c.settings[key][2];
+}
 
 /* A supported AppSource visual's description, or null */
 function customVisual(type) {
@@ -497,6 +543,20 @@ function tableFormats(objects, theme) {
   return out;
 }
 
+/* A custom table's formatting, as tableFormats describes a table's: the visual's cell bars
+   as data bars on their columns, and header colours the report sets */
+function customTableFormats(custom, ownRoles, settings) {
+  const out = [];
+  for (const [role, bar] of Object.entries(custom.bars || {})) {
+    for (const f of ownRoles[role] || []) {
+      out.push({ target: "m:" + f.ref, kind: "bar", bar: { color: bar.color, negative: bar.negative || null, axis: null, reverse: false, showValue: true } });
+    }
+  }
+  if (settings.headerBack) out.push({ target: "header", kind: "back", color: settings.headerBack });
+  if (settings.headerText) out.push({ target: "header", kind: "font", color: settings.headerText });
+  return out;
+}
+
 /* How a visual colours its data, with every colour set by hand resolved to a hex code */
 function visualColorInfo(visual, theme) {
   const custom = customVisual(visual.type);
@@ -556,6 +616,16 @@ function visualColorInfo(visual, theme) {
     total: colorFromFill(sp.totalFill, theme) || theme.dataColors[0],
   } : null;
   // A custom visual's roles as the built-in roles they act like (category, then subcategory…)
+  // A custom visual's own settings, as the report sets them (colours resolved, true / false, text)
+  const settings = {};
+  for (const [k, [obj, prop]] of Object.entries((custom && custom.settings) || {})) {
+    const v = ((((visual.objects || {})[obj] || [])[0] || {}).properties || {})[prop];
+    if (!v) continue;
+    const lit = v.expr && v.expr.Literal ? String(v.expr.Literal.Value) : null;
+    const color = colorFromFill(v, theme);
+    if (color) settings[k] = color;
+    else if (lit !== null) settings[k] = lit === "true" ? true : lit === "false" ? false : lit.replace(/^'(.*)'$/, "$1");
+  }
   const roles = custom ? {} : visual.roles;
   if (custom) for (const [name, role] of Object.entries(custom.roles)) roles[role] = [...(roles[role] || []), ...(visual.roles[name] || [])];
   const series = (roles.Series || [])[0] || null;
@@ -579,9 +649,11 @@ function visualColorInfo(visual, theme) {
     accent,
     waterfall,
     roles,   // every field well of the visual (X, Y, Size, Legend…), used by scatter charts
-    tableFormats: ["tableEx", "pivotTable", "table", "matrix"].includes(visual.type) ? tableFormats(visual.objects, theme) : [],
+    tableFormats: ["tableEx", "pivotTable", "table", "matrix"].includes(visual.type) ? tableFormats(visual.objects, theme)
+      : custom && custom.rule === "table" ? customTableFormats(custom, visual.roles, settings) : [],
+    settings,
     titleHidden: visual.titleShown === false,
-    mainValue: KPI_VALUE_ROLE[visual.type] ? (roles[KPI_VALUE_ROLE[visual.type]] || [])[0] || null : null,
+    mainValue: (roles[(custom && custom.mainRole) || KPI_VALUE_ROLE[visual.type]] || [])[0] || null,
   };
 }
 

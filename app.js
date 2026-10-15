@@ -25,7 +25,8 @@ const NON_DATA_TYPES = ["textbox", "image", "shape", "basicShape", "actionButton
 /* Every kind of slicer: the classic one ("slicer") and the newer button, list, text and
    date slicers (advancedSlicerVisual, listSlicer, textSlicer…) */
 function isSlicerType(type) {
-  return /slicer/i.test(String(type || ""));
+  // AppSource filter visuals (a date range picker…) count too: colors.js lists them
+  return /slicer/i.test(String(type || "")) || (customVisual(type) || {}).rule === "slicer";
 }
 
 const msalApp = new msal.PublicClientApplication({
