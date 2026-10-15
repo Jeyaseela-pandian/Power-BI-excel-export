@@ -2429,6 +2429,7 @@ function scatterPlan(item) {
     series: valueCols.map((ci, k) => ({ name: header[ci], values: points.map((p) => p.values[k]), fmt: fmts[k], color: null })),
     groups,
     perPoint,
+    sizePx: chartSizePx(item),   // the visual's size on the report page, for Power BI-like axis steps
     pointColors: null,
     note: merged ? `"${title}" shows one bubble per ${header[labelCol]}, but Power BI exported several rows for some of them. They were combined, so averages and percentages in that chart are approximate.` : null,
   };
@@ -2444,33 +2445,31 @@ function waterfallPlan(item) {
   if (!steps.length) return null;
   const w = (item.colorInfo && item.colorInfo.waterfall) || {};
   const up = toArgb(w.increase || "#1AAB40"), down = toArgb(w.decrease || "#D64554"), total = toArgb(w.total || "#118DFF");
-  const names = ["Base", "Increase", "Increase", "Decrease", "Decrease", "Total"];
-  const values = names.map(() => []);
+  const n = steps.length;
+  const blanks = () => new Array(n + 1).fill(null);
+  // Each step runs from the running total before it (Start) to the running total after it (End)
+  const start = blanks(), end = blanks(), totals = blanks();
   let running = 0;
-  for (const s of steps) {
-    const a = running, b = running + s.value;
-    const lo = Math.min(a, b), hi = Math.max(a, b);
-    const row = [null, null, null, null, null, null];
-    const [pos, neg] = s.value >= 0 ? [1, 2] : [3, 4];
-    if (lo >= 0) { row[0] = lo || null; row[pos] = hi - lo; }
-    else if (hi <= 0) { row[0] = hi || null; row[neg] = lo - hi; }
-    else { row[pos] = hi; row[neg] = lo; }
-    row.forEach((v, i) => values[i].push(v));
-    running = b;
-  }
-  values.forEach((v, i) => v.push(i === 5 ? running : null));
+  steps.forEach((s, i) => { start[i] = running; running += s.value; end[i] = running; });
+  totals[n] = running;
   const fmt = t.formatOf(valueCol);
+  const d = item.colorInfo && item.colorInfo.display;
   return {
-    spec: { kind: "bar", dir: "col", grouping: "stacked" },
+    spec: { kind: "waterfall" },
     title: item.displayTitle || item.title,
     catName: t.header[catCol],
     categories: [...steps.map((s) => s.label), "Total"],
-    series: names.map((name, i) => ({
-      name, values: values[i], fmt,
-      color: [null, up, up, down, down, total][i],
-      hidden: i === 0,
-      noLegend: i === 0 || i === 2 || i === 4,
-    })),
+    series: [
+      { name: "Increase", values: blanks(), fmt, color: up },
+      { name: "Decrease", values: blanks(), fmt, color: down },
+      { name: "Total", values: totals, fmt, color: total },
+      { name: "Start", values: start, fmt, hidden: true, noLegend: true },
+      { name: "End", values: end, fmt, hidden: true, noLegend: true },
+    ],
+    steps: [...steps.map((s) => s.value), running],
+    up, down, fmt,
+    showLabels: !(d && d.labels && d.labels.show === false),   // labels on unless switched off in the report
+    labelPrecision: d && d.labels ? d.labels.precision : undefined,
     pointColors: null,
   };
 }
@@ -2533,9 +2532,13 @@ function scatterXml(plan) {
     ? `<c:bubbleChart><c:varyColors val="0"/>${sers}<c:bubbleScale val="40"/><c:showNegBubbles val="0"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:bubbleChart>`
     : `<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>${sers}<c:axId val="${A1}"/><c:axId val="${A2}"/></c:scatterChart>`;
   // Axes along the bottom and left edges with their field names, as Power BI draws them
+    // Axis range and steps like Power BI's automatic axes, sized to the visual (one step per
+  // ~110 px across, ~45 px up), so the gridlines fall on the same values as in the report
+  const size = plan.sizePx || { w: 0, h: 0 };
+  const xAxis = niceAxis(xs.values, size.w - 90, 110), yAxis = niceAxis(ys.values, size.h - 100, 45);
   return chart +
-    valAxXml(A1, A2, "b", axisFormat(xs.fmt, xs.values), { crosses: "min", title: xs.name }) +
-    valAxXml(A2, A1, "l", axisFormat(ys.fmt, ys.values), { crosses: "min", title: ys.name });
+    valAxXml(A1, A2, "b", stepFormat(xs.fmt, xAxis, xs.values), { crosses: "min", title: xs.name, axis: xAxis }) +
+    valAxXml(A2, A1, "l", stepFormat(ys.fmt, yAxis, ys.values), { crosses: "min", title: ys.name, axis: yAxis });
 }
 
 /* Number format for axis labels, shortened the way Power BI does: "$4,000,000" → "$4.0M", "34.28%" → "34%" */
@@ -2598,6 +2601,83 @@ function scatterFields(t, item, info, nums) {
     .sort((a, b) => a.at - b.at);
   if (found.length >= 2) return [found[0].ci, found[1].ci, found[2] ? found[2].ci : undefined];
   return [nums[0], nums[1], nums[2]];
+}
+
+/* Axis range and step like Power BI's automatic axes: the step is the first of 1, 2, 5, 10…
+   that leaves room for each label (minGapPx between gridlines on a plot plotPx long) */
+function niceAxis(values, plotPx, minGapPx) {
+  const v = (values || []).filter((x) => typeof x === "number" && isFinite(x));
+  if (!v.length || !plotPx) return null;
+  let lo = Math.min(...v), hi = Math.max(...v);
+  if (lo === hi) { const d = Math.abs(lo) || 1; lo -= d / 2; hi += d / 2; }
+  const range = hi - lo, padded = range * 1.1;
+  const most = Math.max(2, plotPx / minGapPx);
+  const p = Math.pow(10, Math.floor(Math.log10(padded / most)));
+  const step = [1, 2, 5, 10, 20, 50, 100].map((m) => m * p).find((s) => padded / s <= most) || 100 * p;
+  const tidy = (x) => Number(x.toFixed(12));
+  let min = tidy(Math.floor((lo - range * 0.03) / step + 1e-9) * step);
+  const max = tidy(Math.ceil((hi + range * 0.03) / step - 1e-9) * step);
+  if (lo >= 0 && min < 0) min = 0;
+  return { min, max, step: tidy(step) };
+}
+
+/* Axis label format with as many decimals as the step needs: 10% steps → "-30%", 0.5 steps → "$12.5" */
+function stepFormat(fmt, axis, values) {
+  const f = String(fmt || "General");
+  if (!axis) return axisFormat(fmt, values);
+  const pct = f.includes("%");
+  if (!pct && Math.max(Math.abs(axis.min), Math.abs(axis.max)) >= 1e4) return axisFormat(fmt, values);
+  const s = pct ? axis.step * 100 : axis.step;
+  const d = Math.max(0, Math.min(4, -Math.floor(Math.log10(s) + 1e-9)));
+  const dec = d ? "." + "0".repeat(d) : "";
+  if (pct) return `0${dec}%`;
+  const prefix = (f.match(/^"[^"]*"/) || [""])[0];
+  return `${prefix}#,##0${dec}`;
+}
+
+/* A waterfall step as text, the way Power BI labels it: "-10%", "32%" */
+function waterfallLabel(v, fmt, precision) {
+  const f = String(fmt || "");
+  if (f.includes("%")) return (v * 100).toFixed(precision ?? 0) + "%";
+  const prefix = (f.match(/^"([^"]*)"/) || [])[1] || "";
+  const dec = precision ?? (((f.match(/\.(0+)/) || [])[1] || "").length);
+  return (v < 0 ? "-" : "") + prefix + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: dec, maximumFractionDigits: dec });
+}
+
+/*
+ * Waterfall chart: each step is ONE bar from its start to its end value (Excel "up/down bars"
+ * between an invisible Start line and an invisible End line), so a step that crosses zero is
+ * never split in two. Up bars take the increase colour, down bars the decrease colour; the
+ * total is a normal column. Labels show each step's value, like Power BI.
+ */
+function waterfallXml(plan) {
+  const { series, refs, categories } = plan;
+  const A1 = 50210, A2 = 50220;
+  const last = categories.length - 1;
+  const noBox = `<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>`;
+  const flags = (show) => `<c:showLegendKey val="0"/><c:showVal val="${show ? 1 : 0}"/><c:showCatName val="0"/><c:showSerName val="0"/><c:showPercent val="0"/><c:showBubbleSize val="0"/>`;
+  const label = (i, pos) => `<c:dLbl><c:idx val="${i}"/><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>` +
+    `${xmlEsc(waterfallLabel(plan.steps[i], plan.fmt, plan.labelPrecision))}</a:t></a:r></a:p></c:rich></c:tx>${noBox}<c:dLblPos val="${pos}"/>${flags(true)}</c:dLbl>`;
+  const cat = `<c:cat><c:strRef><c:f>${xmlEsc(refs.catRef)}</c:f>${strCacheXml(categories)}</c:strRef></c:cat>`;
+  const head = (i) => `<c:idx val="${i}"/><c:order val="${i}"/>` +
+    `<c:tx><c:strRef><c:f>${xmlEsc(refs.series[i].nameRef)}</c:f>${strCacheXml([series[i].name])}</c:strRef></c:tx>`;
+  const val = (i) => `<c:val><c:numRef><c:f>${xmlEsc(refs.series[i].valRef)}</c:f>${numCacheXml(series[i].values, series[i].fmt)}</c:numRef></c:val>`;
+  // Increase and Decrease are empty columns: they only put the two colours in the legend
+  const totalLabel = plan.showLabels ? `<c:dLbls>${label(last, "inBase")}${noBox}${flags(false)}</c:dLbls>` : "";
+  const bars = [0, 1, 2].map((i) => `<c:ser>${head(i)}<c:spPr>${fillXml(series[i].color)}</c:spPr><c:invertIfNegative val="0"/>` +
+    `${i === 2 ? totalLabel : ""}${cat}${val(i)}</c:ser>`).join("");
+  const stepLabels = plan.showLabels
+    ? `<c:dLbls>${plan.steps.slice(0, last).map((v, i) => label(i, v >= 0 ? "t" : "b")).join("")}${noBox}${flags(false)}</c:dLbls>` : "";
+  const line = (i, labels) => `<c:ser>${head(i)}<c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:marker><c:symbol val="none"/></c:marker>` +
+    `${labels}${cat}${val(i)}<c:smooth val="0"/></c:ser>`;
+  return `<c:barChart><c:barDir val="col"/><c:grouping val="stacked"/><c:varyColors val="0"/>${bars}` +
+      `<c:gapWidth val="60"/><c:overlap val="100"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:barChart>` +
+    `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>${line(3, "")}${line(4, stepLabels)}` +
+      `<c:upDownBars><c:gapWidth val="60"/><c:upBars><c:spPr>${fillXml(plan.up)}</c:spPr></c:upBars>` +
+      `<c:downBars><c:spPr>${fillXml(plan.down)}</c:spPr></c:downBars></c:upDownBars>` +
+      `<c:marker val="1"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:lineChart>` +
+    catAxXml(A1, A2, "b") +
+    valAxXml(A2, A1, "l", axisFormat(plan.fmt, [...series[3].values, ...series[4].values, ...series[2].values]));
 }
 
 /* Writes every chart's numbers on the page's "Data" sheet and records the cell ranges */
@@ -2698,12 +2778,14 @@ function catAxXml(id, crossId, pos, { reverse = false, hidden = false } = {}) {
     `<c:crossAx val="${crossId}"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/><c:noMultiLvlLbl val="0"/></c:catAx>`;
 }
 
-function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true, hidden = false, title = null } = {}) {
-  return `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="${hidden ? 1 : 0}"/><c:axPos val="${pos}"/>` +
+function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true, hidden = false, title = null, axis = null } = {}) {
+  const bounds = axis ? `<c:max val="${axis.max}"/><c:min val="${axis.min}"/>` : "";
+  return `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/>${bounds}</c:scaling><c:delete val="${hidden ? 1 : 0}"/><c:axPos val="${pos}"/>` +
     (grid ? `<c:majorGridlines><c:spPr><a:ln w="6350">${fillXml(C.HAIR)}</a:ln></c:spPr></c:majorGridlines>` : "") +
     (title ? axisTitleXml(title) : "") +
     `<c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/>` +
-    `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:crossAx val="${crossId}"/><c:crosses val="${crosses}"/><c:crossBetween val="between"/></c:valAx>`;
+    `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:crossAx val="${crossId}"/><c:crosses val="${crosses}"/><c:crossBetween val="between"/>` +
+    (axis ? `<c:majorUnit val="${axis.step}"/>` : "") + `</c:valAx>`;
 }
 
 function chartXml(plan) {
@@ -2712,8 +2794,10 @@ function chartXml(plan) {
   const refs = plan.refs;
   const scatter = kind === "scatter" || kind === "bubble";
   let body;
-  if (scatter) {
+    if (scatter) {
     body = scatterXml(plan);
+  } else if (kind === "waterfall") {
+    body = waterfallXml(plan);
   } else if (kind === "pie" || kind === "doughnut") {
     const s0 = { ...series[0], pieLabels: true, pieLabelPos: kind === "pie" ? "outEnd" : null };
     const ser = chartSeriesXml("pie", s0, 0, plan, refs.series[0]);
