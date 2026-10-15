@@ -197,7 +197,11 @@ function friendlyType(type) {
   if (FRIENDLY_TYPES[t]) return FRIENDLY_TYPES[t];
   if (customVisual(t)) return customVisual(t).name;
   if (/^deneb/i.test(t)) return "Deneb visual";
-  if (/[0-9A-F]{32}$/i.test(t)) return "Custom visual";
+  if (isCustomType(t)) {
+    // "SankeyDiagram1446463184954" → "Sankey diagram"; an id alone stays "Custom visual"
+    const name = t.replace(/(_[0-9A-F]{8}_.*|[0-9A-F]{32}|\d{12,})$/i, "").replace(/_/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2").trim().toLowerCase();
+    return name.length > 2 ? name[0].toUpperCase() + name.slice(1) : "Custom visual";
+  }
   const words = t.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
   return words ? words[0].toUpperCase() + words.slice(1) : "Visual";
 }
@@ -567,6 +571,8 @@ function ringColors(t) {
  */
 function columnColors(item, palette, info) {
   if (!palette || !palette.length || item.isKpi || TABLE_VISUAL_TYPES.includes(item.type)) return null;
+  const own = customVisual(item.type);
+  if (own && own.palette) palette = own.palette;   // a visual with its own fixed colours instead of the theme's
   const { header, data, filled, numeric, hex, helper } = classifyColumns(item.rows);
   const cols = header.map((_, ci) => ci);
   const hexCols = cols.filter((ci) => hex[ci]);
@@ -589,13 +595,44 @@ function columnColors(item, palette, info) {
     const rings = ringColors({ data, cols, numeric, hex, findCol, palette, info });
     if (rings) return { ...rings, hexCols, exact: !!info };
   }
+  if (custom && custom.rule === "nodes") {
+    // Sankey: every node (source or destination) its theme colour by name, in the order the
+    // visual meets them: sources first, then destination-only nodes. Its code asks the palette
+    // for an empty key right after the first node, so node k (k ≥ 1) takes slot k + 1
+    const texts = cols.filter((ci) => !numeric[ci] && !hex[ci]);
+    const src = info ? findCol(info.category) : texts[0] ?? -1;
+    const dst = info ? findCol((info.roles.Destination || [])[0], { [src]: true }) : texts.find((ci) => ci !== src) ?? -1;
+    if (src >= 0 && dst >= 0) {
+      const text = (r, ci) => String(r[ci] ?? "").trim();
+      const sources = [...new Set(data.map((r) => text(r, src)))];
+      const nodes = [...sources, ...[...new Set(data.map((r) => text(r, dst)))].filter((v) => !sources.includes(v))];
+      const colorOf = {};
+      const set = (info && info.overrides) || {};   // node colours set in the report, or one for every node
+      nodes.forEach((v, k) => { colorOf[v] = toArgb(set["i:" + normalizeValue(v)] || set.all || palette[(k === 0 ? 0 : k + 1) % palette.length]); });
+      const rowKey = { col: src, colorOf: Object.fromEntries(sources.map((v) => [v, colorOf[v]])) };
+      return { series: {}, rowCols: [], hexCols, rowKey, rings: { col: dst, colors: data.map((r) => colorOf[text(r, dst)]) },
+        dot: { keyCol: src, colorOf: (v) => colorOf[v] || null }, exact: !!info };
+    }
+  }
+  if (custom && custom.rule === "fixed" && info) {
+    // Fixed colours per value field (a bullet chart's bands…): each field's header, from the
+    // report's setting, else the visual's default; a setting may fall back to another's
+    const series = {};
+    for (const [role, keys] of Object.entries(custom.seriesColors || {})) {
+      const ci = findCol((info.roles[role] || [])[0], series);
+      const c = keys.map((k) => customSetting(item.type, info, k)).find(Boolean);
+      if (ci >= 0 && c) series[ci] = toArgb(c);
+    }
+    return Object.keys(series).length ? { series, rowCols: [], hexCols, rowKey: null, dot: null, exact: true } : null;
+  }
   if (custom && custom.rule === "nested") {
     // Nested bars: the category value in the outer colour, the subset value inside it in the
     // subset colour (by default the outer colour's complement); the visual's own colours,
     // not the theme's
     const valueCols = cols.filter((ci) => numeric[ci] && !hex[ci]);
-    const outerCol = info ? findCol(info.measures.find((m) => m.role === "Y")) : valueCols[0] ?? -1;
-    const innerCol = info ? findCol(info.measures.find((m) => m.role === "Y2"), { [outerCol]: true }) : valueCols[1] ?? -1;
+    const placed = item.nestedCols;   // rows rebuilt by nestedBarsRows: category, total, chosen subset
+    const outerCol = placed ? placed.outer : info ? findCol(info.measures.find((m) => m.role === "Y")) : valueCols[0] ?? -1;
+    const innerCol = placed ? placed.inner : info ? findCol(info.measures.find((m) => m.role === "Y2"), { [outerCol]: true }) : valueCols[1] ?? -1;
     const outer = customSetting(item.type, info, "outer");
     const inner = customSetting(item.type, info, "autoInner") === false ? customSetting(item.type, info, "inner") : complementaryColor(outer);
     const series = {};
@@ -669,6 +706,19 @@ function columnColors(item, palette, info) {
     return { series: {}, rowCols: [ci], perCol: { [ci]: rowColors }, rowColors, hexCols, rowKey: null, dot: null, legend, exact };
   }
 
+  // An AppSource visual whose colouring isn't known: most give each value of their first
+  // category its own theme colour (Power BI's palette, in data order), with colours set per
+  // item kept. A best match, so a note says so.
+  const unknownCustom = info ? info.rule === "generic" : isCustomType(item.type) && !customVisual(item.type) && !/^deneb/i.test(item.type);
+  if (unknownCustom) {
+    const keyCol = cols.find((ci) => !numeric[ci] && !hex[ci] && !helper[ci]);
+    if (keyCol !== undefined && new Set(filled(keyCol)).size > 1) {
+      const rowKey = keyedRows(keyCol, (v, i) => toArgb(itemOverride(v) || palette[i % palette.length]));
+      return { series: {}, rowCols: [], hexCols, rowKey, dot: { keyCol, colorOf: (v) => rowKey.colorOf[v] || null }, exact: !!info,
+        note: `"${item.displayTitle || item.title}" (${friendlyType(item.type)}) is an AppSource visual whose colouring isn't known in detail: its ${header[keyCol]} values take the theme colours in order, which may differ from the chart.` };
+    }
+  }
+
   // 3. Conditional formatting (fx) in the report file: colour scales, rules, colours from a field
   let ruleNote = null;
   // With a legend, Power BI applies colour rules per legend value only; a rule for every
@@ -686,7 +736,8 @@ function columnColors(item, palette, info) {
   if (info && (info.rule === "legend" || info.rule === "item")) {
     let keyCol = findCol(info.rule === "legend" ? info.series : info.category);
     if (keyCol < 0 && info.rule === "item" && !numeric[0] && !hex[0]) keyCol = 0;
-    if (keyCol >= 0) rowKey = keyedRows(keyCol, (v, i) => toArgb(itemOverride(v) || palette[i % palette.length]), info.rule === "legend");
+    const oneColor = custom && custom.settings && custom.settings.all && overrides.all;   // e.g. a word cloud's single colour
+    if (keyCol >= 0) rowKey = keyedRows(keyCol, (v, i) => toArgb(itemOverride(v) || oneColor || palette[i % palette.length]), info.rule === "legend");
   } else if (info && seriesCols.length === 1 && Object.keys(overrides).some((k) => k.startsWith("i:"))) {
     // One series with colours set per bar ("Show all"): set bars keep theirs, the rest the series colour
     const keyCol = findCol(info.category);
@@ -769,10 +820,45 @@ function cleanRows(rows) {
  * Convert them to real Excel numbers with a matching number format, so they can be
  * filtered, sorted and summed. Anything that is not clearly a number stays text.
  */
-function toCellValue(raw) {
+/*
+ * A date as Power BI exports it, "2023-01-15 00:00:00" or "1/15/2023 12:00:00 AM" (day
+ * first when the first number can't be a month), as a UTC Date (what ExcelJS writes as an
+ * Excel date), or null. hasTime: the value carries a time of day other than midnight.
+ */
+const EXPORTED_ISO_DATE = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?Z?$/;
+const EXPORTED_SLASH_DATE = /^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:,?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AP]M)?)?$/i;
+function parseDate(text, dayFirst = false) {
+  let y, mo, d, h = 0, mi = 0, sec = 0, m;
+  if ((m = text.match(EXPORTED_ISO_DATE))) [, y, mo, d, h = 0, mi = 0, sec = 0] = m;
+  else if ((m = text.match(EXPORTED_SLASH_DATE))) {
+    let a = Number(m[1]), b = Number(m[2]);
+    if ((dayFirst || a > 12) && b <= 12) [a, b] = [b, a];   // 15/1/2023 (or a day-first column): day first
+    [mo, d, y] = [a, b, m[3]];
+    h = Number(m[4] || 0); mi = m[5] || 0; sec = m[6] || 0;
+    if (m[7]) h = (h % 12) + (/p/i.test(m[7]) ? 12 : 0);
+  } else return null;
+  [y, mo, d, h, mi, sec] = [y, mo, d, h, mi, sec].map(Number);
+  if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || sec > 59) return null;
+  const date = new Date(Date.UTC(y, mo - 1, d, h, mi, sec));
+  if (date.getUTCDate() !== d) return null;   // 31 February
+  return { date, hasTime: !!(h || mi || sec) };
+}
+const SHORT_DATE = "mm-dd-yy";   // Excel's built-in short date: shown in the reader's own date order
+
+/* Columns whose dates are written day first (dd/mm/yyyy): some value's first number can't be a month */
+function dayFirstColumns(header, data) {
+  return header.map((_, ci) => data.some((r) => {
+    const m = String(r[ci] ?? "").trim().match(EXPORTED_SLASH_DATE);
+    return m && Number(m[1]) > 12;
+  }));
+}
+
+function toCellValue(raw, dayFirst = false) {
   const s = (raw ?? "").trim();
   if (s === "") return { value: null };
   if (/^0\d+$/.test(s)) return { value: s };             // codes with leading zeros (ZIP, IDs)
+  const date = parseDate(s, dayFirst);
+  if (date) return { value: date.date, numFmt: date.hasTime ? "m/d/yyyy h:mm" : SHORT_DATE };
 
   let t = s, negative = false;
   if (/^\(.*\)$/.test(t)) { negative = true; t = t.slice(1, -1); }
@@ -814,6 +900,7 @@ function readableFormats(header, data) {
 
 /* Roughly how Excel shows a value with a number format (used to size columns) */
 function displayText(value, fmt) {
+  if (value instanceof Date) return dateText(value, /h/.test(fmt || ""));
   if (typeof value !== "number") return String(value ?? "");
   const f = fmt || "";
   const prefix = (f.match(/^"([^"]*)"/) || [])[1] || "";
@@ -973,6 +1060,62 @@ function mainValueFirst(item, info) {
   if (k > 0) item.rows = item.rows.map((row) => [row[k], ...row.filter((_, i) => i !== k)]);
 }
 
+/*
+ * Nested Bars draws one bar per category: the outer bar is the category's total of its
+ * category value, the inner bar the subset value of ONE subset (the one chosen in the
+ * visual, else the first in the data). Power BI exports a row per category and subset, so
+ * the rows are rebuilt to read like the chart: category, its total, the chosen subset's
+ * value (headed "Value · Subset"). A total of a ratio can't be added up from the rows: it
+ * is averaged, with a note.
+ */
+function nestedBarsRows(item, info, notes) {
+  const { header, data, numeric, hex } = classifyColumns(item.rows);
+  const cols = header.map((_, ci) => ci);
+  const norm = header.map((h) => normalizeField(h)), lower = header.map((h) => String(h ?? "").trim().toLowerCase());
+  const taken = new Set();
+  const colOf = (f) => {
+    if (!f) return -1;
+    let ci = f.label ? cols.find((c) => !taken.has(c) && lower[c] === f.label) : undefined;
+    if (ci === undefined) ci = cols.find((c) => !taken.has(c) && norm[c] === f.ref);
+    if (ci !== undefined) taken.add(ci);
+    return ci ?? -1;
+  };
+  const texts = cols.filter((ci) => !numeric[ci] && !hex[ci]), nums = cols.filter((ci) => numeric[ci] && !hex[ci]);
+  const roles = (info && info.roles) || {};
+  let cat = colOf((roles.Category || [])[0]), sub = colOf((roles.Subset || [])[0]);
+  let outer = colOf((roles.Y || [])[0]), inner = colOf((roles.Y2 || [])[0]);
+  if (cat < 0) cat = texts[0] ?? -1;
+  if (sub < 0) sub = texts.find((ci) => ci !== cat) ?? -1;
+  if (outer < 0) outer = nums[0] ?? -1;
+  if (inner < 0) inner = nums.find((ci) => ci !== outer) ?? -1;
+  if (cat < 0 || sub < 0 || outer < 0) return;   // one level only: the rows already read like the chart
+  const key = (r, ci) => String(r[ci] ?? "").trim();
+  const num = (r, ci) => { const v = toCellValue(r[ci]).value; return typeof v === "number" ? v : null; };
+  const subsets = [...new Set(data.map((r) => key(r, sub)))];
+  const chosen = customSetting(item.type, info, "subset");
+  const shown = chosen && subsets.includes(chosen) ? chosen : subsets[0];
+  const additive = !NON_ADDITIVE.test(header[outer]) && !data.some((r) => key(r, outer).endsWith("%"));
+  const raw = (r, ci) => String(r[ci] ?? "").trim();
+  const fmtLike = (ci, v) => {   // write the total the way the column's values are written ("$7052", "12.5%")
+    const sample = data.map((r) => raw(r, ci)).find(Boolean) || "";
+    const cur = (sample.match(/^-?\s*([$€£₹¥])/) || [])[1] || "";
+    if (sample.endsWith("%")) return (v * 100).toFixed(2) + "%";
+    return (v < 0 ? "-" : "") + cur + String(Math.abs(Math.round(v * 100) / 100));
+  };
+  const rows = [];
+  for (const c of [...new Set(data.map((r) => key(r, cat)))]) {
+    const mine = data.filter((r) => key(r, cat) === c);
+    const vals = mine.map((r) => num(r, outer)).filter((v) => v !== null);
+    const total = vals.length ? (additive ? vals.reduce((a, b) => a + b, 0) : vals.reduce((a, b) => a + b, 0) / vals.length) : null;
+    const pick = mine.find((r) => key(r, sub) === shown);
+    rows.push([mine[0][cat], total === null ? "" : fmtLike(outer, total), inner >= 0 && pick ? pick[inner] : ""]);
+  }
+  const head = [header[cat], header[outer], ...(inner >= 0 ? [`${header[inner]} · ${shown || "subset"}`] : [])];
+  item.rows = [head, ...rows.map((r) => (inner >= 0 ? r : r.slice(0, 2)))];
+  item.nestedCols = { outer: 1, inner: inner >= 0 ? 2 : -1 };
+  if (!additive) notes.push(`"${item.title}": each bar's total is averaged from Power BI's rows (a ratio can't be added up), so it may differ slightly from the chart.`);
+}
+
 /* KPI tiles show a title row only when the title adds something beyond the field name */
 function kpiHasTitle(item) {
   return !!item.displayTitle && item.displayTitle.toLowerCase() !== String(item.rows[0][0] || "").toLowerCase();
@@ -1117,6 +1260,18 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
     compact ? cellUnits(displayText(hero.value, heroFmt || "#,##0.00"), fonts.kpiExact, 1) : 0));
 }
 
+/* A date as short text, "1/15/2023" (with the time when it has one): sizes columns, labels keys */
+function dateText(date, withTime) {
+  const t = `${date.getUTCMonth() + 1}/${date.getUTCDate()}/${date.getUTCFullYear()}`;
+  return withTime ? `${t} ${date.getUTCHours()}:${String(date.getUTCMinutes()).padStart(2, "0")}` : t;
+}
+
+/* A colour key's label: a date exported as "2023-01-15 00:00:00" reads "1/15/2023" */
+function keyLabel(text) {
+  const d = parseDate(String(text ?? "").trim());
+  return d ? dateText(d.date, d.hasTime) : text;
+}
+
 /* Caption runs: a legend of the chart's colours, or "Table · 24 rows" */
 function captionRuns(item, colors, header, fonts, units) {
   const n = item.rows.length - 1;
@@ -1127,9 +1282,9 @@ function captionRuns(item, colors, header, fonts, units) {
     const runs = [];
     let len = 0, shown = 0;
     for (const e of entries) {
-      const add = e.label.length * 0.8 + 4;
+      const add = String(keyLabel(e.label)).length * 0.8 + 4;
       if (shown && len + add > units - 6) break;
-      runs.push([KEY_GLYPH + "  ", fonts.dot(e.argb)], [e.label + "      ", fonts.caption]);
+      runs.push([KEY_GLYPH + "  ", fonts.dot(e.argb)], [keyLabel(e.label) + "      ", fonts.caption]);
       len += add;
       shown++;
     }
@@ -1181,7 +1336,8 @@ function writeDataTable(ws, r, col, item, tableName, widths, lay, number) {
   const fonts = lay.fonts;
   const cls = classifyColumns(item.rows);
   const header = uniqueHeaders(item.rows[0]);
-  const data = cls.data.map((row) => header.map((_, i) => toCellValue(row[i])));
+  const dayFirst = dayFirstColumns(header, cls.data);   // 05/01/2023 is 5 January in a column that also has 15/01/2023
+  const data = cls.data.map((row) => header.map((_, i) => toCellValue(row[i], dayFirst[i])));
   const formats = readableFormats(header, data);
   const n = data.length;
   const executive = !BUILT_IN_STYLES.includes(lay.tableStyle);
@@ -1204,7 +1360,7 @@ function writeDataTable(ws, r, col, item, tableName, widths, lay, number) {
       }
     } else {
       let longest = 0;
-      for (const row of data) if (row[ci].value != null) longest = Math.max(longest, String(row[ci].value).length);
+      for (const row of data) if (row[ci].value != null) longest = Math.max(longest, displayText(row[ci].value, row[ci].numFmt).length);
       u = Math.max(u, Math.min(45, Math.ceil(longest * 0.95) + 3));
     }
     return Math.max(u, 10);
@@ -1440,11 +1596,14 @@ function applyVisualColors(ws, hr, col, item, colors, lay) {
     cell.border = GAP_BORDER;
   };
 
-  // Series drawn in one colour: the header naming the series
+  // Series drawn in one colour: the header naming the series. An AppSource visual's value
+  // fields (a bullet chart's bands, a histogram's bars…) fill their value cells too, like the
+  // marks the visual draws
   for (const [ci, argb] of Object.entries(colors.series)) {
     const h = ws.getCell(hr, col + Number(ci));
     h.fill = styleOf(argb).fill;
     h.font = styleOf(argb).headFont;
+    if (customVisual(item.type) && !colors.rowKey) data.forEach((row, ri) => { if (String(row[ci] ?? "").trim()) fillCell(ws.getCell(first + ri, col + Number(ci)), argb); });
   }
 
   // Colour that identifies a category (legend value, slice, tile, a bar set by hand): the
@@ -1639,6 +1798,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
   for (const item of items) {
     const info = visualInfo(lay.reportColors, item.page, item.name);
     if (item.isKpi) mainValueFirst(item, info);
+    if ((customVisual(item.type) || {}).rule === "nested") nestedBarsRows(item, info, colorNotes);
     // A title turned off in the report isn't shown either (it is often an internal name such
     // as "TYS Card"): a table is titled from its columns instead, a KPI tile by its label
     const hidden = !!(info && info.titleHidden);
@@ -1774,7 +1934,9 @@ async function slicerFieldNames(visual, fallback) {
   try {
     const result = await visual.exportData(models.ExportDataType.Summarized, 1);
     const header = parseCsv(result.data)[0];
-    if (header && header.length) return header.join(", ");
+    // An AppSource filter visual may export its value measure too (an attribute slicer's
+    // bars): its field is the first column
+    if (header && header.length) return customVisual(visual.type) ? header[0] : header.join(", ");
   } catch (e) {
     // fall through to the visual's title
   }
@@ -2658,7 +2820,7 @@ function waterfallXml(plan) {
   const flags = (show) => `<c:showLegendKey val="0"/><c:showVal val="${show ? 1 : 0}"/><c:showCatName val="0"/><c:showSerName val="0"/><c:showPercent val="0"/><c:showBubbleSize val="0"/>`;
   const label = (i, pos) => `<c:dLbl><c:idx val="${i}"/><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>` +
     `${xmlEsc(waterfallLabel(plan.steps[i], plan.fmt, plan.labelPrecision))}</a:t></a:r></a:p></c:rich></c:tx>${noBox}<c:dLblPos val="${pos}"/>${flags(true)}</c:dLbl>`;
-  const cat = `<c:cat><c:strRef><c:f>${xmlEsc(refs.catRef)}</c:f>${strCacheXml(categories)}</c:strRef></c:cat>`;
+  const cat = `<c:cat><c:strRef><c:f>${xmlEsc(refs.catRef)}</c:f>${strCacheXml(categories.map(keyLabel))}</c:strRef></c:cat>`;
   const head = (i) => `<c:idx val="${i}"/><c:order val="${i}"/>` +
     `<c:tx><c:strRef><c:f>${xmlEsc(refs.series[i].nameRef)}</c:f>${strCacheXml([series[i].name])}</c:strRef></c:tx>`;
   const val = (i) => `<c:val><c:numRef><c:f>${xmlEsc(refs.series[i].valRef)}</c:f>${numCacheXml(series[i].values, series[i].fmt)}</c:numRef></c:val>`;
@@ -2707,7 +2869,7 @@ function writeChartDataSheet(wb, name, charts) {
       h.alignment = { horizontal: "right" };
     });
     p.categories.forEach((c, ri) => {
-      ws.getCell(hr + 1 + ri, 2).value = c;
+      ws.getCell(hr + 1 + ri, 2).value = keyLabel(c);   // a date reads "1/15/2023" on the axis
       p.series.forEach((s, i) => {
         const cell = ws.getCell(hr + 1 + ri, 3 + i);
         cell.value = s.values[ri];
@@ -2752,7 +2914,7 @@ function numCacheXml(values, fmt) {
 function chartSeriesXml(kind, s, i, plan, ref) {
   const head = `<c:idx val="${i}"/><c:order val="${i}"/>` +
     `<c:tx><c:strRef><c:f>${xmlEsc(ref.nameRef)}</c:f>${strCacheXml([s.name])}</c:strRef></c:tx>`;
-  const cat = `<c:cat><c:strRef><c:f>${xmlEsc(plan.refs.catRef)}</c:f>${strCacheXml(plan.categories)}</c:strRef></c:cat>`;
+  const cat = `<c:cat><c:strRef><c:f>${xmlEsc(plan.refs.catRef)}</c:f>${strCacheXml(plan.categories.map(keyLabel))}</c:strRef></c:cat>`;
   const val = `<c:val><c:numRef><c:f>${xmlEsc(ref.valRef)}</c:f>${numCacheXml(s.values, s.fmt)}</c:numRef></c:val>`;
   // Hidden helper series (waterfall base, funnel offset) take no bar colours
   const points = s.hidden ? "" : (plan.pointColors || []).map((c, pi) => (c

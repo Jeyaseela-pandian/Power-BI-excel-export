@@ -62,6 +62,7 @@ const CUSTOM_VISUALS = {
       outer: ["columns", "outerColumnColor", "#12239E"],
       inner: ["columns", "innerColumnColor", "#118DFF"],
       autoInner: ["columns", "autoGenerateSubsetColor", true],   // the subset colour is the outer one's complement
+      subset: ["subsetSelection", "selectedSubset", null],        // the subset drawn inside (else the first one)
     },
   },
   // NeenOpal's Comparison Table: metrics against regions; benchmark cells hold a blue bar,
@@ -86,6 +87,77 @@ const CUSTOM_VISUALS = {
   },
   // NeenOpal's Date Range Picker: filters the page by a date range
   datePicker7A12AE28E48C4004852BA7D1536C378E: { name: "Date range picker", rule: "slicer", roles: { DateField: "Values" } },
+  // ── Microsoft's open-source AppSource visuals (rules read from their GitHub source) ──
+  // Bullet Chart: fixed band colours, the value bar black
+  BulletChart1443347686880: {
+    name: "Bullet chart", rule: "fixed",
+    roles: { Category: "Category", Value: "Value", TargetValue: "TargetValue", Minimum: "Minimum", NeedsImprovement: "NeedsImprovement",
+      Satisfactory: "Satisfactory", Good: "Good", VeryGood: "VeryGood", Maximum: "Maximum", TargetValue2: "TargetValue2" },
+    seriesColors: { Value: ["bullet"], Minimum: ["min"], NeedsImprovement: ["needs"], Satisfactory: ["satisfactory"], Good: ["good"], VeryGood: ["veryGood"] },
+    settings: { bullet: ["colors", "bulletColor", "#000000"], min: ["colors", "minColor", "#8B0000"], needs: ["colors", "needsImprovementColor", "#FF0000"],
+      satisfactory: ["colors", "satisfactoryColor", "#FFFF00"], good: ["colors", "goodColor", "#008000"], veryGood: ["colors", "veryGoodColor", "#006400"] },
+  },
+  // Gantt: a theme colour per Legend value (colours set under Legend win); one task colour without a legend
+  Gantt1448688115699: {
+    name: "Gantt chart", rule: "auto",
+    roles: { Legend: "Series", Task: "Category", Parent: "Parent", StartDate: "StartDate", EndDate: "Y", Duration: "Y", Completion: "Completion",
+      Resource: "Resource", ExtraInformation: "Tooltips", Milestones: "Milestones" },
+    colors: "legend",
+    settings: { all: ["taskConfig", "fill", "#00B099"] },
+  },
+  // Mekko: a theme colour per Series value; one colour without a series
+  MekkoChart1449744733038: {
+    name: "Mekko chart", rule: "auto",
+    roles: { Category: "Category", Series: "Series", Y: "Y", Width: "Width", CategoryCustomSorting: "Sorting" },
+    settings: { all: ["dataPoint", "defaultColor", "#01B8AA"] },
+  },
+  // Stream Graph: a theme colour per group (stream), in order; per measure without a group
+  StreamGraph1446659696222: {
+    name: "Stream graph", rule: "auto",
+    roles: { Category: "Category", Series: "Series", Y: "Y" },
+    colors: "streams",
+  },
+  // Histogram: every bar one colour
+  Histogram1445664487616: {
+    name: "Histogram", rule: "fixed",
+    roles: { Values: "Category", Frequency: "Frequency" },
+    seriesColors: { Frequency: ["fill"] },
+    settings: { fill: ["dataPoint", "fill", "#01B8AA"] },
+  },
+  // Dual KPI: top and bottom charts in fixed colours (the bottom matches the top by default)
+  PBI_CV_3C80B1F2_09AF_4123_8E99_C3CBC46B23E0: {
+    name: "Dual KPI", rule: "fixed",
+    roles: { axis: "Category", topvalues: "topvalues", bottomvalues: "bottomvalues", warningstate: "warningstate" },
+    seriesColors: { topvalues: ["top"], bottomvalues: ["bottom", "top"] },
+    settings: { top: ["dualKpiColors", "dataColor", "#01B8AA"], bottom: ["dualKpiColorsBottom", "dataColor", null] },
+  },
+  // Sankey: a theme colour per node name (sources first, then destination-only nodes; the
+  // visual's code skips the 2nd palette slot); links grey
+  sankey02300D1BE6F5427989F3DE31CCA9E0F32020: {
+    name: "Sankey diagram", rule: "nodes",
+    roles: { Source: "Category", Destination: "Destination", Weight: "Y", SourceLabels: "SourceLabels" },
+    colors: "nodes",
+  },
+  // Word Cloud: a theme colour per word (row order); one colour for all words when set
+  WordCloud1447959067750: {
+    name: "Word cloud", rule: "item",
+    roles: { Category: "Category", Values: "Values", Excludes: "Excludes" },
+    settings: { all: ["dataPoint", "defaultColor", null] },
+  },
+  // Sunburst: a theme colour per top-level group; inner rings inherit their group's colour
+  Sunburst1445472000808: { name: "Sunburst", rule: "item", roles: { Nodes: "Category", Values: "Values" }, colors: "group" },
+  // Aster Plot: a theme colour per slice (row order)
+  AsterPlot1443303142064: { name: "Aster plot", rule: "item", roles: { Category: "Category", Y: "Y" }, colors: "pies" },
+  // Radar Chart: a theme colour per measure (polygon)
+  RadarChart1446119667547: { name: "Radar chart", rule: "measure", roles: { Category: "Category", Y: "Y" } },
+  // Tornado: one fixed colour per side, purple then teal (the AppSource build; its newest source
+  // switches to theme colours), whether the sides are legend values or two measures
+  TornadoChart1452517688218: { name: "Tornado chart", rule: "auto", roles: { Category: "Category", Series: "Series", Values: "Values" },
+    palette: ["#800080", "#008080"] },
+  // Filter visuals: filter chips
+  Timeline1447991079100: { name: "Timeline", rule: "slicer", roles: { Time: "Values" } },
+  textFilter25A4896A83E0487089E2B90C9AE57C8A: { name: "Text filter", rule: "slicer", roles: { field: "Values" } },
+  AttributeSlicer1652434005853: { name: "Attribute slicer", rule: "slicer", roles: { Category: "Values" } },
   // Microsoft's Power Automate button: no data
   FlowVisual_C29F1DCC_81F5_4973_94AD_0517D44CC06A: { name: "Power Automate button", rule: "none", roles: {} },
 };
@@ -96,6 +168,13 @@ function customSetting(type, info, key) {
   if (!c || !c.settings || !c.settings[key]) return null;
   const set = info && info.settings;
   return set && key in set ? set[key] : c.settings[key][2];
+}
+
+/* An AppSource (custom) visual's type name: a name followed by an id (32 hex digits, a GUID
+   written with underscores, or a long number such as "SankeyDiagram1446463184954") */
+function isCustomType(type) {
+  const t = String(type || "");
+  return /[0-9A-F]{32}$/i.test(t) || /_[0-9A-F]{8}_[0-9A-F]{4}_/i.test(t) || /[A-Za-z]\d{12,}$/.test(t);
 }
 
 /* A supported AppSource visual's description, or null */
@@ -616,6 +695,21 @@ function visualColorInfo(visual, theme) {
     total: colorFromFill(sp.totalFill, theme) || theme.dataColors[0],
   } : null;
   // A custom visual's roles as the built-in roles they act like (category, then subcategory…)
+  // An AppSource visual whose colouring isn't known: any colour it stores for one item
+  // (whatever its object is called) counts as that item's colour
+  const generic = !custom && isCustomType(visual.type) && !/^deneb/i.test(visual.type);
+  if (generic) {
+    for (const entries of Object.values(visual.objects || {})) {
+      for (const d of entries || []) {
+        const key = selectorKey(d.selector);
+        if (!key || !key.startsWith("i:")) continue;
+        for (const v of Object.values(d.properties || {})) {
+          const c = colorFromFill(v, theme);
+          if (c && !(key in overrides)) overrides[key] = c;
+        }
+      }
+    }
+  }
   // A custom visual's own settings, as the report sets them (colours resolved, true / false, text)
   const settings = {};
   for (const [k, [obj, prop]] of Object.entries((custom && custom.settings) || {})) {
@@ -631,7 +725,13 @@ function visualColorInfo(visual, theme) {
   const series = (roles.Series || [])[0] || null;
   const measures = MEASURE_ROLES.flatMap((r) => (roles[r] || []).map((m) => ({ ...m, role: r })));
   let rule = "measure";
-  if (custom) rule = custom.rule;
+  if (custom) rule = custom.rule === "auto" ? (series ? "legend" : "measure") : custom.rule;
+  // One colour for every data point unless split by a legend (a custom visual's own default)
+  if (custom && !series && !overrides.all && custom.settings && custom.settings.all) {
+    const all = settings.all || custom.settings.all[2];
+    if (all) overrides.all = all;
+  }
+  else if (generic) rule = "generic";
   else if (COLOR_BY_ITEM_TYPES.includes(visual.type)) rule = "item";
   else if (series) rule = "legend";
   else if (SINGLE_COLOR_TYPES.includes(visual.type)) rule = "single";
