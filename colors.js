@@ -69,7 +69,7 @@ const CUSTOM_VISUALS = {
   // value cells a green bar (red when negative)
   comparisonTable97CE315D158843019602B15CF4A4063F: {
     name: "Comparison table",
-    rule: "table",
+    rule: "table", layout: "grid",   // a row per metric, a column per region (comparisonRows in export.js)
     roles: { metrics: "Rows", regions: "Columns", benchmark: "Values", values: "Values" },
     bars: { benchmark: { color: "#2196F3" }, values: { color: "#4CAF50", negative: "#F44336" } },
     settings: {
@@ -119,10 +119,10 @@ const CUSTOM_VISUALS = {
   },
   // Histogram: every bar one colour
   Histogram1445664487616: {
-    name: "Histogram", rule: "fixed",
+    name: "Histogram", rule: "fixed", layout: "bins",   // its bins, as the visual draws them (histogramRows in export.js)
     roles: { Values: "Category", Frequency: "Frequency" },
     seriesColors: { Frequency: ["fill"] },
-    settings: { fill: ["dataPoint", "fill", "#01B8AA"] },
+    settings: { fill: ["dataPoint", "fill", "#01B8AA"], bins: ["general", "bins", null] },
   },
   // Dual KPI: top and bottom charts in fixed colours (the bottom matches the top by default)
   PBI_CV_3C80B1F2_09AF_4123_8E99_C3CBC46B23E0: {
@@ -496,6 +496,21 @@ async function readTheme(zip, themeCollection) {
  * { type, roles: { Category: [{ ref, label }], Series: [...], Y: [...] … }, dataPoint: [...], titleShown }
  * ref is the normalised field name; label the visual's own name for it when renamed.
  */
+/* A chart's axes as the report sets them: { cat, val } with show (the axis) and title (its
+   title), each true / false, or null when left at Power BI's default (shown) */
+function axisSettings(objects) {
+  const flag = (name, prop) => {
+    const v = (((((objects || {})[name] || [])[0] || {}).properties || {})[prop] || {}).expr;
+    const lit = v && v.Literal && String(v.Literal.Value);
+    return lit === "true" ? true : lit === "false" ? false : null;
+  };
+  return {
+    cat: { show: flag("categoryAxis", "show"), title: flag("categoryAxis", "showAxisTitle") },
+    val: { show: flag("valueAxis", "show"), title: flag("valueAxis", "showAxisTitle") },
+    sec: { show: flag("valueAxis", "secShow"), title: flag("valueAxis", "secShowAxisTitle") },
+  };
+}
+
 /* Whether a visual's title is shown, from its container settings: true / false when the
    report says, null when it leaves the default */
 function titleShown(containerObjects) {
@@ -753,6 +768,7 @@ function visualColorInfo(visual, theme) {
       : custom && custom.rule === "table" ? customTableFormats(custom, visual.roles, settings) : [],
     settings,
     titleHidden: visual.titleShown === false,
+    axes: axisSettings(visual.objects),
     mainValue: (roles[(custom && custom.mainRole) || KPI_VALUE_ROLE[visual.type]] || [])[0] || null,
   };
 }

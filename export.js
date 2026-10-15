@@ -1116,6 +1116,99 @@ function nestedBarsRows(item, info, notes) {
   if (!additive) notes.push(`"${item.title}": each bar's total is averaged from Power BI's rows (a ratio can't be added up), so it may differ slightly from the chart.`);
 }
 
+/*
+ * The Comparison Table draws a grid: a row per metric, its benchmark (the first region's), then
+ * a column per region holding that region's value, each cell with a bar: blue for the
+ * benchmark, green for a value (red when negative). Power BI exports a row per metric and
+ * region, so the rows are rebuilt into that grid and the bars become data bars on its
+ * columns (header colours set in the report still apply). Needs the report file to tell the
+ * benchmark from the values.
+ */
+function comparisonRows(item, info) {
+  const roles = (info && info.roles) || {};
+  const { header, data } = classifyColumns(item.rows);
+  const norm = header.map((h) => normalizeField(h)), lower = header.map((h) => String(h ?? "").trim().toLowerCase());
+  const taken = new Set();
+  const colOf = (f) => {
+    if (!f) return -1;
+    let ci = f.label ? header.findIndex((_, c) => !taken.has(c) && lower[c] === f.label) : -1;
+    if (ci < 0) ci = header.findIndex((_, c) => !taken.has(c) && norm[c] === f.ref);
+    if (ci >= 0) taken.add(ci);
+    return ci;
+  };
+  const metric = colOf((roles.Rows || [])[0]), region = colOf((roles.Columns || [])[0]);
+  const bench = colOf((roles.Values || [])[0]), value = colOf((roles.Values || [])[1]);
+  if (metric < 0 || region < 0 || (bench < 0 && value < 0)) return;
+  const key = (r, ci) => String(r[ci] ?? "").trim();
+  const metrics = [...new Set(data.map((r) => key(r, metric)))];
+  const regions = [...new Set(data.map((r) => key(r, region)))];
+  const cell = (m, g, ci) => { const r = data.find((x) => key(x, metric) === m && key(x, region) === g); return r && ci >= 0 ? r[ci] : ""; };
+  const head = [header[metric], ...(bench >= 0 ? [header[bench]] : []), ...(value >= 0 ? regions.map((g) => g || "(Blank)") : [])];
+  const rows = metrics.map((m) => [m, ...(bench >= 0 ? [cell(m, regions[0], bench)] : []), ...(value >= 0 ? regions.map((g) => cell(m, g, value)) : [])]);
+  item.rows = [head, ...rows];
+  const custom = customVisual(item.type);
+  const bar = (name, b) => ({ target: "m:" + normalizeField(name), kind: "bar", bar: { color: b.color, negative: b.negative || null, axis: null, reverse: false, showValue: true } });
+  item.gridFormat = { measures: [], tableFormats: [
+    ...(bench >= 0 ? [bar(head[1], custom.bars.benchmark)] : []),
+    ...(value >= 0 ? head.slice(bench >= 0 ? 2 : 1).map((g) => bar(g, custom.bars.values)) : []),
+    ...((info && info.tableFormats) || []).filter((f) => f.target === "header"),
+  ] };
+}
+
+/*
+ * The Histogram draws its values in bins, as its code (d3 v5) makes them: the bin count is
+ * the visual's setting, else d3's own (Sturges' rule on a nice step); the bins split the range
+ * from the smallest to the largest value evenly, a value falls in (x0, x1] (the first bin also
+ * takes its lower edge), and each value adds its frequency (the Frequency field, 1 without
+ * one). Power BI exports a row per value, so the rows are rebuilt as one per bin.
+ */
+function histogramRows(item, info) {
+  const { header, data } = classifyColumns(item.rows);
+  const roles = (info && info.roles) || {};
+  const find = (f) => (f ? header.findIndex((h) => normalizeField(h) === f.ref || String(h).trim().toLowerCase() === f.label) : -1);
+  let vc = find((roles.Category || [])[0]), fc = find((roles.Frequency || [])[0]);
+  if (vc < 0) vc = 0;
+  if (fc < 0 && header.length > 1) fc = vc === 0 ? 1 : 0;
+  const num = (x) => { const v = toCellValue(x).value; return typeof v === "number" ? v : null; };
+  const points = data.map((r) => ({ v: num(r[vc]), f: fc >= 0 ? num(r[fc]) : null })).filter((p) => p.v !== null)
+    .map((p) => ({ v: p.v, f: p.f !== null && p.f > 1 ? p.f : 1 }));
+  if (points.length < 2) return;
+  const values = points.map((p) => p.v);
+  const min = Math.min(...values), max = Math.max(...values);
+  if (min === max) return;
+  // d3 v5: tickStep and range, as d3.histogram uses them
+  const tickStep = (a, b, count) => {
+    const step0 = Math.abs(b - a) / Math.max(0, count);
+    let step1 = Math.pow(10, Math.floor(Math.log(step0) / Math.LN10));
+    const error = step0 / step1;
+    if (error >= Math.sqrt(50)) step1 *= 10; else if (error >= Math.sqrt(10)) step1 *= 5; else if (error >= Math.sqrt(2)) step1 *= 2;
+    return b < a ? -step1 : step1;
+  };
+  const range = (a, b, step) => Array.from({ length: Math.max(0, Math.ceil((b - a) / step)) }, (_, i) => a + i * step);
+  const binCount = (thresholds) => {
+    const t = [...thresholds];
+    while (t.length && t[0] <= min) t.shift();
+    while (t.length && t[t.length - 1] > max) t.pop();
+    return t;
+  };
+  const set = Number(String(customSetting(item.type, info, "bins") ?? "").replace(/[LD]$/, ""));
+  let count = set > 0 ? Math.round(set) : 0;
+  if (!count) {
+    const sturges = Math.ceil(Math.log(values.length) / Math.LN2) + 1;
+    const step = tickStep(min, max, sturges);
+    count = binCount(range(Math.ceil(min / step) * step, max, step)).length + 1;
+  }
+  const edges = [min, ...binCount(range(min, max, (max - min) / count)), max];
+  const fmt = (x) => Number(x.toFixed(2)).toLocaleString("en-US", { maximumFractionDigits: 2 });
+  const rows = [];
+  for (let i = 0; i < edges.length - 1; i++) {
+    const [x0, x1] = [edges[i], edges[i + 1]];
+    const freq = points.filter((p) => (i === 0 ? p.v >= x0 : p.v > x0) && p.v <= x1).reduce((a, p) => a + p.f, 0);
+    rows.push([`${fmt(x0)} – ${fmt(x1)}`, String(freq)]);
+  }
+  item.rows = [[`${header[vc]} (bin)`, fc >= 0 ? header[fc] : "Frequency"], ...rows];
+}
+
 /* KPI tiles show a title row only when the title adds something beyond the field name */
 function kpiHasTitle(item) {
   return !!item.displayTitle && item.displayTitle.toLowerCase() !== String(item.rows[0][0] || "").toLowerCase();
@@ -1799,6 +1892,8 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     const info = visualInfo(lay.reportColors, item.page, item.name);
     if (item.isKpi) mainValueFirst(item, info);
     if ((customVisual(item.type) || {}).rule === "nested") nestedBarsRows(item, info, colorNotes);
+    if ((customVisual(item.type) || {}).layout === "grid") comparisonRows(item, info);
+    if ((customVisual(item.type) || {}).layout === "bins") histogramRows(item, info);
     // A title turned off in the report isn't shown either (it is often an internal name such
     // as "TYS Card"): a table is titled from its columns instead, a KPI tile by its label
     const hidden = !!(info && info.titleHidden);
@@ -1810,7 +1905,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     }
     item.displayTitle = title;
     item.colors = lay.palette && !item.isKpi ? columnColors(item, lay.palette, info) : null;
-    item.tableFormat = info && info.tableFormats && info.tableFormats.length ? info : null;
+    item.tableFormat = item.gridFormat || (info && info.tableFormats && info.tableFormats.length ? info : null);
     item.colorInfo = info;
     item.chart = options.visualsAs === "charts" ? chartPlan(item) : null;   // charts mode only
     if (item.chart && item.chart.note) colorNotes.push(item.chart.note);
@@ -2420,7 +2515,8 @@ function chartPlan(item) {
       return additive ? vals.reduce((a, b) => a + b, 0) : vals[0];
     });
   };
-  const base = { spec, title: item.displayTitle || item.title, catName: levelCols.map((c) => header[c]).join(" / "), categories, pointColors: null };
+  const base = { spec, title: item.displayTitle || item.title, catName: levelCols.map((c) => header[c]).join(" / "), categories, pointColors: null,
+    axes: (info && info.axes) || null };
 
   // Pie / donut: one series, a colour per slice
   if (spec.kind === "pie" || spec.kind === "doughnut") {
@@ -2441,17 +2537,29 @@ function chartPlan(item) {
     legendCol = textCols[1];
   }
   if (legendCol >= 0 && legendCol !== catCol) {
-    const vc = valueCols[0];
+    // A combo's legend splits only its column values: its line values (Y2) stay one line
+    // each, on a second axis. A line value repeats on every legend row of a category, so it
+    // is read once per category, not added up.
+    const lines = spec.kind === "combo" && lineCols ? valueCols.filter((ci) => lineCols.includes(ci)) : [];
+    const vc = valueCols.find((ci) => !lines.includes(ci)) ?? valueCols[0];
     const byKey = colors && colors.rowKey && colors.rowKey.col === legendCol ? colors.rowKey.colorOf : null;
     const legends = byKey ? Object.keys(byKey) : seriesOrder(data, legendCol, [catCol]);
+    const once = (ci) => categories.map((c) => {
+      const r = data.find((x) => catOf(x) === c && num(x[ci]) !== null);
+      return r ? num(r[ci]) : null;
+    });
     return {
       ...base,
-      series: legends.map((name) => ({
-        name,
-        values: valuesFor(vc, data.filter((r) => key(r, legendCol) === name)),
-        fmt: formatOf(vc),
-        color: (byKey && byKey[name]) || null,
-      })),
+      valueName: header[vc],
+      series: [
+        ...legends.map((name) => ({
+          name,
+          values: valuesFor(vc, data.filter((r) => key(r, legendCol) === name)),
+          fmt: formatOf(vc),
+          color: (byKey && byKey[name]) || null,
+        })),
+        ...lines.map((ci) => ({ name: header[ci], values: once(ci), fmt: formatOf(ci), color: (colors && colors.series && colors.series[ci]) || null, line: true })),
+      ],
     };
   }
 
@@ -2653,6 +2761,8 @@ function waterfallPlan(item) {
     spec: { kind: "waterfall" },
     title: item.displayTitle || item.title,
     catName: t.header[catCol],
+    valueName: t.header[valueCol],
+    axes: (item.colorInfo && item.colorInfo.axes) || null,
     categories: [...steps.map((s) => s.label), "Total"],
     series: [
       { name: " ", values: base, fmt: ";;;", hidden: true, noLegend: true },   // ";;;" keeps the base out of tooltips
@@ -2874,14 +2984,15 @@ function waterfallXml(plan) {
         return label(i, (v >= 0) !== inside ? "t" : "b", inside ? C.WHITE : C.SLATE, inside);
       }).join("")}${noBox}${flags(false)}</c:dLbls>` : "";
   const line = `<c:ser>${head(4)}<c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:marker><c:symbol val="none"/></c:marker>${labels}${cat}${val(4)}<c:smooth val="0"/></c:ser>`;
+  const titles = axisTitles(plan, [], []);
   // Columns first, so legend entries follow the series order (helper entries are removed by index).
   // The columns use a second axis without labels, running from 0 to the axis height (the shift);
   // the visible axis shows the real values, and both cover the same range.
   return `<c:barChart><c:barDir val="col"/><c:grouping val="stacked"/><c:varyColors val="0"/>${bars}` +
       `<c:gapWidth val="60"/><c:overlap val="100"/><c:axId val="${A3}"/><c:axId val="${A4}"/></c:barChart>` +
     `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>${line}<c:marker val="1"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:lineChart>` +
-    catAxXml(A1, A2, "b") +
-    valAxXml(A2, A1, "l", stepFormat(plan.fmt, axis), { axis }) +
+    catAxXml(A1, A2, "b", { title: titles.cat, hidden: !titles.catShow, count: categories.length }) +
+    valAxXml(A2, A1, "l", stepFormat(plan.fmt, axis), { axis, title: titles.val, hidden: !titles.valShow }) +
     catAxXml(A3, A4, "b", { hidden: true }) +
     valAxXml(A4, A3, "r", "General", { crosses: "max", grid: false, labels: false,
       axis: { min: 0, max: Number((axis.max - axis.min).toFixed(12)), step: axis.step } });
@@ -2977,12 +3088,35 @@ function chartSeriesXml(kind, s, i, plan, ref) {
   const pieLabels = s.pieLabels ? pieLabelsXml(s.pieLabelPos) : "";
   return `<c:ser>${head}${sp}${points}${pieLabels}${cat}${val}</c:ser>`;   // pie, doughnut
 }
-function catAxXml(id, crossId, pos, { reverse = false, hidden = false } = {}) {
+/* A category axis. Every label is drawn (Excel otherwise skips some when it thinks they are
+   crowded, so labels came and went with the chart's size); up to 60 categories, beyond which
+   Excel's own spacing reads better */
+function catAxXml(id, crossId, pos, { reverse = false, hidden = false, title = null, count = 0 } = {}) {
   return `<c:catAx><c:axId val="${id}"/><c:scaling><c:orientation val="${reverse ? "maxMin" : "minMax"}"/></c:scaling>` +
-    `<c:delete val="${hidden ? 1 : 0}"/><c:axPos val="${pos}"/><c:numFmt formatCode="General" sourceLinked="1"/>` +
+    `<c:delete val="${hidden ? 1 : 0}"/><c:axPos val="${pos}"/>` + (title && !hidden ? axisTitleXml(title) : "") +
+    `<c:numFmt formatCode="General" sourceLinked="1"/>` +
     `<c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="low"/>` +
     `<c:spPr><a:ln w="9525">${fillXml(C.RULE)}</a:ln></c:spPr>` +
-    `<c:crossAx val="${crossId}"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/><c:noMultiLvlLbl val="0"/></c:catAx>`;
+    `<c:crossAx val="${crossId}"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/>` +
+    (count && count <= 60 && !hidden ? `<c:tickLblSkip val="1"/>` : "") + `<c:noMultiLvlLbl val="0"/></c:catAx>`;
+}
+
+/* A chart's axis titles as Power BI draws them by default: the category field, and the value
+   fields ("Last Year Sales and This Year Sales"); a title or axis the report turns off isn't
+   drawn. Returns { cat, val, sec, catShow, valShow, secShow } */
+function axisTitles(plan, main, lines) {
+  const a = plan.axes || {};
+  const on = (x, key) => !x || x[key] !== false;
+  const names = (list) => {
+    const n = [...new Set(list.map(([s]) => s.name))];
+    return n.length <= 2 ? n.join(" and ") : `${n.slice(0, -1).join(", ")} and ${n[n.length - 1]}`;
+  };
+  return {
+    catShow: on(a.cat, "show"), valShow: on(a.val, "show"), secShow: on(a.sec, "show"),
+    cat: on(a.cat, "show") && on(a.cat, "title") ? plan.catName : null,
+    val: on(a.val, "show") && on(a.val, "title") ? plan.valueName || names(main) : null,
+    sec: lines.length && on(a.sec, "show") && on(a.sec, "title") ? names(lines) : null,
+  };
 }
 
 function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true, hidden = false, title = null, axis = null, labels = true } = {}) {
@@ -3039,14 +3173,16 @@ function chartXml(plan) {
         `<c:axId val="${A1}"/><c:axId val="${A2}"/></c:areaChart>`;
     }
     // A funnel hides its value axis and gridlines: the offsets would make the numbers misleading
-    let axes = catAxXml(A1, A2, horizontal ? "l" : "b", { reverse: horizontal }) +
-      valAxXml(A2, A1, horizontal ? "b" : "l", valFmt, { crosses: horizontal ? "max" : "autoZero", grid: !spec.hideValueAxis, hidden: !!spec.hideValueAxis });
+    const titles = axisTitles(plan, main, lines);
+    let axes = catAxXml(A1, A2, horizontal ? "l" : "b", { reverse: horizontal, title: titles.cat, hidden: !titles.catShow, count: plan.categories.length }) +
+      valAxXml(A2, A1, horizontal ? "b" : "l", valFmt, { crosses: horizontal ? "max" : "autoZero", grid: !spec.hideValueAxis,
+        hidden: !!spec.hideValueAxis || !titles.valShow, title: spec.hideValueAxis ? null : titles.val });
     if (lines.length) {
       groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
         lines.map(([s, i]) => chartSeriesXml("line", s, i, plan, refs.series[i])).join("") +
         `<c:marker val="1"/><c:axId val="${A3}"/><c:axId val="${A4}"/></c:lineChart>`;
       const lineFmt = axisFormat(lines[0][0].fmt, lines.flatMap(([s]) => s.values));
-      axes += catAxXml(A3, A4, "b", { hidden: true }) + valAxXml(A4, A3, "r", lineFmt, { crosses: "max", grid: false });
+      axes += catAxXml(A3, A4, "b", { hidden: true }) + valAxXml(A4, A3, "r", lineFmt, { crosses: "max", grid: false, hidden: !titles.secShow, title: titles.sec });
     }
     body = groups + axes;
   }
