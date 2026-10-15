@@ -2607,30 +2607,64 @@ function waterfallPlan(item) {
   if (!steps.length) return null;
   const w = (item.colorInfo && item.colorInfo.waterfall) || {};
   const up = toArgb(w.increase || "#1AAB40"), down = toArgb(w.decrease || "#D64554"), total = toArgb(w.total || "#118DFF");
-  const n = steps.length;
-  const blanks = () => new Array(n + 1).fill(null);
-  // Each step runs from the running total before it (Start) to the running total after it (End)
-  const start = blanks(), end = blanks(), totals = blanks();
-  let running = 0;
-  steps.forEach((s, i) => { start[i] = running; running += s.value; end[i] = running; });
-  totals[n] = running;
   const fmt = t.formatOf(valueCol);
+  const negFmt = `"-"${fmt}`;   // a decrease is stored as its size and shown with a minus: -25.36%
+  const starts = [], ends = [];
+  let running = 0;
+  steps.forEach((s) => { starts.push(running); running += s.value; ends.push(running); });
+  // The axis like Power BI's (-40% to 20% in 20% steps), ending exactly on a step
+  const size = chartSizePx(item);
+  const axis = niceAxis([0, ...starts, ...ends], size.h - 100, 45, 0) || { min: Math.min(0, ...ends), max: Math.max(0, ...ends), step: 0 };
+  const tidy = (x) => Number(x.toFixed(12));
   const d = item.colorInfo && item.colorInfo.display;
+  const showLabels = !(d && d.labels && d.labels.show === false);   // labels on unless switched off in the report
+  // Each label needs room outside its bar (above an increase, below a decrease). Where the
+  // axis edge leaves too little, the label goes inside the end of the bar in white, as Power
+  // BI does; a bar too short to hold it makes the axis one step longer instead. The total is
+  // labelled inside its bar when it is tall enough, like Power BI.
+  const points = [...steps.map((s, i) => ({ v: s.value, end: ends[i], total: false })), { v: running, end: running, total: true }];
+  const inside = points.map(() => false);
+  if (showLabels && axis.step) {
+    const plotPx = Math.max(60, size.h - 100), LABEL_PX = 16;   // the plot's height; a label's height
+    const px = (v) => (Math.abs(v) * plotPx) / (axis.max - axis.min);
+    points.forEach((p, i) => {
+      const tall = px(p.v) >= LABEL_PX + 4;
+      if (p.total && tall) { inside[i] = true; return; }
+      const room = p.v >= 0 ? axis.max - p.end : p.end - axis.min;
+      if (px(room) >= LABEL_PX) return;
+      if (tall) inside[i] = true;
+      else if (p.v >= 0) axis.max = tidy(axis.max + axis.step);
+      else axis.min = tidy(axis.min - axis.step);
+    });
+  }
+  // Every bar is drawn as ONE column holding the step's real size, so hovering shows the true
+  // value. The columns stand on an invisible base, measured from the bottom of the axis
+  // (shift), which keeps every value above zero: a step that crosses zero is never split.
+  const shift = -axis.min;
+  const base = [], inc = [], dec = [], tot = [];
+  steps.forEach((s, i) => {
+    base.push(tidy(Math.min(starts[i], ends[i]) + shift));
+    inc.push(s.value >= 0 ? tidy(s.value) : null);
+    dec.push(s.value < 0 ? tidy(-s.value) : null);
+    tot.push(null);
+  });
+  base.push(tidy(Math.min(0, running) + shift)); inc.push(null); dec.push(null); tot.push(tidy(Math.abs(running)));
   return {
     spec: { kind: "waterfall" },
     title: item.displayTitle || item.title,
     catName: t.header[catCol],
     categories: [...steps.map((s) => s.label), "Total"],
     series: [
-      { name: "Increase", values: blanks(), fmt, color: up },
-      { name: "Decrease", values: blanks(), fmt, color: down },
-      { name: "Total", values: totals, fmt, color: total },
-      { name: "Start", values: start, fmt, hidden: true, noLegend: true },
-      { name: "End", values: end, fmt, hidden: true, noLegend: true },
+      { name: " ", values: base, fmt: ";;;", hidden: true, noLegend: true },   // ";;;" keeps the base out of tooltips
+      { name: "Increase", values: inc, fmt, color: up },
+      { name: "Decrease", values: dec, fmt: negFmt, color: down },
+      { name: "Total", values: tot, fmt: running < 0 ? negFmt : fmt, color: total },
+      { name: t.header[valueCol], values: [...ends, running], fmt, hidden: true, noLegend: true },   // carries the labels
     ],
     steps: [...steps.map((s) => s.value), running],
-    up, down, fmt,
-    showLabels: !(d && d.labels && d.labels.show === false),   // labels on unless switched off in the report
+    axis, fmt,
+    showLabels,
+    labelInside: inside,   // per bar: label inside the bar's end (white) instead of beside it
     labelPrecision: d && d.labels ? d.labels.precision : undefined,
     pointColors: null,
   };
@@ -2767,7 +2801,7 @@ function scatterFields(t, item, info, nums) {
 
 /* Axis range and step like Power BI's automatic axes: the step is the first of 1, 2, 5, 10…
    that leaves room for each label (minGapPx between gridlines on a plot plotPx long) */
-function niceAxis(values, plotPx, minGapPx) {
+function niceAxis(values, plotPx, minGapPx, pad = 0.03) {
   const v = (values || []).filter((x) => typeof x === "number" && isFinite(x));
   if (!v.length || !plotPx) return null;
   let lo = Math.min(...v), hi = Math.max(...v);
@@ -2777,8 +2811,9 @@ function niceAxis(values, plotPx, minGapPx) {
   const p = Math.pow(10, Math.floor(Math.log10(padded / most)));
   const step = [1, 2, 5, 10, 20, 50, 100].map((m) => m * p).find((s) => padded / s <= most) || 100 * p;
   const tidy = (x) => Number(x.toFixed(12));
-  let min = tidy(Math.floor((lo - range * 0.03) / step + 1e-9) * step);
-  const max = tidy(Math.ceil((hi + range * 0.03) / step - 1e-9) * step);
+  // pad: room beyond the data (bubbles need some; waterfall bars end exactly on a step)
+  let min = tidy(Math.floor((lo - range * pad) / step + 1e-9) * step);
+  const max = tidy(Math.ceil((hi + range * pad) / step - 1e-9) * step);
   if (lo >= 0 && min < 0) min = 0;
   return { min, max, step: tidy(step) };
 }
@@ -2813,33 +2848,43 @@ function waterfallLabel(v, fmt, precision) {
  * total is a normal column. Labels show each step's value, like Power BI.
  */
 function waterfallXml(plan) {
-  const { series, refs, categories } = plan;
-  const A1 = 50210, A2 = 50220;
+  const { series, refs, categories, axis } = plan;
+  const A1 = 50210, A2 = 50220, A3 = 50230, A4 = 50240;
   const last = categories.length - 1;
   const noBox = `<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>`;
   const flags = (show) => `<c:showLegendKey val="0"/><c:showVal val="${show ? 1 : 0}"/><c:showCatName val="0"/><c:showSerName val="0"/><c:showPercent val="0"/><c:showBubbleSize val="0"/>`;
-  const label = (i, pos) => `<c:dLbl><c:idx val="${i}"/><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>` +
-    `${xmlEsc(waterfallLabel(plan.steps[i], plan.fmt, plan.labelPrecision))}</a:t></a:r></a:p></c:rich></c:tx>${noBox}<c:dLblPos val="${pos}"/>${flags(true)}</c:dLbl>`;
+  // Small labels like Power BI's: 8pt grey beside a bar, white bold inside one
+  const label = (i, pos, argb, bold) => `<c:dLbl><c:idx val="${i}"/><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="800"/></a:pPr>` +
+    `<a:r><a:rPr lang="en-US" sz="800" b="${bold ? 1 : 0}">${fillXml(argb)}</a:rPr><a:t>${xmlEsc(waterfallLabel(plan.steps[i], plan.fmt, plan.labelPrecision))}</a:t></a:r></a:p></c:rich></c:tx>` +
+    `${noBox}<c:dLblPos val="${pos}"/>${flags(true)}</c:dLbl>`;
   const cat = `<c:cat><c:strRef><c:f>${xmlEsc(refs.catRef)}</c:f>${strCacheXml(categories.map(keyLabel))}</c:strRef></c:cat>`;
   const head = (i) => `<c:idx val="${i}"/><c:order val="${i}"/>` +
     `<c:tx><c:strRef><c:f>${xmlEsc(refs.series[i].nameRef)}</c:f>${strCacheXml([series[i].name])}</c:strRef></c:tx>`;
   const val = (i) => `<c:val><c:numRef><c:f>${xmlEsc(refs.series[i].valRef)}</c:f>${numCacheXml(series[i].values, series[i].fmt)}</c:numRef></c:val>`;
-  // Increase and Decrease are empty columns: they only put the two colours in the legend
-  const totalLabel = plan.showLabels ? `<c:dLbls>${label(last, "inBase")}${noBox}${flags(false)}</c:dLbls>` : "";
-  const bars = [0, 1, 2].map((i) => `<c:ser>${head(i)}<c:spPr>${fillXml(series[i].color)}</c:spPr><c:invertIfNegative val="0"/>` +
-    `${i === 2 ? totalLabel : ""}${cat}${val(i)}</c:ser>`).join("");
-  const stepLabels = plan.showLabels
-    ? `<c:dLbls>${plan.steps.slice(0, last).map((v, i) => label(i, v >= 0 ? "t" : "b")).join("")}${noBox}${flags(false)}</c:dLbls>` : "";
-  const line = (i, labels) => `<c:ser>${head(i)}<c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:marker><c:symbol val="none"/></c:marker>` +
-    `${labels}${cat}${val(i)}<c:smooth val="0"/></c:ser>`;
+  const bars = [0, 1, 2, 3].map((i) => {
+    const sp = series[i].hidden ? noBox : `<c:spPr>${fillXml(series[i].color)}<a:ln><a:noFill/></a:ln></c:spPr>`;
+    return `<c:ser>${head(i)}${sp}<c:invertIfNegative val="0"/>${cat}${val(i)}</c:ser>`;
+  }).join("");
+  // Labels sit on an invisible line through each bar's end value, on the visible axis: beside
+  // the bar (above an increase, below a decrease), or inside its end in white where the axis
+  // edge leaves no room, so a label never runs into the axis labels
+  const labels = plan.showLabels
+    ? `<c:dLbls>${plan.steps.map((v, i) => {
+        const inside = plan.labelInside ? plan.labelInside[i] : i === last;
+        return label(i, (v >= 0) !== inside ? "t" : "b", inside ? C.WHITE : C.SLATE, inside);
+      }).join("")}${noBox}${flags(false)}</c:dLbls>` : "";
+  const line = `<c:ser>${head(4)}<c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:marker><c:symbol val="none"/></c:marker>${labels}${cat}${val(4)}<c:smooth val="0"/></c:ser>`;
+  // Columns first, so legend entries follow the series order (helper entries are removed by index).
+  // The columns use a second axis without labels, running from 0 to the axis height (the shift);
+  // the visible axis shows the real values, and both cover the same range.
   return `<c:barChart><c:barDir val="col"/><c:grouping val="stacked"/><c:varyColors val="0"/>${bars}` +
-      `<c:gapWidth val="60"/><c:overlap val="100"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:barChart>` +
-    `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>${line(3, "")}${line(4, stepLabels)}` +
-      `<c:upDownBars><c:gapWidth val="60"/><c:upBars><c:spPr>${fillXml(plan.up)}</c:spPr></c:upBars>` +
-      `<c:downBars><c:spPr>${fillXml(plan.down)}</c:spPr></c:downBars></c:upDownBars>` +
-      `<c:marker val="1"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:lineChart>` +
+      `<c:gapWidth val="60"/><c:overlap val="100"/><c:axId val="${A3}"/><c:axId val="${A4}"/></c:barChart>` +
+    `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>${line}<c:marker val="1"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:lineChart>` +
     catAxXml(A1, A2, "b") +
-    valAxXml(A2, A1, "l", axisFormat(plan.fmt, [...series[3].values, ...series[4].values, ...series[2].values]));
+    valAxXml(A2, A1, "l", stepFormat(plan.fmt, axis), { axis }) +
+    catAxXml(A3, A4, "b", { hidden: true }) +
+    valAxXml(A4, A3, "r", "General", { crosses: "max", grid: false, labels: false,
+      axis: { min: 0, max: Number((axis.max - axis.min).toFixed(12)), step: axis.step } });
 }
 
 /* Writes every chart's numbers on the page's "Data" sheet and records the cell ranges */
@@ -2940,12 +2985,12 @@ function catAxXml(id, crossId, pos, { reverse = false, hidden = false } = {}) {
     `<c:crossAx val="${crossId}"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/><c:noMultiLvlLbl val="0"/></c:catAx>`;
 }
 
-function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true, hidden = false, title = null, axis = null } = {}) {
+function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true, hidden = false, title = null, axis = null, labels = true } = {}) {
   const bounds = axis ? `<c:max val="${axis.max}"/><c:min val="${axis.min}"/>` : "";
   return `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/>${bounds}</c:scaling><c:delete val="${hidden ? 1 : 0}"/><c:axPos val="${pos}"/>` +
     (grid ? `<c:majorGridlines><c:spPr><a:ln w="6350">${fillXml(C.HAIR)}</a:ln></c:spPr></c:majorGridlines>` : "") +
     (title ? axisTitleXml(title) : "") +
-    `<c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/>` +
+    `<c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="${labels ? "nextTo" : "none"}"/>` +
     `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:crossAx val="${crossId}"/><c:crosses val="${crosses}"/><c:crossBetween val="between"/>` +
     (axis ? `<c:majorUnit val="${axis.step}"/>` : "") + `</c:valAx>`;
 }
