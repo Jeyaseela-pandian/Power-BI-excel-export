@@ -44,7 +44,9 @@ const KPI_VALUE_ROLE = { gauge: "Y", kpi: "Indicator" };   // the main value; th
    - settings: { key: [object, property, default] } other settings read from the report
    - rule: how the export shows it: "rings" (double donut), "nested" (outer / inner bars),
      "table" (a table, with the visual's cell bars as data bars), "kpi" (a KPI tile; mainRole
-     is its main value), "slicer" (a filter chip), "none" (no data: skipped quietly) */
+     is its main value), "slicer" (a filter chip), "none" (no data: skipped quietly)
+   - layout: how its rows are rebuilt to read like the visual: "grid" (comparison table),
+     "bins" (histogram), "trend" (trend cards with sparklines above the table: Dual KPI) */
 const CUSTOM_VISUALS = {
   // NeenOpal's Double Donut Chart: categories on the inner ring, their subcategories on the outer ring
   doubleDonut2B2DE03D219E04DFF80684A45ECA4D25E: {
@@ -126,10 +128,26 @@ const CUSTOM_VISUALS = {
   },
   // Dual KPI: top and bottom charts in fixed colours (the bottom matches the top by default)
   PBI_CV_3C80B1F2_09AF_4123_8E99_C3CBC46B23E0: {
-    name: "Dual KPI", rule: "fixed",
-    roles: { axis: "Category", topvalues: "topvalues", bottomvalues: "bottomvalues", warningstate: "warningstate" },
+    name: "Dual KPI", rule: "fixed", layout: "trend",   // two trend cards (dualKpiTrend in export.js)
+    roles: { axis: "Category", topvalues: "topvalues", bottomvalues: "bottomvalues", warningstate: "warningstate",
+      toppercentdate: "toppercentdate", bottompercentdate: "bottompercentdate" },
     seriesColors: { topvalues: ["top"], bottomvalues: ["bottom", "top"] },
-    settings: { top: ["dualKpiColors", "dataColor", "#01B8AA"], bottom: ["dualKpiColorsBottom", "dataColor", null] },
+    settings: {
+      top: ["dualKpiColors", "dataColor", "#01B8AA"], bottom: ["dualKpiColorsBottom", "dataColor", null],
+      matchBottom: ["dualKpiColorsBottom", "matchTopChartOptions", true],
+      showTop: ["dualKpiProperties", "topChartShow", true], showBottom: ["dualKpiProperties", "bottomChartShow", true],
+      titleText: ["dualKpiProperties", "titleText", ""],
+      abbreviate: ["dualKpiProperties", "abbreviateValues", false],
+      topStart: ["dualKpiProperties", "topPercentCalcDate", ""], bottomStart: ["dualKpiProperties", "bottomPercentCalcDate", ""],
+      warningText: ["dualKpiProperties", "warningTooltipText", ""],
+      staleWarning: ["dualKpiProperties", "showStaleDataWarning", true], staleDays: ["dualKpiProperties", "staleDataThreshold", 2],
+      staleText: ["dualKpiProperties", "staleDataTooltipText", ""],
+      showTopValue: ["dualKpiValues", "showKpiValuesTop", true], showBottomValue: ["dualKpiValues", "showKpiValuesBottom", true],
+      topDefault: ["dualKpiValues", "topChartDefaultKpiValue", "N/A"], bottomDefault: ["dualKpiValues", "bottomChartDefaultKpiValue", "N/A"],
+      units: ["dualKpiValueFormatting", "displayUnits", 1], precision: ["dualKpiValueFormatting", "precision", 0],
+      topMin: ["dualKpiAxis", "topChartAxisMin", null], topMax: ["dualKpiAxis", "topChartAxisMax", null],
+      bottomMin: ["dualKpiAxis", "bottomChartAxisMin", null], bottomMax: ["dualKpiAxis", "bottomChartAxisMax", null],
+    },
   },
   // Sankey: a theme colour per node name (sources first, then destination-only nodes; the
   // visual's code skips the 2nd palette slot); links grey

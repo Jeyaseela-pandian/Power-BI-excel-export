@@ -56,6 +56,7 @@ const NEUTRAL_ACCENT = "FF1F3A5F";   // deep navy: the "match the report" accent
 const MIN_RULE_CONTRAST = 2;         // accent rules and caps stay at least this visible on white
 const ROW_H = 18;          // the row grid, in points
 const HEAD_ROWS = 3;       // exhibit title, caption, table header
+const TREND_ROWS = 4;      // a trend card: label, value (two rows) beside its sparkline, change
 const CONTENT_COL = 2;     // everything starts at column B; column A is the margin
 const MARGIN_W = 3;
 const GUTTER_W = 3;
@@ -155,6 +156,7 @@ function makeFonts(titleFont) {
     kpiSubLabel: f(9, C.SLATE),
     kpiSubValue: f(10, C.TEXT, { bold: true }),
     kpiExact: f(9, C.SLATE),
+    kpiChange: f(10, C.INK, { bold: true }),
     noteCount: f(9, C.TEXT, { bold: true }),
     noteText: f(9, C.MUTED),
     notesHead: f(9, C.SLATE, { bold: true }),
@@ -1209,16 +1211,191 @@ function histogramRows(item, info) {
   item.rows = [[`${header[vc]} (bin)`, fc >= 0 ? header[fc] : "Frequency"], ...rows];
 }
 
+/* ── Trend cards ──────────────────────────────────────────────────────────
+ * A KPI drawn with its trend becomes a card per value field above the visual's data table:
+ * the latest value, its change, and an Excel sparkline of the values over time (added to the
+ * finished file by addSparklinesToFile). item.trend:
+ *   { dateCol, points, cards: [{ col, label, value, numFmt, text, change, since, color, min, max }],
+ *     caption: { title, days, from, to, stale, staleText, warning } }
+ * The rows are put in date order, rows without a date last, so each sparkline reads the
+ * first `points` data rows.
+ */
+
+/* Dual KPI's percentages: one decimal, cut (not rounded), "+" when asked */
+function dualKpiPercent(v, sign) {
+  return `${sign && v >= 0 ? "+" : ""}${Math.floor(v * 10) / 10}%`;
+}
+
+/* d3's ".3s" (1.19k): three significant digits and an SI unit, as an Excel format for this
+   value, and as text */
+function siUnit(value) {
+  const a = Math.abs(value);
+  return a >= 1e12 ? [1e12, ",,,,", "T"] : a >= 1e9 ? [1e9, ",,,", "G"] : a >= 1e6 ? [1e6, ",,", "M"] : a >= 1e3 ? [1e3, ",", "k"] : [1, "", ""];
+}
+function siFormat(value) {
+  const [div, commas, unit] = siUnit(value);
+  const a = Math.abs(value) / div;
+  const dec = 3 - (a >= 100 ? 3 : a >= 10 ? 2 : 1);
+  return `0${dec ? "." + "0".repeat(dec) : ""}${commas}${unit ? `"${unit}"` : ""}`;
+}
+function siText(value) {
+  const [div, , unit] = siUnit(value);
+  return (value / div).toPrecision(3) + unit;
+}
+
+/* A number format with `places` decimals, shown in thousands / millions … (Power BI's display
+   units: 1 none, 0 auto, else the unit) */
+const DISPLAY_UNITS = [[1e12, ",,,,", "T"], [1e9, ",,,", "bn"], [1e6, ",,", "M"], [1e3, ",", "K"]];
+function displayUnit(units, value) {
+  if (units === 0) return DISPLAY_UNITS.find(([u]) => Math.abs(value) >= u) || null;
+  return DISPLAY_UNITS.find(([u]) => u === units) || null;
+}
+function unitsFormat(fmt, places, unit) {
+  const tail = (places > 0 ? "." + "0".repeat(places) : "") + (unit ? `${unit[1]}"${unit[2]}"` : "");
+  return (fmt || "#,##0").split(";").map((section) => section.replace(/(#,##0|0)(\.0+)?/, `$1${tail}`)).join(";");
+}
+
+/*
+ * Dual KPI draws two charts, one per value field (top and bottom), each with the field's
+ * latest value and its change since the first date (or the "% change start date" set in the
+ * visual or given as a field); "Last N days" spans the first to the last date. Its code skips
+ * rows without a date and sorts the rest by date. Percent fields show the change in points.
+ */
+function dualKpiTrend(item, info, colorsOn) {
+  const set = (key) => customSetting(item.type, info, key);
+  const num = (x) => {
+    const n = Number(String(x ?? "").replace(/[LDM]$/i, ""));
+    return x === null || x === undefined || x === "" || !Number.isFinite(n) ? null : n;
+  };
+  const { header, data, numeric } = classifyColumns(item.rows);
+  const dayFirst = dayFirstColumns(header, data);
+  const cells = data.map((row) => header.map((_, ci) => toCellValue(row[ci], dayFirst[ci])));
+  const formats = readableFormats(header, cells);
+  const roles = (info && info.roles) || {};
+  const lower = header.map((h) => String(h ?? "").trim().toLowerCase());
+  const taken = new Set();
+  const colOf = (f) => {
+    if (!f) return -1;
+    let ci = f.label ? lower.findIndex((h, c) => !taken.has(c) && h === f.label) : -1;
+    if (ci < 0) ci = header.findIndex((h, c) => !taken.has(c) && normalizeField(h) === f.ref);
+    return ci;
+  };
+  const isDate = (ci) => cells.some((r) => r[ci].value instanceof Date) && cells.every((r) => r[ci].value === null || r[ci].value instanceof Date);
+
+  // The axis: the visual's field, else the first column of dates
+  let dateCol = colOf((roles.Category || [])[0]);
+  if (dateCol < 0 || !isDate(dateCol)) dateCol = header.findIndex((_, ci) => isDate(ci));
+  if (dateCol < 0) return;
+  taken.add(dateCol);
+  const fieldCol = (role) => { const ci = colOf((roles[role] || [])[0]); if (ci >= 0) taken.add(ci); return ci; };
+  const startCols = { top: fieldCol("toppercentdate"), bottom: fieldCol("bottompercentdate") };
+  const warnCol = fieldCol("warningstate");
+  // The values: the visual's fields, else (without the report file) the first two number columns
+  const valueCol = (role) => {
+    if (info && !(roles[role] || []).length) return -1;
+    let ci = colOf((roles[role] || [])[0]);
+    if (ci < 0) ci = header.findIndex((_, c) => numeric[c] && !taken.has(c));
+    if (ci >= 0) taken.add(ci);
+    return ci;
+  };
+  const cols = { top: valueCol("topvalues"), bottom: valueCol("bottomvalues") };
+
+  const points = cells.map((r, i) => ({ i, date: r[dateCol].value })).filter((p) => p.date instanceof Date)
+    .sort((a, b) => a.date - b.date || a.i - b.i);
+  if (!points.length) return;
+
+  const DAY = 86400000;
+  const daysBetween = (a, b) => Math.round(Math.abs(a - b) / DAY);
+  const first = points[0].date, last = points[points.length - 1].date;
+  const topColor = colorsOn ? set("top") || "#01B8AA" : null;
+  const colors = { top: topColor, bottom: colorsOn ? (set("matchBottom") !== false ? topColor : set("bottom") || topColor) : null };
+
+  const cards = [];
+  for (const pos of ["top", "bottom"]) {
+    const ci = cols[pos];
+    if (ci < 0 || set(pos === "top" ? "showTop" : "showBottom") === false) continue;
+    const fmt = formats[ci] || cells[points[points.length - 1].i][ci].numFmt || null;
+    const asPercent = /%/.test(fmt || "");
+    // The visual reads a blank as 0, and a percent field in percent points
+    const values = points.map((p) => { const v = cells[p.i][ci].value; return (typeof v === "number" ? v : 0) * (asPercent ? 100 : 1); });
+    const latest = values[values.length - 1];
+
+    // The change's start: the last date on or before the start date (from the field, else the setting), else the first
+    const given = startCols[pos] >= 0 && cells.length ? cells[0][startCols[pos]].value : null;
+    const typed = String(set(pos === "top" ? "topStart" : "bottomStart") || "").trim();
+    const calc = given instanceof Date ? given : typed ? (parseDate(typed) || {}).date || null : null;
+    let k = 0;
+    if (calc) {
+      for (let i = 0; i < points.length; i++) {
+        const t = points[i].date.getTime();
+        if (t === calc.getTime()) { k = i; break; }
+        if (t < calc.getTime()) k = i; else break;
+      }
+    }
+    const start = values[k];
+    let change;
+    if (asPercent) change = dualKpiPercent(latest - start, true);
+    else if (start === 0) change = "n/a";
+    else change = dualKpiPercent((latest < start ? -1 : 1) * Math.abs((latest - start) / start) * 100, true);
+
+    // The latest value as the visual formats it: its decimal places and display units, or abbreviated
+    const raw = cells[points[points.length - 1].i][ci].value;
+    let value = raw, numFmt = null, text;
+    if (set(pos === "top" ? "showTopValue" : "showBottomValue") === false) {
+      value = text = String(set(pos === "top" ? "topDefault" : "bottomDefault") ?? "N/A");
+      change = "";
+    } else if (typeof raw !== "number") {
+      value = text = "(Blank)";
+    } else if (asPercent) {
+      numFmt = "0.0%";
+      text = dualKpiPercent(latest, false);
+    } else if (set("abbreviate") === true) {
+      numFmt = siFormat(raw);
+      text = siText(raw);
+    } else {
+      const places = Math.min(17, Math.max(0, num(set("precision")) ?? 0));
+      const unit = displayUnit(num(set("units")) ?? 1, raw);
+      numFmt = unitsFormat(fmt, places, unit);
+      text = displayText(unit ? raw / unit[0] : raw, unitsFormat(fmt, places, null)) + (unit ? unit[2] : "");
+    }
+    const axis = (key) => { const v = num(set(pos + key)); return v === null ? null : asPercent ? v / 100 : v; };
+    cards.push({ col: ci, label: header[ci], value, numFmt, text, change, since: change ? dateText(points[k].date) : "",
+      color: colors[pos], min: axis("Min"), max: axis("Max") });
+  }
+  if (!cards.length) return;
+
+  const title = String(set("titleText") || "").trim();
+  const age = daysBetween(last.getTime(), Date.now());
+  const warn = warnCol >= 0 && cells.length ? cells[cells.length - 1][warnCol].value : null;
+  const dated = new Set(points.map((p) => p.i));
+  item.rows = [header, ...points.map((p) => data[p.i]), ...data.filter((_, i) => !dated.has(i))];
+  item.trend = {
+    dateCol, points: points.length, cards,
+    caption: {
+      title: title && title !== "Title" ? title : null,   // "Title" is the visual's placeholder
+      days: daysBetween(first.getTime(), last.getTime()), from: dateText(first), to: dateText(last),
+      stale: set("staleWarning") !== false && age >= (num(set("staleDays")) ?? 2) ? age : null,
+      staleText: String(set("staleText") || "").trim(),
+      warning: typeof warn === "number" && warn < 0 ? String(set("warningText") || "").trim() || "Warning message" : null,
+    },
+  };
+}
+
 /* KPI tiles show a title row only when the title adds something beyond the field name */
 function kpiHasTitle(item) {
   return !!item.displayTitle && item.displayTitle.toLowerCase() !== String(item.rows[0][0] || "").toLowerCase();
 }
 
+/* Rows an exhibit takes above its data rows: title, caption, [trend cards and a blank row], header */
+function headRows(item) {
+  return HEAD_ROWS + (item.trend ? item.trend.cards.length * TREND_ROWS + 1 : 0);
+}
+
 /*
  * Size of a visual's block in rows / columns.
  *  - KPI tile: [title] + label + value (2 rows) + [exact value] + one row per extra field
- *  - exhibit: title + caption + header + data rows + closing row (the closing rule, which
- *    doubles as the "rows grouped" note when collapsing is on)
+ *  - exhibit: title + caption + [trend cards] + header + data rows + closing row (the closing
+ *    rule, which doubles as the "rows grouped" note when collapsing is on)
  */
 function blockSize(item, options) {
   if (item.chart) return chartBlockSize(item);   // charts mode: the chart's own size
@@ -1232,7 +1409,7 @@ function blockSize(item, options) {
   }
   const n = item.rows.length - 1;
   const note = !!(options.collapse && n > options.visibleRows);
-  return { width: item.rows[0].length, height: HEAD_ROWS + n + 1, note };
+  return { width: item.rows[0].length, height: headRows(item) + n + 1, note };
 }
 
 /*
@@ -1419,6 +1596,76 @@ function captionRuns(item, colors, header, fonts, units) {
   return runs.length ? runs : plain;
 }
 
+/* A trend visual's caption: its title, the days it spans and its dates, and its warnings */
+function trendCaptionRuns(trend, fonts) {
+  const c = trend.caption;
+  return [
+    c.title ? [c.title + "  ·  ", fonts.caption] : null,
+    [`Last ${c.days} day${c.days === 1 ? "" : "s"}`, fonts.caption],
+    [`  ·  ${c.from} – ${c.to}`, fonts.caption],
+    c.stale !== null ? [`  ·  latest data ${c.stale} days old${c.staleText ? ". " + c.staleText : ""}`, fonts.captionMore] : null,
+    c.warning ? [`  ·  ⚠ ${c.warning}`, fonts.kpiChange] : null,
+  ];
+}
+
+/*
+ * Trend cards, one under the other, as wide as the table beneath:
+ *   TOTAL SALES
+ *   $1,192        ╱╲_╱‾╲_   (an Excel sparkline of the values, over a date axis)
+ *   +27.2%  since 1/15/2023
+ * The cap takes the chart's colour (the brand accent without the report's colours); the
+ * sparkline reads the table's first `trend.points` rows (hr: the table's header row).
+ */
+function writeTrendCards(ws, r, col, w, item, widths, lay, hr) {
+  const fonts = lay.fonts, trend = item.trend;
+  const range = (ci) => `'${lay.sheetName}'!${ws.getCell(hr + 1, col + ci).address}:${ws.getCell(hr + trend.points, col + ci).address}`;
+  let needLeft = 12, needLabel = 0;
+  trend.cards.forEach((card, k) => {
+    const a = r + k * TREND_ROWS;
+    const color = card.color ? readableOnWhite(toArgb(card.color)) : lay.accent.cap;
+
+    const label = ws.getCell(a, col);
+    label.value = String(card.label ?? "").toLocaleUpperCase();
+    label.font = fonts.kpiLabel;
+    label.alignment = { vertical: "bottom", indent: 1 };
+
+    ws.mergeCellsWithoutStyle(a + 1, col, a + 2, col);
+    const v = ws.getCell(a + 1, col);
+    v.value = card.value;
+    if (card.numFmt) v.numFmt = card.numFmt;
+    v.font = fonts.kpiValue;
+    v.alignment = { horizontal: "left", vertical: "middle", indent: 1 };
+
+    const change = ws.getCell(a + 3, col);
+    change.value = rich([card.change, fonts.kpiChange], [card.since ? `  since ${card.since}` : "", fonts.caption]);
+    change.alignment = { vertical: "middle", indent: 1 };
+
+    if (w > 1) {
+      ws.mergeCellsWithoutStyle(a + 1, col + 1, a + 3, col + w - 1);
+      (lay.sparklines = lay.sparklines || []).push({
+        cell: ws.getCell(a + 1, col + 1).address, values: range(card.col), dates: range(trend.dateCol),
+        color, min: card.min, max: card.max,
+      });
+    }
+
+    for (let rr = a; rr < a + TREND_ROWS; rr++) {
+      for (let cc = col; cc < col + w; cc++) {
+        const cell = ws.getCell(rr, cc);
+        cell.fill = SURFACE_FILL;
+        if (rr === a) cell.border = { top: { style: "medium", color: { argb: color } } };
+        else if (rr === a + TREND_ROWS - 1 && k === trend.cards.length - 1) cell.border = { bottom: LIGHT_RULE };
+      }
+    }
+    needLeft = Math.max(needLeft, cellUnits(card.text, fonts.kpiValue, 1),
+      cellUnits(card.change, fonts.kpiChange, 1) + (card.since ? cellUnits(`  since ${card.since}`, fonts.caption) : 0));
+    needLabel = Math.max(needLabel, cellUnits(label.value, fonts.kpiLabel, 1));
+  });
+  // The value and change fit their column; the sparkline gets room; the label stays inside the card
+  widths.want(col, Math.min(40, needLeft));
+  if (w === 2) widths.want(col + 1, 20);
+  widths.span(col, col + w - 1, needLabel);
+}
+
 /*
  * Exhibit: title row, caption row, then a real Excel Table. "Executive" uses Excel's
  * "None" table style with ink rules and hairlines; a built-in style keeps its own look.
@@ -1475,11 +1722,12 @@ function writeDataTable(ws, r, col, item, tableName, widths, lay, number) {
   t.value = rich(number ? [String(number).padStart(2, "0") + "  ", fonts.exNum] : null, [item.displayTitle, fonts.exTitle]);
   t.alignment = { vertical: "bottom" };
   const cap = ws.getCell(r + 1, col);
-  cap.value = rich(...captionRuns(item, item.colors, header, fonts, totalUnits));
+  cap.value = rich(...(item.trend ? trendCaptionRuns(item.trend, fonts) : captionRuns(item, item.colors, header, fonts, totalUnits)));
   cap.alignment = { vertical: "middle" };
 
-  // The table
-  const hr = r + 2;
+  // Trend cards, then the table
+  const hr = r + headRows(item) - 1;
+  if (item.trend) writeTrendCards(ws, r + 2, col, header.length, item, widths, lay, hr);
   ws.addTable({
     name: tableName,
     ref: ws.getCell(hr, col).address,
@@ -1772,19 +2020,19 @@ function groupIntoStacks(items) {
 /* Rows of a planned table that may collapse: data rows past its visible rows, plus padding before its note */
 function collapsibleRange(p) {
   if (p.item.isKpi || p.item.chart) return null;
-  const n = p.item.rows.length - 1;
+  const n = p.item.rows.length - 1, head = headRows(p.item);
   if (n <= p.vis) return null;
-  const end = p.noteRow ? p.noteRow - 1 : p.r + HEAD_ROWS + n - 1;
-  return [p.r + HEAD_ROWS + p.vis, end];
+  const end = p.noteRow ? p.noteRow - 1 : p.r + head + n - 1;
+  return [p.r + head + p.vis, end];
 }
 
 /* Rows of a planned block that must always stay visible: a whole tile, or a table's
    head and first rows (and its closing row when nothing of it collapses) */
 function topRange(p) {
   if (p.item.isKpi || p.item.chart) return [p.r, p.r + p.size.height - 1];
-  const n = p.item.rows.length - 1;
-  if (n <= p.vis) return [p.r, p.r + HEAD_ROWS + n];
-  return [p.r, p.r + HEAD_ROWS - 1 + p.vis];
+  const n = p.item.rows.length - 1, head = headRows(p.item);
+  if (n <= p.vis) return [p.r, p.r + head + n];
+  return [p.r, p.r + head - 1 + p.vis];
 }
 
 /* Moves a block, and everything below it in the same stack, down by `delta` rows */
@@ -1894,6 +2142,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     if ((customVisual(item.type) || {}).rule === "nested") nestedBarsRows(item, info, colorNotes);
     if ((customVisual(item.type) || {}).layout === "grid") comparisonRows(item, info);
     if ((customVisual(item.type) || {}).layout === "bins") histogramRows(item, info);
+    if ((customVisual(item.type) || {}).layout === "trend") dualKpiTrend(item, info, !!lay.palette);
     // A title turned off in the report isn't shown either (it is often an internal name such
     // as "TYS Card"): a table is titled from its columns instead, a KPI tile by its label
     const hidden = !!(info && info.titleHidden);
@@ -1904,10 +2153,11 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
       if (usedTitles[key] > 1) title = `${title} (${usedTitles[key]})`;
     }
     item.displayTitle = title;
-    item.colors = lay.palette && !item.isKpi ? columnColors(item, lay.palette, info) : null;
+    // A trend visual's colours are on its cards; its table stays plain
+    item.colors = lay.palette && !item.isKpi && !item.trend ? columnColors(item, lay.palette, info) : null;
     item.tableFormat = item.gridFormat || (info && info.tableFormats && info.tableFormats.length ? info : null);
     item.colorInfo = info;
-    item.chart = options.visualsAs === "charts" ? chartPlan(item) : null;   // charts mode only
+    item.chart = options.visualsAs === "charts" && !item.trend ? chartPlan(item) : null;   // charts mode only
     if (item.chart && item.chart.note) colorNotes.push(item.chart.note);
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
   }
@@ -1952,7 +2202,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
         const n = item.rows.length - 1;
         plan.push({
           item, col, r, size, stackIndex, vis: threshold, extra: 0,
-          noteRow: size.note ? r + HEAD_ROWS + n : null,
+          noteRow: size.note ? r + headRows(item) + n : null,
           divider: allCards && stackIndex > 0,
           strip: inStrip ? strip : null,
         });
@@ -1982,14 +2232,14 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
       } else {
         const number = options.exhibitNumbers ? ++exhibit : null;
         writeDataTable(ws, r, col, item, nameTable(item.displayTitle), widths, lay, number);
-        const n = item.rows.length - 1;
-        for (let i = 0; i < HEAD_ROWS; i++) mark(r + i, "other");
-        for (let i = 0; i < n; i++) mark(r + HEAD_ROWS + i, i >= p.vis ? "deep" : "other");
-        const closeRow = p.noteRow || r + HEAD_ROWS + n;
-        for (let x = r + HEAD_ROWS + n; x < closeRow; x++) mark(x, "deep");   // padding lined up with a neighbour
+        const n = item.rows.length - 1, head = headRows(item);
+        for (let i = 0; i < head; i++) mark(r + i, "other");
+        for (let i = 0; i < n; i++) mark(r + head + i, i >= p.vis ? "deep" : "other");
+        const closeRow = p.noteRow || r + head + n;
+        for (let x = r + head + n; x < closeRow; x++) mark(x, "deep");   // padding lined up with a neighbour
         mark(closeRow, "other");
         if (executive) paintRange(ws, closeRow, col, col + size.width - 1, { border: { top: INK_RULE } });
-        tables.push({ top: r, col, w: size.width, n, vis: p.vis, noteRow: p.noteRow });
+        tables.push({ top: r, head, col, w: size.width, n, vis: p.vis, noteRow: p.noteRow });
       }
       bandBottom = Math.max(bandBottom, r + size.height);
     }
@@ -2014,7 +2264,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
   for (const t of tables) {
     if (!t.noteRow) continue;
     let hidden = 0;
-    for (let i = t.vis; i < t.n; i++) if (ws.getRow(t.top + HEAD_ROWS + i).hidden) hidden++;
+    for (let i = t.vis; i < t.n; i++) if (ws.getRow(t.top + t.head + i).hidden) hidden++;
     if (hidden) pendingNotes.push({ row: t.noteRow, col: t.col, w: t.w, n: t.n, hidden });
   }
 
@@ -2192,7 +2442,7 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
   const accent = accentPlan(toArgb(branding.accent));
   const fonts = makeFonts(branding.titleFont);
   const lay = {
-    fonts, accent,
+    fonts, accent, sheetName,
     tableStyle: branding.tableStyle || EXECUTIVE,
     palette: options.matchColors ? options.palette : null,
     reportColors: options.matchColors ? options.reportColors || null : null,
@@ -2382,6 +2632,7 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
     tables: layout.tableCount,
     kpis: data.items.filter((it) => it.isKpi).length,
     charts: lay.charts || [],   // charts mode: charts to add to this sheet (Step 9)
+    sparklines: lay.sparklines || [],   // trend cards' sparklines, added by addSparklinesToFile
   };
 }
 
@@ -3257,27 +3508,31 @@ function insertDrawing(sheetXml, rid) {
   return sheetXml.slice(0, at) + `<drawing r:id="${rid}"/>` + sheetXml.slice(at);
 }
 
+/* Sheet name → its part in the file ("xl/worksheets/sheet3.xml") */
+async function sheetFileMap(zip) {
+  const workbookXml = await zip.file("xl/workbook.xml").async("string");
+  const workbookRels = await zip.file("xl/_rels/workbook.xml.rels").async("string");
+  const files = {};
+  for (const m of workbookXml.matchAll(/<sheet\b[^>]*>/g)) {
+    const name = unescapeXml((m[0].match(/\bname="([^"]*)"/) || [])[1] || "");
+    const rid = (m[0].match(/\br:id="([^"]+)"/) || [])[1];
+    const target = rid && relTarget(workbookRels, rid);
+    if (target) files[name] = xlPath(target);
+  }
+  return files;
+}
+
 /* chartSheets: [{ sheetName, charts: [{ plan, col, row, wPx, hPx }] }]. Returns the new file. */
 async function addChartsToFile(buffer, chartSheets) {
   const zip = await JSZip.loadAsync(buffer);
   const read = (p) => zip.file(p).async("string");
-  const workbookXml = await read("xl/workbook.xml");
-  const workbookRels = await read("xl/_rels/workbook.xml.rels");
   let types = await read("[Content_Types].xml");
   const addType = (part, type) => {
     if (!types.includes(`PartName="/${part}"`)) types = types.replace("</Types>", `<Override PartName="/${part}" ContentType="${type}"/></Types>`);
   };
   let chartNo = Object.keys(zip.files).filter((n) => /^xl\/charts\/chart\d+\.xml$/.test(n)).length;
   let drawingNo = Object.keys(zip.files).filter((n) => /^xl\/drawings\/drawing\d+\.xml$/.test(n)).length;
-
-  // Sheet name → its file
-  const sheetFiles = {};
-  for (const m of workbookXml.matchAll(/<sheet\b[^>]*>/g)) {
-    const name = unescapeXml((m[0].match(/\bname="([^"]*)"/) || [])[1] || "");
-    const rid = (m[0].match(/\br:id="([^"]+)"/) || [])[1];
-    const target = rid && relTarget(workbookRels, rid);
-    if (target) sheetFiles[name] = xlPath(target);
-  }
+  const sheetFiles = await sheetFileMap(zip);
 
   for (const { sheetName, charts } of chartSheets) {
     const sheetPath = sheetFiles[sheetName];
@@ -3326,6 +3581,45 @@ async function addChartsToFile(buffer, chartSheets) {
     zip.file(drawingRelsPath, drawingRels);
   }
   zip.file("[Content_Types].xml", types);
+  return zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
+}
+
+/*
+ * Trend cards' sparklines. ExcelJS can't write them, so they go into each sheet's <extLst>
+ * once the file is written: a group per sparkline (each has its own colour), a line over a
+ * date axis (points spaced by date, as the visual's time scale spaces them), the last point
+ * marked, gaps for blanks, and drawn from collapsed rows too.
+ * sparkSheets: [{ sheetName, sparklines: [{ cell, values, dates, color, min, max }] }].
+ */
+const SPARKLINE_EXT = "{05C60535-1F16-4fd2-B633-F4F36F0B64E0}";
+function sparklineGroupXml(s) {
+  const color = (tag) => `<x14:${tag} rgb="${s.color}"/>`;
+  const axis = (s.min !== null && s.min !== undefined ? ` manualMin="${s.min}"` : "") + (s.max !== null && s.max !== undefined ? ` manualMax="${s.max}"` : "");
+  const types = (s.min !== null && s.min !== undefined ? ' minAxisType="custom"' : "") + (s.max !== null && s.max !== undefined ? ' maxAxisType="custom"' : "");
+  return `<x14:sparklineGroup${axis} lineWeight="1.5"${s.dates ? ' dateAxis="1"' : ""} displayEmptyCellsAs="gap" last="1" displayHidden="1"${types}>` +
+    color("colorSeries") + color("colorNegative") + `<x14:colorAxis rgb="FF000000"/>` + color("colorMarkers") +
+    color("colorFirst") + color("colorLast") + color("colorHigh") + color("colorLow") +
+    (s.dates ? `<xm:f>${xmlEsc(s.dates)}</xm:f>` : "") +
+    `<x14:sparklines><x14:sparkline><xm:f>${xmlEsc(s.values)}</xm:f><xm:sqref>${s.cell}</xm:sqref></x14:sparkline></x14:sparklines>` +
+    `</x14:sparklineGroup>`;
+}
+
+async function addSparklinesToFile(buffer, sparkSheets) {
+  const zip = await JSZip.loadAsync(buffer);
+  const sheetFiles = await sheetFileMap(zip);
+  for (const { sheetName, sparklines } of sparkSheets) {
+    const path = sheetFiles[sheetName];
+    if (!path || !sparklines.length) continue;
+    const xml = await zip.file(path).async("string");
+    const ext = `<ext uri="${SPARKLINE_EXT}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main">` +
+      `<x14:sparklineGroups xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main">${sparklines.map(sparklineGroupXml).join("")}</x14:sparklineGroups></ext>`;
+    // <extLst> is a worksheet's last element: join the one ExcelJS wrote (data bars), else add one
+    const body = xml.slice(0, xml.lastIndexOf("</worksheet>")).trimEnd();
+    const out = body.endsWith("</extLst>")
+      ? body.slice(0, -"</extLst>".length) + ext + "</extLst></worksheet>"
+      : body + "<extLst>" + ext + "</extLst></worksheet>";
+    zip.file(path, out);
+  }
   return zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
 }
 
@@ -3427,6 +3721,7 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
   const nameTable = makeTableNamer();
   const totals = { tables: 0, kpis: 0, notes: [] };
   const chartSheets = [];   // charts mode: { sheetName, charts } for addChartsToFile
+  const sparkSheets = [];   // trend cards: { sheetName, sparklines } for addSparklinesToFile
   // With several pages, one with nothing to show (a cover or info page of images and text)
   // isn't given an empty sheet; the first sheet's notes name it
   const filled = collected.filter(({ data }) => data.items.length || data.notes.length);
@@ -3442,6 +3737,7 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
       writeChartDataSheet(wb, nameSheet(`${page.displayName} – Data`), counts.charts);
       chartSheets.push({ sheetName, charts: counts.charts });
     }
+    if (counts.sparklines.length) sparkSheets.push({ sheetName, sparklines: counts.sparklines });
     totals.tables += counts.tables;
     totals.kpis += counts.kpis;
     data.notes.forEach((n) => totals.notes.push(sheets.length > 1 ? `${page.displayName}: ${n}` : n));
@@ -3450,6 +3746,7 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
   let buffer = await wb.xlsx.writeBuffer();
   // Charts mode: add the real Excel charts to the finished file
   if (chartSheets.length) buffer = await addChartsToFile(buffer, chartSheets);
+  if (sparkSheets.length) buffer = await addSparklinesToFile(buffer, sparkSheets);
   const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
   const baseName = sheets.length === 1 ? `${currentReportName} - ${sheets[0].page.displayName}` : currentReportName;
   const fileName = (baseName.replace(/[\\/:*?"<>|]/g, "").trim() || "Power BI export") + ".xlsx";
