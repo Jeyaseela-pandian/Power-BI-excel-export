@@ -1557,6 +1557,36 @@ function writeTotalsRow(ws, row, col, item, hr, n, lay, table) {
 }
 
 /*
+ * A visual's field wells at the drill level the report shows while exporting. The report file
+ * lists every level of a hierarchy (Year, Quarter, Month), but Power BI exports a visual as it
+ * is drawn: drilled down to Quarter, only Quarter; expanded one level, Year and Quarter; a
+ * matrix only the row and column levels it has expanded. So the hierarchy roles keep just the
+ * levels in the export, and everything after (chart categories, colours, the matrix layout)
+ * follows the report's current level. The embedding API can't report drill state, but the
+ * export always reflects it. AppSource visuals keep their roles (theirs mean something else).
+ */
+const HIERARCHY_ROLES = ["Category", "Group", "Rows", "Columns"];
+function atDrillLevel(item, info) {
+  if (!info || !info.roles || !item.rows || !item.rows.length || customVisual(item.type)) return info;
+  const header = item.rows[0].map((h) => String(h ?? "").trim());
+  const lower = header.map((h) => h.toLowerCase());
+  const norm = header.map((h) => normalizeField(h));
+  const shown = (f) => !!f && ((f.label && lower.includes(f.label)) || norm.includes(f.ref));
+  const roles = { ...info.roles };
+  let changed = false;
+  for (const r of HIERARCHY_ROLES) {
+    const list = roles[r];
+    if (!list || list.length < 2) continue;
+    const kept = list.filter(shown);
+    // None found means the export names them differently: keep the report's list
+    if (kept.length && kept.length < list.length) { roles[r] = kept; changed = true; }
+  }
+  if (!changed) return info;
+  const cats = roles.Category || roles.Group || [];
+  return { ...info, roles, category: cats[0] || null, categories: cats };
+}
+
+/*
  * A matrix as Power BI draws it, from its flat export (needs the report file to know its
  * row, column and value fields):
  *  - column fields: a column per column value (per value and measure, "2024 · Sales" when
@@ -1958,6 +1988,13 @@ function dateText(date, withTime) {
 function keyLabel(text) {
   const d = parseDate(String(text ?? "").trim());
   return d ? dateText(d.date, d.hasTime) : text;
+}
+
+/* A category on a chart axis: as keyLabel, and "(Blank)" for an empty one, as Power BI labels it
+   (an empty label leaves its column or point unnamed on the axis) */
+function axisLabel(text) {
+  const t = keyLabel(text);
+  return t === null || t === undefined || String(t).trim() === "" ? "(Blank)" : t;
 }
 
 /* Caption runs: a legend of the chart's colours, or "Table · 24 rows" */
@@ -2731,7 +2768,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
   // A new card with several measures: one tile per measure
   items = items.flatMap((item) => splitCards(item, visualInfo(lay.reportColors, item.page, item.name)));
   for (const item of items) {
-    const info = visualInfo(lay.reportColors, item.page, item.name);
+    const info = atDrillLevel(item, visualInfo(lay.reportColors, item.page, item.name));
     if (item.isKpi) mainValueFirst(item, info);
     if ((customVisual(item.type) || {}).rule === "nested") nestedBarsRows(item, info, colorNotes);
     if ((customVisual(item.type) || {}).layout === "grid") comparisonRows(item, info);
@@ -3857,7 +3894,7 @@ function waterfallXml(plan) {
   const label = (i, pos, argb, bold) => `<c:dLbl><c:idx val="${i}"/><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="800"/></a:pPr>` +
     `<a:r><a:rPr lang="en-US" sz="800" b="${bold ? 1 : 0}">${fillXml(argb)}</a:rPr><a:t>${xmlEsc(waterfallLabel(plan.steps[i], plan.fmt, plan.labelPrecision))}</a:t></a:r></a:p></c:rich></c:tx>` +
     `${noBox}<c:dLblPos val="${pos}"/>${flags(true)}</c:dLbl>`;
-  const cat = `<c:cat><c:strRef><c:f>${xmlEsc(refs.catRef)}</c:f>${strCacheXml(categories.map(keyLabel))}</c:strRef></c:cat>`;
+  const cat = `<c:cat><c:strRef><c:f>${xmlEsc(refs.catRef)}</c:f>${strCacheXml(categories.map(axisLabel))}</c:strRef></c:cat>`;
   const head = (i) => `<c:idx val="${i}"/><c:order val="${i}"/>` +
     `<c:tx><c:strRef><c:f>${xmlEsc(refs.series[i].nameRef)}</c:f>${strCacheXml([series[i].name])}</c:strRef></c:tx>`;
   const val = (i) => `<c:val><c:numRef><c:f>${xmlEsc(refs.series[i].valRef)}</c:f>${numCacheXml(series[i].values, series[i].fmt)}</c:numRef></c:val>`;
@@ -3915,7 +3952,7 @@ function writeChartDataSheet(wb, name, charts) {
       h.alignment = { horizontal: "right" };
     });
     p.categories.forEach((c, ri) => {
-      ws.getCell(hr + 1 + ri, 2).value = keyLabel(c);   // a date reads "1/15/2023" on the axis
+      ws.getCell(hr + 1 + ri, 2).value = axisLabel(c);   // a date reads "1/15/2023" on the axis, an empty one "(Blank)"
       p.series.forEach((s, i) => {
         const cell = ws.getCell(hr + 1 + ri, 3 + i);
         cell.value = s.values[ri];
@@ -3960,7 +3997,7 @@ function numCacheXml(values, fmt) {
 function chartSeriesXml(kind, s, i, plan, ref) {
   const head = `<c:idx val="${i}"/><c:order val="${i}"/>` +
     `<c:tx><c:strRef><c:f>${xmlEsc(ref.nameRef)}</c:f>${strCacheXml([s.name])}</c:strRef></c:tx>`;
-  const cat = `<c:cat><c:strRef><c:f>${xmlEsc(plan.refs.catRef)}</c:f>${strCacheXml(plan.categories.map(keyLabel))}</c:strRef></c:cat>`;
+  const cat = `<c:cat><c:strRef><c:f>${xmlEsc(plan.refs.catRef)}</c:f>${strCacheXml(plan.categories.map(axisLabel))}</c:strRef></c:cat>`;
   const val = `<c:val><c:numRef><c:f>${xmlEsc(ref.valRef)}</c:f>${numCacheXml(s.values, s.fmt)}</c:numRef></c:val>`;
   // Hidden helper series (waterfall base, funnel offset) take no bar colours
   const points = s.hidden ? "" : (plan.pointColors || []).map((c, pi) => (c
