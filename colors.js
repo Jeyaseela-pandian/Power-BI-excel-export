@@ -506,6 +506,8 @@ async function readTheme(zip, themeCollection) {
     background: merged.background || FALLBACK_THEME.background,
     foreground: merged.foreground || FALLBACK_THEME.foreground,
     keywords,
+    // Formatting defaults per visual type, base theme first, the custom theme over it
+    visualStyles: [base && base.visualStyles, custom && custom.visualStyles].filter(Boolean),
   };
 }
 
@@ -514,18 +516,37 @@ async function readTheme(zip, themeCollection) {
  * { type, roles: { Category: [{ ref, label }], Series: [...], Y: [...] … }, dataPoint: [...], titleShown }
  * ref is the normalised field name; label the visual's own name for it when renamed.
  */
-/* A chart's axes as the report sets them: { cat, val } with show (the axis) and title (its
-   title), each true / false, or null when left at Power BI's default (shown) */
-function axisSettings(objects) {
-  const flag = (name, prop) => {
-    const v = (((((objects || {})[name] || [])[0] || {}).properties || {})[prop] || {}).expr;
+/*
+ * A chart's axes as Power BI draws them: { cat, val, sec }, each with show (the axis) and title
+ * (its title), true / false. Power BI resolves each setting in layers, and so does the export:
+ * the visual's own default (axes shown, titles off), then the report's base theme, then its
+ * custom theme (each for every visual, "*", then for this visual type), then the visual's own
+ * setting. So a report on an older base theme shows axis titles unless a visual turns them off,
+ * one on Fluent 2 or with no base theme doesn't unless a visual turns them on.
+ */
+const AXIS_DEFAULTS = { categoryAxis: { show: true, showAxisTitle: false }, valueAxis: { show: true, showAxisTitle: false, secShow: true } };
+function axisSettings(objects, type, theme) {
+  // The value set for this visual or in the themes (undefined when none sets it)
+  const setting = (object, prop) => {
+    const v = (((((objects || {})[object] || [])[0] || {}).properties || {})[prop] || {}).expr;
     const lit = v && v.Literal && String(v.Literal.Value);
-    return lit === "true" ? true : lit === "false" ? false : null;
+    if (lit === "true" || lit === "false") return lit === "true";
+    let value;
+    for (const styles of (theme && theme.visualStyles) || []) {
+      for (const key of ["*", type]) {
+        const t = ((((styles || {})[key] || {})["*"] || {})[object] || [])[0];
+        if (t && typeof t[prop] === "boolean") value = t[prop];
+      }
+    }
+    return value;
   };
+  const flag = (object, prop) => setting(object, prop) ?? (AXIS_DEFAULTS[object] || {})[prop] ?? null;
+  const val = { show: flag("valueAxis", "show"), title: flag("valueAxis", "showAxisTitle") };
   return {
     cat: { show: flag("categoryAxis", "show"), title: flag("categoryAxis", "showAxisTitle") },
-    val: { show: flag("valueAxis", "show"), title: flag("valueAxis", "showAxisTitle") },
-    sec: { show: flag("valueAxis", "secShow"), title: flag("valueAxis", "secShowAxisTitle") },
+    val,
+    // The line values' axis title follows the value axis's unless something sets it
+    sec: { show: flag("valueAxis", "secShow"), title: setting("valueAxis", "secShowAxisTitle") ?? val.title },
   };
 }
 
@@ -881,7 +902,7 @@ function visualColorInfo(visual, theme) {
       : custom && custom.rule === "table" ? customTableFormats(custom, visual.roles, settings) : [],
     settings,
     titleHidden: visual.titleShown === false,
-    axes: axisSettings(visual.objects),
+    axes: axisSettings(visual.objects, visual.type, theme),
     mainValue: (roles[(custom && custom.mainRole) || KPI_VALUE_ROLE[visual.type]] || [])[0] || null,
     builtin: builtInSettings(visual, theme),
     // A matrix's saved expand / collapse state: per role, each level's default and the groups toggled

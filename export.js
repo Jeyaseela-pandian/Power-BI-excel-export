@@ -4221,10 +4221,10 @@ function chartSeriesXml(kind, s, i, plan, ref) {
    Excel's own spacing reads better */
 function catAxXml(id, crossId, pos, { reverse = false, hidden = false, title = null, count = 0 } = {}) {
   return `<c:catAx><c:axId val="${id}"/><c:scaling><c:orientation val="${reverse ? "maxMin" : "minMax"}"/></c:scaling>` +
-    `<c:delete val="${hidden ? 1 : 0}"/><c:axPos val="${pos}"/>` + (title && !hidden ? axisTitleXml(title) : "") +
+    `<c:delete val="${hidden && !title ? 1 : 0}"/><c:axPos val="${pos}"/>` + (title ? axisTitleXml(title) : "") +
     `<c:numFmt formatCode="General" sourceLinked="1"/>` +
-    `<c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="low"/>` +
-    `<c:spPr><a:ln w="9525">${fillXml(C.RULE)}</a:ln></c:spPr>` +
+    `<c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="${hidden ? "none" : "low"}"/>` +
+    `<c:spPr><a:ln w="9525">${hidden ? "<a:noFill/>" : fillXml(C.RULE)}</a:ln></c:spPr>` +
     `<c:crossAx val="${crossId}"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/>` +
     (count && count <= 60 && !hidden ? `<c:tickLblSkip val="1"/>` : "") + `<c:noMultiLvlLbl val="0"/></c:catAx>`;
 }
@@ -4241,19 +4241,20 @@ function axisTitles(plan, main, lines) {
   };
   return {
     catShow: on(a.cat, "show"), valShow: on(a.val, "show"), secShow: on(a.sec, "show"),
-    cat: on(a.cat, "show") && on(a.cat, "title") ? plan.catName : null,
-    val: on(a.val, "show") && on(a.val, "title") ? plan.valueName || names(main) : null,
-    sec: lines.length && on(a.sec, "show") && on(a.sec, "title") ? names(lines) : null,
+    // An axis turned off loses its labels, not its title (Power BI still draws the title)
+    cat: on(a.cat, "title") ? plan.catName : null,
+    val: on(a.val, "title") ? plan.valueName || names(main) : null,
+    sec: lines.length && on(a.sec, "title") ? names(lines) : null,
   };
 }
 
 function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true, hidden = false, title = null, axis = null, labels = true, zero = false } = {}) {
   // zero: bars and columns start at 0 as Power BI's do; Excel's own minimum can cut close values short
   const bounds = axis ? `<c:max val="${axis.max}"/><c:min val="${axis.min}"/>` : zero ? `<c:min val="0"/>` : "";
-  return `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/>${bounds}</c:scaling><c:delete val="${hidden ? 1 : 0}"/><c:axPos val="${pos}"/>` +
+  return `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/>${bounds}</c:scaling><c:delete val="${hidden && !title ? 1 : 0}"/><c:axPos val="${pos}"/>` +
     (grid ? `<c:majorGridlines><c:spPr><a:ln w="6350">${fillXml(C.HAIR)}</a:ln></c:spPr></c:majorGridlines>` : "") +
     (title ? axisTitleXml(title) : "") +
-    `<c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="${labels ? "nextTo" : "none"}"/>` +
+    `<c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="${labels && !hidden ? "nextTo" : "none"}"/>` +
     `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:crossAx val="${crossId}"/><c:crosses val="${crosses}"/><c:crossBetween val="between"/>` +
     (axis ? `<c:majorUnit val="${axis.step}"/>` : "") + `</c:valAx>`;
 }
