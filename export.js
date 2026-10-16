@@ -3559,7 +3559,7 @@ const EXCEL_CHARTS = {
   scatterChart: { kind: "scatter" },   // a bubble chart when the visual has a Size field
   waterfallChart: { kind: "waterfall" },
   funnel: { kind: "funnel" },
-  treemap: { kind: "treemap" },   // drawn as Power BI lays it out, its numbers on the Data sheet
+  treemap: { kind: "treemap" },   // an Excel treemap (Excel 2016 and later)
 };
 const CHART_SCALE = 1;          // Power BI page pixels → chart pixels
 const CHART_MIN_W = 360;        // smallest chart, in pixels
@@ -3956,10 +3956,10 @@ function funnelPlan(item) {
 }
 
 /*
- * A Power BI treemap, drawn as the report lays it out: a tile per group (Group), split into its
- * Details when the visual has them, sized by the value, each group in its colour from the report
- * (its Details share it, as in Power BI), largest first; the numbers go on the Data sheet. Tiles
- * can't be negative: those rows are left out of the drawing (Data tables mode still lists them).
+ * A Power BI treemap as an Excel treemap: a tile per group (Group), split into its Details when
+ * the visual has them, sized by the value, each group in its colour from the report (its
+ * Details share it, as in Power BI), largest first. Tiles can't be negative: those rows are left
+ * out of the chart (the table still lists them in Data tables mode).
  */
 function treemapPlan(item, spec) {
   const t = chartColumns(item);
@@ -4009,7 +4009,6 @@ function treemapPlan(item, spec) {
       return out;
     }, []),
     nested: detailCol !== undefined,
-    pbi: { w: (item.layout && item.layout.width) || 400, h: (item.layout && item.layout.height) || 260 },
   };
 }
 
@@ -4227,7 +4226,7 @@ function writeChartDataSheet(wb, name, charts) {
     t.value = p.title;
     t.font = { name: "Calibri", size: 12, bold: true, color: { argb: C.INK } };
     const hr = row + 1;
-    // Higher category levels (a treemap's groups) come first, each in its own column
+    // Higher category levels (a treemap's groups) come first: Excel reads the levels together
     const levels = p.catLevels || [], off = levels.length;
     [...levels.map((l) => l.name), p.catName || "Category"].forEach((name, k) => {
       const h = ws.getCell(hr, 2 + k);
@@ -4428,119 +4427,47 @@ function chartXml(plan) {
     `</c:chartSpace>`;
 }
 
-/*
- * Power BI's treemap layout (d3's squarify, aiming at golden-ratio tiles): the largest node
- * first, nodes added to a row along the shorter side while the row's worst tile gets no
- * worse, then the row is laid down and the rest fills what's left. Positions are rounded to
- * whole pixels, as Power BI draws them. nodes: [{ value }] largest first → [{ x, y, w, h }].
- */
-const TREEMAP_RATIO = 0.5 * (1 + Math.sqrt(5));
-function squarify(nodes, rect) {
-  const total = nodes.reduce((a, n) => a + n.value, 0);
-  const out = nodes.map(() => null);
-  if (!total || rect.w <= 0 || rect.h <= 0) return out.map(() => ({ x: rect.x, y: rect.y, w: 0, h: 0 }));
-  const k = (rect.w * rect.h) / total;
-  const area = nodes.map((n) => n.value * k);
-  const r = { ...rect };
-  const worst = (row, sum, u) => {
-    const areas = row.map((i) => area[i]).filter(Boolean);
-    if (!sum || !areas.length) return Infinity;
-    const s2 = sum * sum, u2 = u * u;
-    return Math.max((u2 * Math.max(...areas) * TREEMAP_RATIO) / s2, s2 / (u2 * Math.min(...areas) * TREEMAP_RATIO));
-  };
-  const place = (row, sum, u, flush) => {
-    let v = u ? Math.round(sum / u) : 0;
-    if (u === r.w) {   // a row across the top
-      if (flush || v > r.h) v = r.h;
-      let x = r.x;
-      row.forEach((i, j) => {
-        const w = j === row.length - 1 ? r.x + r.w - x : Math.min(r.x + r.w - x, v ? Math.round(area[i] / v) : 0);
-        out[i] = { x, y: r.y, w, h: v };
-        x += w;
-      });
-      r.y += v; r.h -= v;
-    } else {           // a column down the left
-      if (flush || v > r.w) v = r.w;
-      let y = r.y;
-      row.forEach((i, j) => {
-        const h = j === row.length - 1 ? r.y + r.h - y : Math.min(r.y + r.h - y, v ? Math.round(area[i] / v) : 0);
-        out[i] = { x: r.x, y, w: v, h };
-        y += h;
-      });
-      r.x += v; r.w -= v;
-    }
-  };
-  let row = [], sum = 0, best = Infinity, u = Math.min(r.w, r.h), next = 0;
-  while (next < nodes.length) {
-    const score = worst([...row, next], sum + area[next], u);
-    if (score <= best) { row.push(next); sum += area[next]; best = score; next++; continue; }
-    place(row, sum, u, false);
-    u = Math.min(r.w, r.h);
-    row = []; sum = 0; best = Infinity;
-  }
-  if (row.length) place(row, sum, u, true);
-  return out;
+/* An Excel treemap (chartEx "treemap"): the levels and sizes from the Data sheet, each group in
+   its colour, tiles labelled with their names and group names over each group, no legend */
+function treemapXml(plan, n) {
+  const s = plan.series[0], r = plan.refs;
+  // Excel numbers a treemap's points in tree order: each group, then its tiles. A group's colour
+  // goes on the group itself (its tiles take it); without Details each tile is a group of its own
+  let idx = 0;
+  const points = (plan.groups || []).map((g) => {
+    const at = idx;
+    idx += plan.nested ? 1 + g.tiles.length : 1;
+    return g.color ? `<cx:dataPt idx="${at}"><cx:spPr>${fillXml(g.color)}</cx:spPr></cx:dataPt>` : "";
+  }).join("");
+  const title = `<cx:title pos="t" align="ctr" overlay="0"><cx:tx><cx:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="1200" b="1"/></a:pPr>` +
+    `<a:r><a:rPr lang="en-US" sz="1200" b="1">${fillXml(C.INK)}</a:rPr><a:t>${xmlEsc(plan.title)}</a:t></a:r></a:p></cx:rich></cx:tx></cx:title>`;
+  const labels = `<cx:dataLabels pos="inEnd"><cx:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="900">${fillXml(C.WHITE)}</a:defRPr></a:pPr><a:endParaRPr lang="en-US"/></a:p></cx:txPr>` +
+    `<cx:visibility seriesName="0" categoryName="1" value="0"/></cx:dataLabels>`;
+  const id = `{${String(n).padStart(8, "0")}-0000-4000-8000-00000000AE02}`;
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<cx:chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:cx="${CHARTEX_NS}">` +
+    `<cx:chartData><cx:data id="0"><cx:strDim type="cat"><cx:f>${xmlEsc(r.catRef)}</cx:f></cx:strDim>` +
+    `<cx:numDim type="size"><cx:f>${xmlEsc(r.series[0].valRef)}</cx:f></cx:numDim></cx:data></cx:chartData>` +
+    `<cx:chart>${title}<cx:plotArea><cx:plotAreaRegion><cx:series layoutId="treemap" uniqueId="${id}">` +
+    `<cx:tx><cx:txData><cx:f>${xmlEsc(r.series[0].nameRef)}</cx:f><cx:v>${xmlEsc(s.name)}</cx:v></cx:txData></cx:tx>${points}${labels}` +
+    `<cx:dataId val="0"/><cx:layoutPr><cx:parentLabelLayout val="overlapping"/></cx:layoutPr></cx:series></cx:plotAreaRegion></cx:plotArea>` +
+    `</cx:chart></cx:chartSpace>`;   // no legend: the tiles name their groups, as in Power BI
 }
 
-/* The tiles of a treemap plan in Power BI's pixels: groups over the plot, tiles inside each */
-const TREEMAP_TITLE_PX = 28;   // the visual's title, above the tiles
-function treemapTiles(plan) {
-  const plot = { x: 0, y: 0, w: plan.pbi.w, h: Math.max(1, plan.pbi.h - TREEMAP_TITLE_PX) };
-  const boxes = squarify(plan.groups, plot);
-  return plan.groups.map((g, i) => ({
-    ...g, box: boxes[i],
-    tiles: plan.nested ? squarify(g.tiles, boxes[i]).map((b, j) => ({ ...g.tiles[j], box: b })) : [],
-  }));
-}
-
-/*
- * A treemap as Power BI draws it: the same tiles in the same places, each group in its
- * colour with its name at the top left and its tiles' names at the bottom left (a name too
- * long for its tile is cut short with "…", one with no room is left off). Excel's own
- * treemap lays its tiles out its own way, so the tiles are drawn as shapes, grouped as one
- * picture; the numbers behind them are on the Data sheet.
- */
-function treemapShapesXml(ch, id) {
-  const p = ch.plan, E = CHART_PX_TO_EMU;
-  const W = ch.wPx, H = ch.hPx, titleH = Math.round(TREEMAP_TITLE_PX * (H / p.pbi.h));
-  const pad = 4;   // the frame's inner margin, in pixels
-  const sx = (W - 2 * pad) / p.pbi.w, sy = (H - titleH - pad) / Math.max(1, p.pbi.h - TREEMAP_TITLE_PX);
-  const at = (b) => ({ x: Math.round((pad + b.x * sx) * E), y: Math.round((titleH + b.y * sy) * E), w: Math.round(b.w * sx * E), h: Math.round(b.h * sy * E) });
-  let n = 0;
-  const shape = (name, box, fill, line, text) =>
-    `<xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="${id * 100 + ++n}" name="${xmlEsc(name)}"/><xdr:cNvSpPr/></xdr:nvSpPr>` +
-    `<xdr:spPr><a:xfrm><a:off x="${box.x}" y="${box.y}"/><a:ext cx="${box.w}" cy="${box.h}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>` +
-    `${fill ? fillXml(fill) : "<a:noFill/>"}${line || "<a:ln><a:noFill/></a:ln>"}</xdr:spPr>` +
-    `<xdr:txBody>${text || '<a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="en-US"/></a:p>'}</xdr:txBody></xdr:sp>`;
-  // A name in a tile, in white as Power BI writes it, cut to the tile's width (about 6 pixels a character at 9pt)
-  const label = (name, box, argb, anchor, bold) => {
-    const wPx = box.w / E - 8, hPx = box.h / E;
-    if (wPx < 12 || hPx < 16) return null;
-    const fit = Math.floor(wPx / 6);
-    const textOf = String(name).length > fit ? String(name).slice(0, Math.max(1, fit - 1)).trimEnd() + "…" : String(name);
-    return `<a:bodyPr wrap="none" lIns="45720" tIns="27432" rIns="45720" bIns="27432" anchor="${anchor}" vertOverflow="clip" horzOverflow="clip"/><a:lstStyle/>` +
-      `<a:p><a:r><a:rPr lang="en-US" sz="900" b="${bold ? 1 : 0}">${fillXml(C.WHITE)}<a:latin typeface="Segoe UI"/></a:rPr><a:t>${xmlEsc(textOf)}</a:t></a:r></a:p>`;
-  };
-  const white = `<a:ln w="9525">${fillXml(C.WHITE)}</a:ln>`;
-  let body = shape("Frame", { x: 0, y: 0, w: W * E, h: H * E }, C.WHITE, `<a:ln w="9525">${fillXml(C.HAIR)}</a:ln>`);
-  body += shape("Title", { x: 0, y: 0, w: W * E, h: titleH * E }, null, null,
-    `<a:bodyPr wrap="none" anchor="ctr" lIns="45720" rIns="45720"/><a:lstStyle/><a:p><a:pPr algn="ctr"/><a:r><a:rPr lang="en-US" sz="1200" b="1">${fillXml(C.INK)}` +
-    `<a:latin typeface="Calibri"/></a:rPr><a:t>${xmlEsc(p.title)}</a:t></a:r></a:p>`);
-  const fallback = p.series[0].color || C.INK;
-  for (const g of treemapTiles(p)) {
-    const color = g.color || fallback, gb = at(g.box);
-    if (!p.nested) { body += shape(g.name, gb, color, white, label(g.name, gb, color, "t")); continue; }
-    for (const tile of g.tiles) {
-      const tb = at(tile.box);
-      body += shape(`${g.name} – ${tile.name}`, tb, color, white, label(tile.name, tb, color, "b"));
-    }
-    body += shape(g.name, gb, null, `<a:ln w="19050">${fillXml(C.WHITE)}</a:ln>`, label(g.name, gb, color, "t"));   // the group's outline and name
-  }
-  const cx = Math.round(W * E), cy = Math.round(H * E);
+/* A chartEx chart's frame (a treemap): Excel 2016 and later show the chart, older Excel a note */
+function chartExAnchorXml(ch, rid, id) {
+  const cx = Math.round(ch.wPx * CHART_PX_TO_EMU), cy = Math.round(ch.hPx * CHART_PX_TO_EMU);
   return `<xdr:oneCellAnchor><xdr:from><xdr:col>${ch.col - 1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${ch.row - 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>` +
-    `<xdr:ext cx="${cx}" cy="${cy}"/><xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="${id}" name="${xmlEsc(p.title)}"/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>` +
-    `<xdr:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/><a:chOff x="0" y="0"/><a:chExt cx="${cx}" cy="${cy}"/></a:xfrm></xdr:grpSpPr>` +
-    `${body}</xdr:grpSp><xdr:clientData/></xdr:oneCellAnchor>`;
+    `<xdr:ext cx="${cx}" cy="${cy}"/><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">` +
+    `<mc:Choice xmlns:cx1="http://schemas.microsoft.com/office/drawing/2015/9/8/chartex" Requires="cx1"><xdr:graphicFrame macro="">` +
+    `<xdr:nvGraphicFramePr><xdr:cNvPr id="${id}" name="Chart ${id}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
+    `<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="${CHARTEX_NS}">` +
+    `<cx:chart xmlns:cx="${CHARTEX_NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="${rid}"/>` +
+    `</a:graphicData></a:graphic></xdr:graphicFrame></mc:Choice><mc:Fallback><xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="${id}" name="Chart ${id}"/>` +
+    `<xdr:cNvSpPr><a:spLocks noTextEdit="1"/></xdr:cNvSpPr></xdr:nvSpPr><xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>` +
+    `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="F4F6F5"/></a:solidFill></xdr:spPr><xdr:txBody><a:bodyPr vertOverflow="clip" horzOverflow="clip"/><a:lstStyle/>` +
+    `<a:p><a:r><a:rPr lang="en-US" sz="1100"/><a:t>${xmlEsc(ch.plan.title)}: a treemap, shown in Excel 2016 or later.</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback>` +
+    `</mc:AlternateContent><xdr:clientData/></xdr:oneCellAnchor>`;
 }
 
 /* A chart's frame on the page sheet: its top-left cell and its size */
@@ -4552,6 +4479,10 @@ function chartAnchorXml(ch, rid, id) {
     `<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="${rid}"/>` +
     `</a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:oneCellAnchor>`;
 }
+
+/* Excel's standard chart style and colour parts: a chartEx chart (a treemap) won't load without them */
+const CHARTEX_STYLE_XML = `<cs:chartStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" id="410"><cs:axisTitle><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="bg1"><a:lumMod val="65000"/></a:schemeClr></a:solidFill><a:ln w="19050"><a:solidFill><a:schemeClr val="bg1"/></a:solidFill></a:ln></cs:spPr><cs:defRPr sz="900"/></cs:axisTitle><cs:categoryAxis><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr><cs:defRPr sz="900"/></cs:categoryAxis><cs:chartArea mods="allowNoFillOverride allowNoLineOverride"><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="bg1"/></a:solidFill><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr><cs:defRPr sz="1000"/></cs:chartArea><cs:dataLabel><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="lt1"/></cs:fontRef><cs:defRPr sz="900"/></cs:dataLabel><cs:dataLabelCallout><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="dk1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="lt1"/></a:solidFill><a:ln><a:solidFill><a:schemeClr val="dk1"><a:lumMod val="25000"/><a:lumOff val="75000"/></a:schemeClr></a:solidFill></a:ln></cs:spPr><cs:defRPr sz="900"/><cs:bodyPr rot="0" spcFirstLastPara="1" vertOverflow="clip" horzOverflow="clip" vert="horz" wrap="square" lIns="36576" tIns="18288" rIns="36576" bIns="18288" anchor="ctr" anchorCtr="1"><a:spAutoFit/></cs:bodyPr></cs:dataLabelCallout><cs:dataPoint><cs:lnRef idx="0"/><cs:fillRef idx="0"><cs:styleClr val="auto"/></cs:fillRef><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:ln w="19050"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></cs:spPr></cs:dataPoint><cs:dataPoint3D><cs:lnRef idx="0"/><cs:fillRef idx="0"><cs:styleClr val="auto"/></cs:fillRef><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></cs:spPr></cs:dataPoint3D><cs:dataPointLine><cs:lnRef idx="0"><cs:styleClr val="auto"/></cs:lnRef><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="28575" cap="rnd"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:round/></a:ln></cs:spPr></cs:dataPointLine><cs:dataPointMarker><cs:lnRef idx="0"/><cs:fillRef idx="0"><cs:styleClr val="auto"/></cs:fillRef><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:ln w="9525"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></cs:spPr></cs:dataPointMarker><cs:dataPointMarkerLayout symbol="circle" size="5"/><cs:dataPointWireframe><cs:lnRef idx="0"><cs:styleClr val="auto"/></cs:lnRef><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="28575" cap="rnd"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:round/></a:ln></cs:spPr></cs:dataPointWireframe><cs:dataTable><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:spPr><a:ln w="9525"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:schemeClr></a:solidFill></a:ln></cs:spPr><cs:defRPr sz="900"/></cs:dataTable><cs:downBar><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="dk1"/></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="dk1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></a:solidFill><a:ln w="9525"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></a:solidFill></a:ln></cs:spPr></cs:downBar><cs:dropLine><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="35000"/><a:lumOff val="65000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr></cs:dropLine><cs:errorBar><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr></cs:errorBar><cs:floor><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef></cs:floor><cs:gridlineMajor><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr></cs:gridlineMajor><cs:gridlineMinor><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr></cs:gridlineMinor><cs:hiLoLine><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="75000"/><a:lumOff val="25000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr></cs:hiLoLine><cs:leaderLine><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="35000"/><a:lumOff val="65000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr></cs:leaderLine><cs:legend><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:defRPr sz="900"/></cs:legend><cs:plotArea mods="allowNoFillOverride allowNoLineOverride"><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef></cs:plotArea><cs:plotArea3D mods="allowNoFillOverride allowNoLineOverride"><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef></cs:plotArea3D><cs:seriesAxis><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr><cs:defRPr sz="900"/></cs:seriesAxis><cs:seriesLine><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat"><a:solidFill><a:srgbClr val="D9D9D9"/></a:solidFill><a:round/></a:ln></cs:spPr></cs:seriesLine><cs:title><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:defRPr sz="1400"/></cs:title><cs:trendline><cs:lnRef idx="0"><cs:styleClr val="auto"/></cs:lnRef><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="19050" cap="rnd"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:prstDash val="sysDash"/></a:ln></cs:spPr></cs:trendline><cs:trendlineLabel><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:defRPr sz="900"/></cs:trendlineLabel><cs:upBar><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="dk1"/></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="lt1"/></a:solidFill><a:ln w="9525"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:schemeClr></a:solidFill></a:ln></cs:spPr></cs:upBar><cs:valueAxis><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:defRPr sz="900"/></cs:valueAxis><cs:wall><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef></cs:wall></cs:chartStyle>`;
+const CHARTEX_COLORS_XML = `<cs:colorStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" meth="cycle" id="10"><a:schemeClr val="accent1"/><a:schemeClr val="accent2"/><a:schemeClr val="accent3"/><a:schemeClr val="accent4"/><a:schemeClr val="accent5"/><a:schemeClr val="accent6"/><cs:variation/><cs:variation><a:lumMod val="60000"/></cs:variation><cs:variation><a:lumMod val="80000"/><a:lumOff val="20000"/></cs:variation><cs:variation><a:lumMod val="80000"/></cs:variation><cs:variation><a:lumMod val="60000"/><a:lumOff val="40000"/></cs:variation><cs:variation><a:lumMod val="50000"/></cs:variation><cs:variation><a:lumMod val="70000"/><a:lumOff val="30000"/></cs:variation><cs:variation><a:lumMod val="70000"/></cs:variation><cs:variation><a:lumMod val="50000"/><a:lumOff val="50000"/></cs:variation></cs:colorStyle>`;
 
 /* ── Adding the charts to the finished .xlsx ── */
 /* ── Funnel charts: Excel's own funnel ───────────────────────────────────
@@ -4681,7 +4612,6 @@ async function addChartsToFile(buffer, chartSheets) {
   };
   let chartNo = Object.keys(zip.files).filter((n) => /^xl\/charts\/chart\d+\.xml$/.test(n)).length;
   let exNo = Object.keys(zip.files).filter((n) => /^xl\/charts\/chartEx\d+\.xml$/.test(n)).length;
-  let shapeNo = 0;
   let drawingNo = Object.keys(zip.files).filter((n) => /^xl\/drawings\/drawing\d+\.xml$/.test(n)).length;
   const sheetFiles = await sheetFileMap(zip);
 
@@ -4715,7 +4645,21 @@ async function addChartsToFile(buffer, chartSheets) {
     let anchors = "";
     for (const ch of charts) {
       if (ch.plan.spec.kind === "treemap") {
-        anchors += treemapShapesXml(ch, 3000 + ++shapeNo);   // drawn as Power BI lays it out
+        // A chartEx chart: its part, with Excel's style and colour parts (it needs both)
+        exNo++;
+        const exPath = `xl/charts/chartEx${exNo}.xml`;
+        zip.file(exPath, treemapXml(ch.plan, exNo));
+        zip.file(`xl/charts/style${exNo}.xml`, CHARTEX_STYLE_XML);
+        zip.file(`xl/charts/colors${exNo}.xml`, CHARTEX_COLORS_XML);
+        let exRels = addRel(EMPTY_RELS, "http://schemas.microsoft.com/office/2011/relationships/chartStyle", `style${exNo}.xml`).xml;
+        exRels = addRel(exRels, "http://schemas.microsoft.com/office/2011/relationships/chartColorStyle", `colors${exNo}.xml`).xml;
+        zip.file(`xl/charts/_rels/chartEx${exNo}.xml.rels`, exRels);
+        addType(exPath, CHARTEX_TYPE);
+        addType(`xl/charts/style${exNo}.xml`, "application/vnd.ms-office.chartstyle+xml");
+        addType(`xl/charts/colors${exNo}.xml`, "application/vnd.ms-office.chartcolorstyle+xml");
+        const rel = addRel(drawingRels, CHARTEX_REL, `../charts/chartEx${exNo}.xml`);
+        drawingRels = rel.xml;
+        anchors += chartExAnchorXml(ch, rel.id, 3000 + exNo);
         continue;
       }
       chartNo++;
