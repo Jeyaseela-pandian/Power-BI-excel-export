@@ -63,6 +63,7 @@ const GUTTER_W = 3;
 const MIN_PAGE_W = 100;    // minimum content width (Excel width units)
 const SNAP_PX = 40;        // stacks starting within this many page pixels share a column
 const BAND_GAP = 2;        // blank rows between bands
+const MATRIX_AS_TABLE = true;   // matrices as normal Excel tables (false: Power BI's stepped layout with groups and subtotals)
 const WIDTH_STEPS = [10, 11, 12, 13, 14, 16, 18, 20, 22, 24, 28, 32, 36, 40, 45, 50, 60];
 const EXECUTIVE = "Executive";
 const BUILT_IN_STYLES = ["TableStyleMedium2", "TableStyleMedium4", "TableStyleMedium7", "TableStyleMedium1", "TableStyleLight9"];
@@ -1633,6 +1634,23 @@ async function rollUpToDrillLevel(item, info, filters) {
     if (!groups.has(k)) groups.set(k, { row, rows: [] });
     groups.get(k).rows.push(ri);
   });
+    // Power BI sorted the exported rows by one value (Revenue Won, descending) at the detail level,
+  // so the groups first appear in the wrong order (the biggest single product's group first):
+  // put the groups in that value's order again, by their totals
+  const sortBy = valueCols.find((ci) => {
+    if (!kinds[ci]) return false;
+    const v = cells.map((r) => r[ci].value).filter((x) => typeof x === "number");
+    if (v.length < 3 || new Set(v).size < 2) return false;
+    return v.every((x, i) => !i || x <= v[i - 1]) || v.every((x, i) => !i || x >= v[i - 1]);
+  });
+  if (sortBy !== undefined) {
+    const v = cells.map((r) => r[sortBy].value).filter((x) => typeof x === "number");
+    const desc = v[0] > v[v.length - 1];
+    const total = (g) => subtotalOf(kinds[sortBy], g.rows.map((ri) => cells[ri][sortBy].value));
+    const sorted = [...groups.entries()].sort((a, b) => (desc ? total(b[1]) - total(a[1]) : total(a[1]) - total(b[1])));
+    groups.clear();
+    sorted.forEach(([k, g]) => groups.set(k, g));
+  }
   const out = [...groups.values()].map((g) => header.map((_, ci) => {
     if (!valueCols.includes(ci)) return g.row[ci];
     const kind = kinds[ci];
@@ -2765,14 +2783,10 @@ function applyVisualColors(ws, hr, col, item, colors, lay) {
     cell.border = GAP_BORDER;
   };
 
-  // Series drawn in one colour: the header naming the series. An AppSource visual's value
-  // fields (a bullet chart's bands, a histogram's bars…) fill their value cells too, like the
-  // marks the visual draws
+    // Series drawn in one colour (a measure such as Revenue Won): its value cells, like the bars
+  // the chart draws. The header stays neutral; the caption's colour key names each colour
   for (const [ci, argb] of Object.entries(colors.series)) {
-    const h = ws.getCell(hr, col + Number(ci));
-    h.fill = styleOf(argb).fill;
-    h.font = styleOf(argb).headFont;
-    if (customVisual(item.type) && !colors.rowKey) data.forEach((row, ri) => { if (String(row[ci] ?? "").trim()) fillCell(ws.getCell(first + ri, col + Number(ci)), argb); });
+    data.forEach((row, ri) => { if (String(row[ci] ?? "").trim()) fillCell(ws.getCell(first + ri, col + Number(ci)), argb); });
   }
 
   // Colour that identifies a category (legend value, slice, tile, a bar set by hand): the
@@ -2975,7 +2989,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     if ((customVisual(item.type) || {}).layout === "bins") histogramRows(item, info);
     if ((customVisual(item.type) || {}).layout === "trend") dualKpiTrend(item, info, !!lay.palette);
     if (item.type === "kpi" && !item.isKpi) kpiTrend(item, info, !!lay.palette);
-    if (item.type === "pivotTable" && info) matrixLayout(item, info);
+    if (item.type === "pivotTable" && info && !MATRIX_AS_TABLE) matrixLayout(item, info);
     if (item.sparklines && item.sparklines.length && !item.stepped) addSparklineColumns(item);
     if (TABLE_VISUAL_TYPES.includes(item.type) && !item.stepped) item.totals = totalsPlan(item, info);
     // A title turned off in the report isn't shown either (it is often an internal name such
@@ -3530,7 +3544,6 @@ const EXCEL_CHARTS = {
   lineStackedColumnComboChart: { kind: "combo", dir: "col", grouping: "stacked" },
   pieChart: { kind: "pie" },
   donutChart: { kind: "doughnut" },
-  ribbonChart: { kind: "bar", dir: "col", grouping: "stacked" },   // drawn as stacked columns
   scatterChart: { kind: "scatter" },   // a bubble chart when the visual has a Size field
   waterfallChart: { kind: "waterfall" },
   funnel: { kind: "funnel" },
@@ -3916,6 +3929,7 @@ function funnelPlan(item) {
   const fmt = t.formatOf(valueCol);
   return {
     spec: { kind: "bar", dir: "bar", grouping: "stacked", hideValueAxis: true },
+    funnel: true,   // also written as Excel's own funnel chart (addChartsToFile), these bars its fallback
     title: item.displayTitle || item.title,
     catName: t.header[catCol],
     categories: stages.map((s) => s.label),
@@ -4233,6 +4247,8 @@ function catAxXml(id, crossId, pos, { reverse = false, hidden = false, title = n
    fields ("Last Year Sales and This Year Sales"); a title or axis the report turns off isn't
    drawn. Returns { cat, val, sec, catShow, valShow, secShow } */
 function axisTitles(plan, main, lines) {
+    // A funnel has no axis titles in Power BI: only its stage names and values
+  if (plan.funnel) return { catShow: true, valShow: true, secShow: true, cat: null, val: null, sec: null };
   const a = plan.axes || {};
   const on = (x, key) => !x || x[key] !== false;
   const names = (list) => {
@@ -4242,9 +4258,10 @@ function axisTitles(plan, main, lines) {
   return {
     catShow: on(a.cat, "show"), valShow: on(a.val, "show"), secShow: on(a.sec, "show"),
     // An axis turned off loses its labels, not its title (Power BI still draws the title)
-    cat: on(a.cat, "title") ? plan.catName : null,
-    val: on(a.val, "title") ? plan.valueName || names(main) : null,
-    sec: lines.length && on(a.sec, "title") ? names(lines) : null,
+        // The author's own title text ("Revenue") when the report sets one, else the field names
+    cat: on(a.cat, "title") ? (a.cat && a.cat.text) || plan.catName : null,
+    val: on(a.val, "title") ? (a.val && a.val.text) || plan.valueName || names(main) : null,
+    sec: lines.length && on(a.sec, "title") ? (a.sec && a.sec.text) || names(lines) : null,
   };
 }
 
@@ -4345,13 +4362,73 @@ function chartAnchorXml(ch, rid, id) {
 }
 
 /* ── Adding the charts to the finished .xlsx ── */
+/* ── Funnel charts: Excel's own funnel ───────────────────────────────────
+ * Excel 2019 and Microsoft 365 have a real funnel chart ("chartEx", a newer chart format).
+ * A funnel visual is written as one, with the centred-bar funnel as its fallback: Excel
+ * versions without funnel charts, Excel on older Macs, LibreOffice and Google Sheets show the
+ * bars instead, so every reader sees a funnel. NATIVE_FUNNEL = false keeps the bars only.
+ */
+const NATIVE_FUNNEL = false;
+const CHARTEX_NS = "http://schemas.microsoft.com/office/drawing/2014/chartex";
+const CHARTEX_REL = "http://schemas.microsoft.com/office/2014/relationships/chartEx";
+const CHARTEX_TYPE = "application/vnd.ms-office.chartex+xml";
+
+/* The funnel as Excel's own funnel chart: stages largest first, a colour per stage when the
+   report sets them, values inside the bars */
+function funnelChartExXml(plan) {
+  const s = plan.series[1], ref = plan.refs.series[1];
+  const cats = plan.categories.map(axisLabel);
+  const pts = (list) => list.map((v, i) => (v === null || v === undefined || v === "" ? "" : `<cx:pt idx="${i}">${xmlEsc(v)}</cx:pt>`)).join("");
+  const colors = plan.pointColors || [];
+  const main = s.color || colors.find(Boolean) || toArgb(DEFAULT_THEME_COLORS[0]);
+  const font = (argb, sz, b) => `<a:defRPr sz="${sz}" b="${b ? 1 : 0}">${fillXml(argb)}<a:latin typeface="Calibri"/></a:defRPr>`;
+  const txPr = (argb, sz, b) => `<cx:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr>${font(argb, sz, b)}</a:pPr><a:endParaRPr lang="en-US"/></a:p></cx:txPr>`;
+  const dataPts = colors.map((c, i) => (c ? `<cx:dataPt idx="${i}"><cx:spPr>${fillXml(c)}</cx:spPr></cx:dataPt>` : "")).join("");
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<cx:chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:cx="${CHARTEX_NS}">` +
+    `<cx:chartData><cx:data id="0">` +
+    `<cx:strDim type="cat"><cx:f>${xmlEsc(plan.refs.catRef)}</cx:f><cx:lvl ptCount="${cats.length}">${pts(cats)}</cx:lvl></cx:strDim>` +
+    `<cx:numDim type="val"><cx:f>${xmlEsc(ref.valRef)}</cx:f><cx:lvl ptCount="${s.values.length}" formatCode="${xmlEsc(s.fmt || "General")}">${pts(s.values)}</cx:lvl></cx:numDim>` +
+    `</cx:data></cx:chartData>` +
+    `<cx:chart>` +
+    (plan.title ? `<cx:title pos="t" align="ctr" overlay="0"><cx:tx><cx:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr>${font(C.INK, 1200, true)}</a:pPr>` +
+      `<a:r><a:rPr lang="en-US" sz="1200" b="1">${fillXml(C.INK)}<a:latin typeface="Calibri"/></a:rPr><a:t>${xmlEsc(plan.title)}</a:t></a:r></a:p></cx:rich></cx:tx></cx:title>` : "") +
+    `<cx:plotArea><cx:plotAreaRegion>` +
+    `<cx:series layoutId="funnel" uniqueId="{6F7B2C1A-3E4D-4B5A-9C8D-1A2B3C4D5E6F}">` +
+    `<cx:tx><cx:txData><cx:f>${xmlEsc(ref.nameRef)}</cx:f><cx:v>${xmlEsc(s.name)}</cx:v></cx:txData></cx:tx>` +
+    `<cx:spPr>${fillXml(main)}</cx:spPr>${dataPts}` +
+    `<cx:dataLabels pos="ctr"><cx:numFmt formatCode="${xmlEsc(s.fmt || "General")}" sourceLinked="0"/>${txPr(textOn(main), 900, true)}` +
+    `<cx:visibility seriesName="0" categoryName="0" value="1"/></cx:dataLabels>` +
+    `<cx:dataId val="0"/></cx:series>` +
+    `</cx:plotAreaRegion><cx:axis id="0"><cx:catScaling gapWidth="0.06"/><cx:tickLabels/>${txPr(C.SLATE, 900, false)}</cx:axis></cx:plotArea>` +
+    `</cx:chart>` +
+    `<cx:spPr>${fillXml(C.WHITE)}<a:ln w="9525">${fillXml(C.HAIR)}</a:ln></cx:spPr>` +
+    `</cx:chartSpace>`;
+}
+
+/* A chart frame that shows Excel's own funnel where Excel has it, else the bar funnel */
+function chartAltAnchorXml(ch, exRid, rid, id) {
+  const cx = Math.round(ch.wPx * CHART_PX_TO_EMU), cy = Math.round(ch.hPx * CHART_PX_TO_EMU);
+  const frame = (uri, inner) => `<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="${id}" name="Chart ${id}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
+    `<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="${uri}">${inner}</a:graphicData></a:graphic></xdr:graphicFrame>`;
+  return `<xdr:oneCellAnchor><xdr:from><xdr:col>${ch.col - 1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${ch.row - 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>` +
+    `<xdr:ext cx="${cx}" cy="${cy}"/>` +
+    `<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">` +
+    `<mc:Choice xmlns:cx2="http://schemas.microsoft.com/office/drawing/2015/10/21/chartex" Requires="cx2">` +
+    frame(CHARTEX_NS, `<cx:chart xmlns:cx="${CHARTEX_NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="${exRid}"/>`) +
+    `</mc:Choice><mc:Fallback>` +
+    frame("http://schemas.openxmlformats.org/drawingml/2006/chart", `<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="${rid}"/>`) +
+    `</mc:Fallback></mc:AlternateContent><xdr:clientData/></xdr:oneCellAnchor>`;
+}
+
+
 const REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
 const EMPTY_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`;
 
 function addRel(rels, type, target) {
   const ids = [...rels.matchAll(/Id="rId(\d+)"/g)].map((m) => Number(m[1]));
   const id = "rId" + ((ids.length ? Math.max(...ids) : 0) + 1);
-  const rel = `<Relationship Id="${id}" Type="${REL_TYPE}${type}" Target="${target}"/>`;
+  const rel = `<Relationship Id="${id}" Type="${/^https?:/.test(type) ? type : REL_TYPE + type}" Target="${target}"/>`;
   const xml = /<Relationships[^>]*\/>/.test(rels)
     ? rels.replace(/<Relationships([^>]*)\/>/, `<Relationships$1>${rel}</Relationships>`)
     : rels.replace("</Relationships>", rel + "</Relationships>");
@@ -4411,6 +4488,7 @@ async function addChartsToFile(buffer, chartSheets) {
     if (!types.includes(`PartName="/${part}"`)) types = types.replace("</Types>", `<Override PartName="/${part}" ContentType="${type}"/></Types>`);
   };
   let chartNo = Object.keys(zip.files).filter((n) => /^xl\/charts\/chart\d+\.xml$/.test(n)).length;
+  let exNo = Object.keys(zip.files).filter((n) => /^xl\/charts\/chartEx\d+\.xml$/.test(n)).length;
   let drawingNo = Object.keys(zip.files).filter((n) => /^xl\/drawings\/drawing\d+\.xml$/.test(n)).length;
   const sheetFiles = await sheetFileMap(zip);
 
@@ -4449,7 +4527,18 @@ async function addChartsToFile(buffer, chartSheets) {
       addType(chartPath, "application/vnd.openxmlformats-officedocument.drawingml.chart+xml");
       const rel = addRel(drawingRels, "chart", `../charts/chart${chartNo}.xml`);
       drawingRels = rel.xml;
-      anchors += chartAnchorXml(ch, rel.id, 1000 + chartNo);
+            // A funnel: Excel's own funnel chart too, with the bar funnel as its fallback
+      if (NATIVE_FUNNEL && ch.plan.funnel) {
+        exNo++;
+        const exPath = `xl/charts/chartEx${exNo}.xml`;
+        zip.file(exPath, funnelChartExXml(ch.plan));
+        addType(exPath, CHARTEX_TYPE);
+        const exRel = addRel(drawingRels, CHARTEX_REL, `../charts/chartEx${exNo}.xml`);
+        drawingRels = exRel.xml;
+        anchors += chartAltAnchorXml(ch, exRel.id, rel.id, 1000 + chartNo);
+      } else {
+        anchors += chartAnchorXml(ch, rel.id, 1000 + chartNo);
+      }
     }
     drawingXml = drawingXml.includes("</xdr:wsDr>")
       ? drawingXml.replace("</xdr:wsDr>", anchors + "</xdr:wsDr>")
