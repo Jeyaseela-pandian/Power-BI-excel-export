@@ -1566,18 +1566,31 @@ function writeTotalsRow(ws, row, col, item, hr, n, lay, table) {
  * export always reflects it. AppSource visuals keep their roles (theirs mean something else).
  */
 const HIERARCHY_ROLES = ["Category", "Group", "Rows", "Columns"];
-function atDrillLevel(item, info) {
+function atDrillLevel(item, info, charts = false) {
   if (!info || !info.roles || !item.rows || !item.rows.length || customVisual(item.type)) return info;
   const header = item.rows[0].map((h) => String(h ?? "").trim());
   const lower = header.map((h) => h.toLowerCase());
   const norm = header.map((h) => normalizeField(h));
   const shown = (f) => !!f && ((f.label && lower.includes(f.label)) || norm.includes(f.ref));
+  // A chart drawn at its top level (Region) can still be exported with the levels below it
+  // (Region and VP). The report file marks the levels the chart draws ("active"), so in charts
+  // mode a chart keeps just those, and its amounts are added up per level shown. Averages and
+  // percentages can't be added up, so those charts keep the detail; scatter charts keep theirs.
+  const colOfField = (f) => { const i = f.label ? lower.indexOf(f.label) : -1; return i >= 0 ? i : norm.indexOf(f.ref); };
+  const valueCols = (info.measures || []).map(colOfField).filter((ci) => ci >= 0);
+  const additive = valueCols.length > 0 && valueCols.every((ci) => !NON_ADDITIVE.test(header[ci]) &&
+    !item.rows.slice(1).some((r) => String(r[ci] ?? "").trim().endsWith("%")));
+  const rollUp = !!charts && !!EXCEL_CHARTS[item.type] && item.type !== "scatterChart" && additive;
   const roles = { ...info.roles };
   let changed = false;
   for (const r of HIERARCHY_ROLES) {
     const list = roles[r];
     if (!list || list.length < 2) continue;
-    const kept = list.filter(shown);
+    let kept = list.filter(shown);
+    if (rollUp && (r === "Category" || r === "Group") && kept.length > 1 && kept[0].active) {
+      const active = kept.filter((f) => f.active);
+      if (active.length < kept.length) kept = active;
+    }
     // None found means the export names them differently: keep the report's list
     if (kept.length && kept.length < list.length) { roles[r] = kept; changed = true; }
   }
@@ -2768,7 +2781,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
   // A new card with several measures: one tile per measure
   items = items.flatMap((item) => splitCards(item, visualInfo(lay.reportColors, item.page, item.name)));
   for (const item of items) {
-    const info = atDrillLevel(item, visualInfo(lay.reportColors, item.page, item.name));
+    const info = atDrillLevel(item, visualInfo(lay.reportColors, item.page, item.name), options.visualsAs === "charts");
     if (item.isKpi) mainValueFirst(item, info);
     if ((customVisual(item.type) || {}).rule === "nested") nestedBarsRows(item, info, colorNotes);
     if ((customVisual(item.type) || {}).layout === "grid") comparisonRows(item, info);

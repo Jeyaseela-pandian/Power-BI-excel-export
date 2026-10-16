@@ -593,6 +593,7 @@ function legacyVisual(config) {
   for (const [role, list] of Object.entries(sv.projections || {})) {
     roles[role] = (list || []).map((p) => ({
       ref: normalizeField(aliases[p.queryRef] || p.queryRef),
+      active: p.active === true,   // a hierarchy level the visual shows (not just one it can drill to)
       label: props[p.queryRef] && props[p.queryRef].displayName ? String(props[p.queryRef].displayName).toLowerCase() : null,
       field: fields[p.queryRef] || null,
       queryRef: p.queryRef,
@@ -609,6 +610,7 @@ function pbirVisual(json) {
   for (const [role, state] of Object.entries((v.query && v.query.queryState) || {})) {
     roles[role] = ((state && state.projections) || []).map((p) => ({
       ref: normalizeField(fieldName(p.field) || p.queryRef || p.nativeQueryRef),
+      active: p.active === true,   // a hierarchy level the visual shows (not just one it can drill to)
       label: p.displayName ? String(p.displayName).toLowerCase() : null,
       field: fieldInfo(p.field),
       queryRef: p.queryRef || null,
