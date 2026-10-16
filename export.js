@@ -83,7 +83,8 @@ const DEFAULT_THEME_COLORS = ["#118DFF", "#12239E", "#E66C37", "#6B007B", "#E044
 const TABLE_VISUAL_TYPES = ["tableEx", "pivotTable", "table", "matrix"];
 const HEX_COLOR = /^#[0-9A-F]{6}$/i;    // the leading # keeps codes like 202406 from counting as colours
 // Number columns that are helpers, not series the chart draws (sort keys, ranks, IDs)
-const HELPER_COLUMN = /\b(sort|rank|order|index|id|key)\b/i;
+// ("Order Count" and "Order Qty" are amounts; "Sort Order" is a helper)
+const HELPER_COLUMN = /\b(sort|rank|index|id|key)\b|\border\b(?!\s*(count|qty|quantity|total|value|amount|lines?|date|no\b|number))/i;
 // Visuals that give every value of their first field its own colour (each slice / tile)
 const COLOR_BY_CATEGORY_TYPES = ["treemap", "pieChart", "donutChart"];
 
@@ -896,6 +897,8 @@ function readableFormats(header, data) {
     const isYear = (n) => Number.isInteger(n) && n >= 1900 && n <= 2100;
     const isYearMonth = (n) => Number.isInteger(n) && n >= 190001 && n <= 210012;
     if (cells.every((c) => isYear(c.value)) || cells.every((c) => isYearMonth(c.value))) return null;
+    // Power BI exports a percentage measure as a fraction (0.44): a "%" field reads as one
+    if (/%|\b(percent|pct)\b/i.test(name) && cells.every((c) => Math.abs(c.value) <= 10)) return "0.0%";
     return cells.some((c) => !Number.isInteger(c.value)) ? "#,##0.00" : "#,##0";
   });
 }
@@ -1381,6 +1384,420 @@ function dualKpiTrend(item, info, colorsOn) {
   };
 }
 
+/*
+ * Power BI's KPI visual with a trend axis, as its code draws it: the indicator's value on the
+ * last point of the axis, "Goal: x" (two goals: "Goal: x, y") and the distance to a single
+ * goal ("(+12.5%)", or the amount, or both), the trend as an area over evenly spaced points,
+ * and a status colour from the theme: good, bad (below the goal when high is good, above it
+ * when low is good), neutral (between two goals), grey without a goal. The value and the
+ * trend take the status colour, so the card reads like the visual.
+ */
+const KPI_STATUS_TEXT = { good: "Target met", neutral: "Between targets", bad: "Target not met" };
+function kpiTrend(item, info, colorsOn) {
+  const { header, data, numeric } = classifyColumns(item.rows);
+  if (data.length < 2) return;
+  const dayFirst = dayFirstColumns(header, data);
+  const cells = data.map((row) => header.map((_, ci) => toCellValue(row[ci], dayFirst[ci])));
+  const formats = readableFormats(header, cells);
+  const roles = (info && info.roles) || {};
+  const b = (info && info.builtin) || {};
+  const found = fieldsByColumn(header, [...(roles.TrendLine || []), ...(roles.Indicator || []), ...(roles.Goal || [])]);
+  const roleCol = (role) => found.findIndex((e) => e && (roles[role] || []).includes(e));
+  let trendCol = roleCol("TrendLine"), valueCol = roleCol("Indicator");
+  let goalCols = (roles.Goal || []).map((e) => found.indexOf(e)).filter((c) => c >= 0).slice(0, 2);
+  // Without the report file: the axis is the first column that isn't a number, then the
+  // indicator and up to two goals
+  if (trendCol < 0) trendCol = header.findIndex((_, ci) => !numeric[ci]);
+  if (valueCol < 0) valueCol = header.findIndex((_, ci) => numeric[ci] && ci !== trendCol);
+  if (!info) goalCols = header.map((_, ci) => ci).filter((ci) => numeric[ci] && ci !== trendCol && ci !== valueCol).slice(0, 2);
+  if (trendCol < 0 || valueCol < 0) return;
+
+  // Points in axis order (dates by date; anything else as Power BI sorted it)
+  const order = cells.map((r, i) => i);
+  const dates = cells.every((r) => r[trendCol].value instanceof Date);
+  if (dates) order.sort((x, y) => cells[x][trendCol].value - cells[y][trendCol].value || x - y);
+  item.rows = [header, ...order.map((i) => data[i])];
+  const last = cells[order[order.length - 1]];
+  const actual = last[valueCol].value;
+  const goals = goalCols.map((c) => last[c].value).filter((v) => typeof v === "number");
+  const fmtOf = (c) => formats[c] || (cells.find((r) => typeof r[c].value === "number") || [])[c]?.numFmt || null;
+  const fmt = fmtOf(valueCol);
+
+  let status = null;
+  if (goals.length && typeof actual === "number") {
+    const hi = Math.max(...goals), lo = Math.min(...goals);
+    if (goals.length === 2 && actual >= lo && actual <= hi) status = "neutral";
+    else if (b.direction === "Negative") status = actual > hi ? "bad" : "good";
+    else status = actual < lo ? "bad" : "good";
+  }
+  const statusHex = status ? b[status] || KEYWORD_DEFAULTS[status] : "#8C8C8C";   // the card takes hex colours
+  const statusColor = toArgb(statusHex);
+
+  const note = [];
+  if (goals.length && b.showGoal !== false) {
+    note.push([`${b.goalText || "Goal"}: ${goals.map((g, i) => displayText(g, fmtOf(goalCols[i]) || fmt)).join(", ")}`, "plain"]);
+  }
+  if (goals.length === 1 && goals[0] !== 0 && typeof actual === "number" && b.showDistance !== false) {
+    const highIsGood = (b.distanceDirection || (b.direction === "Negative" ? "Low is good" : "High is good")) !== "Low is good";
+    const sign = (highIsGood ? actual < goals[0] : actual > goals[0]) ? "-" : "+";
+    const diff = Math.abs(actual - goals[0]);
+    const pct = `${sign}${(diff / Math.abs(goals[0]) * 100).toLocaleString("en-US", { maximumFractionDigits: 2 })}%`;
+    const amount = `${sign}${displayText(diff, fmt)}`;
+    const label = String(b.distanceLabel || "Percent");
+    const text = /both/i.test(label) ? `(${amount} ${pct})` : /value/i.test(label) ? `(${amount})` : `(${pct})`;
+    note.push([`${note.length ? "  " : ""}${text}`, "strong", colorsOn ? readableOnWhite(statusColor) : null]);
+  }
+  const label = (v) => (v instanceof Date ? dateText(v) : String(v ?? ""));
+  const compact = compactFormat(actual, fmt);
+  item.trend = {
+    dateCol: trendCol, points: order.length, dateAxis: false,
+    cards: [{
+      col: valueCol, label: header[valueCol], value: actual ?? "(Blank)", numFmt: compact || fmt,
+      text: typeof actual === "number" ? (compact ? compactText(actual, fmt) : displayText(actual, fmt)) : "(Blank)",
+      note, color: colorsOn ? statusHex : null, valueColor: colorsOn && status ? statusHex : null,
+      noSpark: b.showTrend === false, min: null, max: null,
+    }],
+    captionRuns: [
+      [`${header[trendCol]}  ${label(cells[order[0]][trendCol].value)} – ${label(last[trendCol].value)}`, "plain"],
+      b.showLastDate ? [`  ·  as of ${label(last[trendCol].value)}`, "plain"] : null,
+      status ? [`  ·  ${KPI_STATUS_TEXT[status]}`, "strong", colorsOn ? readableOnWhite(statusColor) : null] : null,
+    ],
+  };
+}
+
+/* ── Totals and matrices ──────────────────────────────────────────────────
+ * Power BI exports neither a table's totals nor a matrix's subtotals, and a matrix comes
+ * flat (row fields, values, column fields last; a row per row and column value). Totals are
+ * written as live formulas (SUBTOTAL 9: what the user filters out in Excel leaves the total,
+ * rows folded under [+] stay in it), only where adding up the rows gives Power BI's own
+ * total: sums and counts, minimum / maximum, and measures that aren't ratios, averages or
+ * distinct counts by their name or format. Other columns' totals stay blank.
+ */
+const COUNT_LIKE = /\b(unique|distinct|dcount|customers?|clients?|users?|visitors?|members?|accounts?|headcount|active)\b/i;
+const RATE_LIKE = /\b(price|rate|per|unit|avg|average)\b/i;
+const CHANGE_LIKE = /\b(yoy|mom|qoq|wow|growth|change|var|variance|index|score|share)\b/i;
+const SUBTOTAL_FN = { sum: 9, min: 5, max: 4 };
+
+/* How a column totals: "sum", "min", "max", or null (left blank) */
+function totalKind(field, name, fmt) {
+  if (/%/.test(fmt || "")) return null;
+  const names = [name, field && field.prop].filter(Boolean).join(" ");
+  if (field) {
+    if (field.kind === "agg") return field.agg === 0 || field.agg === 5 ? "sum" : field.agg === 3 ? "min" : field.agg === 4 ? "max" : null;
+    if (field.kind === "measure") return NON_ADDITIVE.test(names) || COUNT_LIKE.test(names) || CHANGE_LIKE.test(names) ? null : "sum";
+    return null;   // a column shown as it is, a hierarchy level
+  }
+  return NON_ADDITIVE.test(names) || COUNT_LIKE.test(names) || CHANGE_LIKE.test(names) || RATE_LIKE.test(names) ? null : "sum";
+}
+
+/* Each column's field in the report: its renamed label first, then its name */
+function fieldsByColumn(header, entries) {
+  const lower = header.map((h) => String(h ?? "").trim().toLowerCase());
+  const norm = header.map((h) => normalizeField(h));
+  const out = header.map(() => null), taken = new Set();
+  for (const e of entries || []) {
+    let ci = e.label ? lower.findIndex((h, c) => !taken.has(c) && h === e.label) : -1;
+    if (ci < 0) ci = norm.findIndex((h, c) => !taken.has(c) && h === e.ref);
+    if (ci >= 0) { out[ci] = e; taken.add(ci); }
+  }
+  return out;
+}
+
+/* A table's (or flat matrix's) totals row: { kinds: per column "sum" | "min" | "max" | null },
+   or null when the report turns totals off or nothing adds up */
+function totalsPlan(item, info) {
+  const b = (info && info.builtin) || {};
+  if ((item.type === "tableEx" && b.totals === false) || (item.type === "pivotTable" && b.rowSubtotals === false)) return null;
+  const { header, data, numeric, helper } = classifyColumns(item.rows);
+  const cells = data.map((row) => header.map((_, ci) => toCellValue(row[ci])));
+  const formats = readableFormats(header, cells);
+  const entries = info ? fieldsByColumn(header, [...((info.roles || {}).Values || []), ...((info.roles || {}).Rows || [])]) : header.map(() => null);
+  const kinds = header.map((h, ci) => {
+    if (item.columnKinds) return item.columnKinds[ci] || null;
+    if (!numeric[ci] || helper[ci] || /\byear\b/i.test(h)) return null;
+    const fmt = formats[ci] || (cells.find((r) => typeof r[ci].value === "number") || [])[ci]?.numFmt;
+    return totalKind(info && entries[ci] ? entries[ci].field || null : null, h, fmt);
+  });
+  return kinds.some(Boolean) ? { kinds } : null;
+}
+
+/* The total of numbers as Excel's SUBTOTAL would give it */
+function subtotalOf(kind, values) {
+  const nums = values.filter((v) => typeof v === "number");
+  if (!nums.length) return 0;
+  return kind === "min" ? Math.min(...nums) : kind === "max" ? Math.max(...nums) : nums.reduce((a, b) => a + b, 0);
+}
+
+/* A1 reference of a run of rows in one column */
+function colRange(ws, c, r1, r2) {
+  const L = ws.getColumn(c).letter;
+  return r1 === r2 ? `${L}${r1}` : `${L}${r1}:${L}${r2}`;
+}
+
+/* The totals row: "Total", then a live SUBTOTAL per column that adds up (data rows hr+1 … hr+n) */
+function writeTotalsRow(ws, row, col, item, hr, n, lay, table) {
+  const fonts = lay.fonts;
+  const kinds = item.totals.kinds;
+  const font = { ...fonts.header };
+  kinds.forEach((kind, ci) => {
+    const cell = ws.getCell(row, col + ci);
+    cell.font = font;
+    if (!kind) return;
+    const values = table.data.map((r) => r[ci].value);
+    cell.value = { formula: `SUBTOTAL(${SUBTOTAL_FN[kind]},${colRange(ws, col + ci, hr + 1, hr + n)})`, result: subtotalOf(kind, values) };
+    const fmt = table.formats[ci] || (table.data.find((r) => typeof r[ci].value === "number") || [])[ci]?.numFmt;
+    if (fmt) cell.numFmt = fmt;
+    cell.alignment = { vertical: "middle", horizontal: "right", indent: 2 };
+  });
+  if (!kinds[0]) {
+    const label = ws.getCell(row, col);
+    label.value = "Total";
+    label.alignment = { vertical: "middle", indent: 1 };
+  }
+}
+
+/*
+ * A matrix as Power BI draws it, from its flat export (needs the report file to know its
+ * row, column and value fields):
+ *  - column fields: a column per column value (per value and measure, "2024 · Sales" when
+ *    there are several measures), then Total columns (live sums across the row) when the
+ *    matrix shows column subtotals
+ *  - one row field: a row per row value, an Excel Table with a totals row
+ *  - several row fields: Power BI's stepped layout (item.stepped): each group's name, its
+ *    rows indented, its total row (live SUBTOTALs), Excel outline levels to fold the groups
+ *    (the grouping buttons beside the row numbers), and a grand total
+ * item.valueCols: each value field's columns (for the report's formatting); item.columnKinds:
+ * how each column totals.
+ */
+function matrixLayout(item, info) {
+  const roles = (info && info.roles) || {};
+  const rowF = roles.Rows || [], colF = roles.Columns || [], valF = roles.Values || [];
+  if (!rowF.length || !valF.length) return;
+  const { header, data } = classifyColumns(item.rows);
+  const lower = header.map((h) => String(h ?? "").trim().toLowerCase());
+  const norm = header.map((h) => normalizeField(h));
+  const taken = new Set();
+  const colOf = (f) => {
+    let ci = f.label ? lower.findIndex((h, c) => !taken.has(c) && h === f.label) : -1;
+    if (ci < 0) ci = norm.findIndex((h, c) => !taken.has(c) && h === f.ref);
+    if (ci >= 0) taken.add(ci);
+    return ci;
+  };
+  const rc = rowF.map(colOf), cc = colF.map(colOf), vc = valF.map(colOf);
+  if (rc.some((c) => c < 0) || cc.some((c) => c < 0) || vc.every((c) => c < 0)) return;
+  if (!cc.length && rc.length < 2) return;   // a plain list: stays a table (totals row only)
+  const b = info.builtin || {};
+  const text = (row, c) => String(row[c] ?? "").trim();
+  const cells = data.map((row) => header.map((_, ci) => toCellValue(row[ci])));
+  const formats = readableFormats(header, cells);
+  const measures = valF.map((f, k) => {
+    const ci = vc[k];
+    if (ci < 0) return null;
+    const fmt = formats[ci] || (cells.find((r) => typeof r[ci].value === "number") || [])[ci]?.numFmt;
+    return { k, ci, name: header[ci], kind: totalKind(f.field, header[ci], fmt) };
+  }).filter(Boolean);
+
+  // Column values in Power BI's order (a value missing from the first rows still lands in place)
+  let keys = [null];
+  const keyOf = (row) => cc.map((c) => text(row, c) || "(Blank)").join(" · ");
+  if (cc.length) {
+    const tagged = data.map((row) => [...row, keyOf(row)]);
+    keys = seriesOrder(tagged, header.length, rc);
+  }
+  // Leaf rows: one per row value(s), in the export's order
+  const leaves = new Map();
+  for (const row of data) {
+    const labels = rc.map((c) => text(row, c) || "(Blank)");
+    const id = labels.join("\u0001");
+    if (!leaves.has(id)) leaves.set(id, { labels, at: {} });
+    leaves.get(id).at[cc.length ? keyOf(row) : "\u0000"] = row;
+  }
+
+  // Columns: values per column value and measure, then the Total columns
+  const several = measures.length > 1;
+  const valueCols = valF.map(() => []);
+  const columns = [];   // { head, m, key } or { head, m, total: true }
+  for (const key of keys) {
+    for (const m of measures) {
+      columns.push({ head: key === null ? m.name : several ? `${key} · ${m.name}` : key, m, key });
+    }
+  }
+  if (cc.length && b.columnSubtotals !== false) {
+    for (const m of measures) if (m.kind) columns.push({ head: several ? `Total · ${m.name}` : "Total", m, total: true });
+  }
+  const valueOf = (leaf, c) => {
+    if (c.total) {
+      const vals = columns.filter((x) => !x.total && x.m === c.m).map((x) => toCellValue(text(leaf.at[x.key] || [], x.m.ci)).value);
+      return vals.some((v) => typeof v === "number") ? String(subtotalOf(c.m.kind, vals)) : "";
+    }
+    const row = leaf.at[c.key === null ? "\u0000" : c.key];
+    return row ? row[c.m.ci] ?? "" : "";
+  };
+
+  const labelHead = rc.length > 1 ? rc.map((c) => header[c]).join(" › ") : header[rc[0]];
+  const leafList = [...leaves.values()];
+  columns.forEach((c, i) => valueCols[c.m.k].push(i + 1));
+  item.valueCols = valueCols;
+  item.columnKinds = [null, ...columns.map((c) => c.m.kind)];
+  // Total columns sum across the row: { col index: [the measure's value columns] }
+  item.rowTotals = {};
+  columns.forEach((c, i) => {
+    if (c.total) item.rowTotals[i + 1] = { kind: c.m.kind, of: columns.map((x, j) => (!x.total && x.m === c.m ? j + 1 : -1)).filter((j) => j > 0) };
+  });
+  item.cellFormats = [null, ...columns.map((c) => formats[c.m.ci] || null)];
+
+  if (rc.length === 1) {
+    item.rows = [[labelHead, ...columns.map((c) => c.head)], ...leafList.map((l) => [l.labels[0], ...columns.map((c) => valueOf(l, c))])];
+    return;
+  }
+
+  // Stepped: group names, indented rows, group totals; levels for Excel's outline
+  const levels = rc.length;
+  const body = [];   // { type: "group" | "leaf" | "total", depth, label, values, from, to (body indices a total covers) }
+  const walk = (list, depth) => {
+    const groups = new Map();
+    for (const l of list) {
+      const g = l.labels[depth];
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(l);
+    }
+    for (const [label, members] of groups) {
+      if (depth === levels - 1) {
+        for (const l of members) body.push({ type: "leaf", depth, label, values: columns.map((c) => valueOf(l, c)) });
+        continue;
+      }
+      body.push({ type: "group", depth, label, values: columns.map(() => "") });
+      const from = body.length;
+      walk(members, depth + 1);
+      if (b.rowSubtotals !== false) body.push({ type: "total", depth, label: `${label} total`, values: columns.map(() => ""), from, to: body.length - 1 });
+    }
+  };
+  walk(leafList, 0);
+  item.stepped = { levels, body, subtotals: b.rowSubtotals !== false };
+  item.rows = [[labelHead, ...columns.map((c) => c.head)], ...body.map((x) => [x.label, ...x.values])];
+}
+
+/*
+ * The new card draws one card per measure in its Data field well, each with its own reference
+ * labels beneath (fields set in the card's formatting, e.g. "vs last year +4.2%"). Power BI
+ * exports them all in one row, so the row is split into one tile per measure, side by side in
+ * the visual's place, each with its reference labels as sub-rows (the visual's title goes on
+ * the first). Without the report file, every number column is a card.
+ */
+function splitCards(item, info) {
+  if (item.type !== "cardVisual" || item.rows.length !== 2 || item.rows[0].length < 2) return [item];
+  const [header, values] = item.rows;
+  const data = (info && info.roles && info.roles.Data) || [];
+  const refLabels = (info && info.builtin && info.builtin.refLabels) || [];
+  const owners = header.map(() => -1);   // per column: the card it belongs to (-1: a card of its own)
+  let cards;
+  if (data.length) {
+    const found = fieldsByColumn(header, data);
+    cards = found.map((e, ci) => (e ? ci : -1)).filter((ci) => ci >= 0);
+    if (cards.length < 1) return [item];
+    header.forEach((h, ci) => {
+      if (cards.includes(ci)) return;
+      const rl = refLabels.find((x) => x.ref === normalizeField(h));
+      const ownerField = rl && rl.owner >= 0 ? data[rl.owner] : null;
+      const at = ownerField ? found.indexOf(ownerField) : -1;
+      owners[ci] = at >= 0 ? at : cards[0];
+    });
+  } else {
+    cards = header.map((_, ci) => ci).filter((ci) => typeof toCellValue(values[ci]).value === "number");
+    if (cards.length < 2) return [item];
+  }
+  if (cards.length === 1) {
+    // one card: its measure is the large value, its reference labels beneath
+    const order = [cards[0], ...header.map((_, ci) => ci).filter((ci) => ci !== cards[0])];
+    return [{ ...item, rows: [order.map((ci) => header[ci]), order.map((ci) => values[ci])] }];
+  }
+  const { x, y, width, height } = item.layout || { x: 0, y: 0, width: 0, height: 0 };
+  return cards.map((ci, k) => {
+    const cols = [ci, ...header.map((_, c) => c).filter((c) => owners[c] === ci)];
+    return {
+      ...item, title: k === 0 ? item.title : "", isKpi: true,
+      rows: [cols.map((c) => header[c]), cols.map((c) => values[c])],
+      layout: { ...item.layout, x: x + (width / cards.length) * k, y, width: width / cards.length, height },
+    };
+  });
+}
+
+/* A table's sparklines (points read by querySparklines) as empty columns at their place in
+   the table, where the Excel sparklines go (item.sparkCols) */
+function addSparklineColumns(item) {
+  const cols = [];
+  for (const sp of [...item.sparklines].sort((a, b) => a.index - b.index)) {
+    const at = Math.max(0, Math.min(sp.index, item.rows[0].length));
+    item.rows = item.rows.map((row, ri) => [...row.slice(0, at), ri === 0 ? sp.name : "", ...row.slice(at)]);
+    cols.forEach((c) => {
+      if (c.ci >= at) c.ci++;
+      c.keyCols = c.keyCols.map((k) => (k >= at ? k + 1 : k));
+    });
+    cols.push({ ci: at, axis: sp.axis, series: sp.series, keyCols: sp.keyCols.map((k) => (k >= at ? k + 1 : k)) });
+  }
+  item.sparkCols = cols;
+}
+
+/*
+ * The page's hidden sheet of sparkline points. Excel sparklines read fixed ranges and stay
+ * in their cells when a table is sorted, so each table row's line reads a "live" row that
+ * looks its points up by the row's key cells (INDEX / MATCH): after a sort, every line
+ * still shows its own row's trend.
+ * add(axis, rows: [{ key, keyExpr, points }]) → each table row's range of live points.
+ */
+function makeTrendSheet(name) {
+  const blocks = [];
+  let next = 1;
+  return {
+    name, blocks,
+    add(axis, rows) {
+      const top = next, v0 = top + 1 + rows.length;
+      blocks.push({ top, axis, rows });
+      next = v0 + rows.length + 1;
+      const last = columnLetter(1 + axis.length);
+      return rows.map((_, i) => `'${name}'!B${v0 + i}:${last}${v0 + i}`);
+    },
+  };
+}
+
+/* A key cell's value as Excel's "&" turns it into text: numbers and dates (serials) plainly */
+function keyText(v) {
+  if (v instanceof Date) return String(Math.round((v.getTime() / 86400000 + 25569) * 1e6) / 1e6);
+  if (v === null || v === undefined) return "";
+  return String(v);
+}
+function columnLetter(n) {
+  let s = "";
+  for (; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + ((n - 1) % 26)) + s;
+  return s;
+}
+function writeTrendSheet(wb, sheet) {
+  const ws = wb.addWorksheet(sheet.name, { views: [{ showGridLines: false }] });
+  ws.state = "veryHidden";   // Excel's sparklines read it; users see only the page
+  for (const { top, axis, rows } of sheet.blocks) {
+    // The axis, then each row's key and points as exported, then the live rows
+    ws.getCell(top, 1).value = "Key";
+    axis.forEach((a, k) => { ws.getCell(top, 2 + k).value = a instanceof Date ? a : String(a ?? ""); });
+    const s0 = top + 1, s1 = top + rows.length, v0 = s1 + 1;
+    const last = columnLetter(1 + axis.length);
+    rows.forEach((r, i) => {
+      ws.getCell(s0 + i, 1).value = r.key;
+      r.points.forEach((v, k) => { ws.getCell(s0 + i, 2 + k).value = typeof v === "number" ? v : null; });
+    });
+    rows.forEach((r, i) => {
+      const vr = v0 + i;
+      ws.getCell(vr, 1).value = { formula: r.keyExpr, result: r.key };
+      axis.forEach((_, k) => {
+        const v = r.points[k];
+        ws.getCell(vr, 2 + k).value = {
+          formula: `IFERROR(INDEX($B$${s0}:$${last}$${s1},MATCH($A$${vr},$A$${s0}:$A$${s1},0),${k + 1}),"")`,
+          result: typeof v === "number" ? v : "",
+        };
+      });
+    });
+  }
+}
+
 /* KPI tiles show a title row only when the title adds something beyond the field name */
 function kpiHasTitle(item) {
   return !!item.displayTitle && item.displayTitle.toLowerCase() !== String(item.rows[0][0] || "").toLowerCase();
@@ -1408,8 +1825,9 @@ function blockSize(item, options) {
     return { width: 2, height, note: false };
   }
   const n = item.rows.length - 1;
-  const note = !!(options.collapse && n > options.visibleRows);
-  return { width: item.rows[0].length, height: headRows(item) + n + 1, note };
+  // A stepped matrix folds by its own groups; a totals row puts the note one row lower
+  const note = !item.stepped && !!(options.collapse && n > options.visibleRows);
+  return { width: item.rows[0].length, height: headRows(item) + n + 1 + (item.totals && note ? 1 : 0), note };
 }
 
 /*
@@ -1598,6 +2016,7 @@ function captionRuns(item, colors, header, fonts, units) {
 
 /* A trend visual's caption: its title, the days it spans and its dates, and its warnings */
 function trendCaptionRuns(trend, fonts) {
+  if (trend.captionRuns) return runsOf(trend.captionRuns, fonts);
   const c = trend.caption;
   return [
     c.title ? [c.title + "  ·  ", fonts.caption] : null,
@@ -1606,6 +2025,14 @@ function trendCaptionRuns(trend, fonts) {
     c.stale !== null ? [`  ·  latest data ${c.stale} days old${c.staleText ? ". " + c.staleText : ""}`, fonts.captionMore] : null,
     c.warning ? [`  ·  ⚠ ${c.warning}`, fonts.kpiChange] : null,
   ];
+}
+
+/* Text runs as [text, "plain" | "muted" | "strong", argb?] → rich-text runs */
+function runsOf(spec, fonts) {
+  return spec.filter(Boolean).map(([text, style, argb]) => {
+    const font = style === "strong" ? fonts.kpiChange : style === "muted" ? fonts.captionMore : fonts.caption;
+    return [text, argb ? { ...font, color: { argb } } : font];
+  });
 }
 
 /*
@@ -1633,19 +2060,23 @@ function writeTrendCards(ws, r, col, w, item, widths, lay, hr) {
     const v = ws.getCell(a + 1, col);
     v.value = card.value;
     if (card.numFmt) v.numFmt = card.numFmt;
-    v.font = fonts.kpiValue;
+    v.font = card.valueColor ? { ...fonts.kpiValue, color: { argb: readableOnWhite(toArgb(card.valueColor)) } } : fonts.kpiValue;
     v.alignment = { horizontal: "left", vertical: "middle", indent: 1 };
 
+    // The line under the value: the change since a date, or a KPI's goal and distance
+    const noteRuns = card.note ? runsOf(card.note, fonts) : [[card.change, fonts.kpiChange], [card.since ? `  since ${card.since}` : "", fonts.caption]];
     const change = ws.getCell(a + 3, col);
-    change.value = rich([card.change, fonts.kpiChange], [card.since ? `  since ${card.since}` : "", fonts.caption]);
+    change.value = rich(...noteRuns);
     change.alignment = { vertical: "middle", indent: 1 };
 
     if (w > 1) {
       ws.mergeCellsWithoutStyle(a + 1, col + 1, a + 3, col + w - 1);
-      (lay.sparklines = lay.sparklines || []).push({
-        cell: ws.getCell(a + 1, col + 1).address, values: range(card.col), dates: range(trend.dateCol),
-        color, min: card.min, max: card.max,
-      });
+      if (!card.noSpark) {
+        (lay.sparklines = lay.sparklines || []).push({
+          cell: ws.getCell(a + 1, col + 1).address, values: range(card.col), dates: trend.dateAxis === false ? null : range(trend.dateCol),
+          color, min: card.min, max: card.max,
+        });
+      }
     }
 
     for (let rr = a; rr < a + TREND_ROWS; rr++) {
@@ -1657,7 +2088,7 @@ function writeTrendCards(ws, r, col, w, item, widths, lay, hr) {
       }
     }
     needLeft = Math.max(needLeft, cellUnits(card.text, fonts.kpiValue, 1),
-      cellUnits(card.change, fonts.kpiChange, 1) + (card.since ? cellUnits(`  since ${card.since}`, fonts.caption) : 0));
+      noteRuns.reduce((u, [text, font], i) => u + cellUnits(text, font, i ? 0 : 1), 0));
     needLabel = Math.max(needLabel, cellUnits(label.value, fonts.kpiLabel, 1));
   });
   // The value and change fit their column; the sparkline gets room; the label stays inside the card
@@ -1672,21 +2103,12 @@ function writeTrendCards(ws, r, col, w, item, widths, lay, hr) {
  * Header cells keep exactly the column name (anything else makes Excel repair the file).
  * Style objects are made once per column and shared by every cell.
  */
-function writeDataTable(ws, r, col, item, tableName, widths, lay, number) {
-  const fonts = lay.fonts;
-  const cls = classifyColumns(item.rows);
-  const header = uniqueHeaders(item.rows[0]);
-  const dayFirst = dayFirstColumns(header, cls.data);   // 05/01/2023 is 5 January in a column that also has 15/01/2023
-  const data = cls.data.map((row) => header.map((_, i) => toCellValue(row[i], dayFirst[i])));
-  const formats = readableFormats(header, data);
-  const n = data.length;
-  const executive = !BUILT_IN_STYLES.includes(lay.tableStyle);
-
-  // Column widths: header, longest text, widest formatted number; numbers in one table
-  // share a width so their columns read as a set
+/* Column widths: header, longest text, widest formatted number; numbers in one table share
+   a width so their columns read as a set. indentOf(ri): a stepped row's label indent. */
+function tableColumnUnits(header, data, numeric, formats, indentOf) {
   const units = header.map((h, ci) => {
     let u = Math.min(45, Math.ceil(h.length * 1.05) + 5);
-    if (cls.numeric[ci]) {
+    if (numeric[ci]) {
       let widest = null, negative = false;
       for (const row of data) {
         const c = row[ci];
@@ -1700,16 +2122,23 @@ function writeDataTable(ws, r, col, item, tableName, widths, lay, number) {
       }
     } else {
       let longest = 0;
-      for (const row of data) if (row[ci].value != null) longest = Math.max(longest, displayText(row[ci].value, row[ci].numFmt).length);
+      data.forEach((row, ri) => {
+        if (row[ci].value != null) longest = Math.max(longest, displayText(row[ci].value, row[ci].numFmt).length + (ci === 0 && indentOf ? indentOf(ri) * 1.3 : 0));
+      });
       u = Math.max(u, Math.min(45, Math.ceil(longest * 0.95) + 3));
     }
     return Math.max(u, 10);
   });
-  const numericUnits = units.filter((_, ci) => cls.numeric[ci]);
+  const numericUnits = units.filter((_, ci) => numeric[ci]);
   if (numericUnits.length > 1) {
     const target = Math.min(Math.max(...numericUnits), 18);
-    units.forEach((u, ci) => { if (cls.numeric[ci]) units[ci] = Math.max(u, target); });
+    units.forEach((u, ci) => { if (numeric[ci]) units[ci] = Math.max(u, target); });
   }
+  return units;
+}
+
+/* An exhibit's title and caption rows, and its columns' widths */
+function writeExhibitHead(ws, r, col, item, header, units, widths, fonts, number) {
   units.forEach((u, ci) => widths.want(col + ci, u));
   const totalUnits = units.reduce((a, b) => a + b, 0);
   // The title overflows to the right, up to the next visual's title one gutter along:
@@ -1717,13 +2146,40 @@ function writeDataTable(ws, r, col, item, tableName, widths, lay, number) {
   const titleUnits = cellUnits(item.displayTitle, fonts.exTitle) + (number ? cellUnits(String(number).padStart(2, "0") + "  ", fonts.exNum) : 0) - GUTTER_W;
   widths.span(col, col + header.length - 1, Math.min(titleUnits, totalUnits + 40));
 
-  // Title and caption
   const t = ws.getCell(r, col);
   t.value = rich(number ? [String(number).padStart(2, "0") + "  ", fonts.exNum] : null, [item.displayTitle, fonts.exTitle]);
   t.alignment = { vertical: "bottom" };
   const cap = ws.getCell(r + 1, col);
   cap.value = rich(...(item.trend ? trendCaptionRuns(item.trend, fonts) : captionRuns(item, item.colors, header, fonts, totalUnits)));
   cap.alignment = { vertical: "middle" };
+}
+
+/* A formula over cells of one row: a range when they're side by side, else a list */
+function rowFormula(ws, fn, row, cols) {
+  const sorted = [...cols].sort((a, b) => a - b);
+  const runs = [];
+  for (const c of sorted) {
+    const last = runs[runs.length - 1];
+    if (last && c === last[1] + 1) last[1] = c; else runs.push([c, c]);
+  }
+  const refs = runs.map(([a, b]) => (a === b ? `${ws.getColumn(a).letter}${row}` : `${ws.getColumn(a).letter}${row}:${ws.getColumn(b).letter}${row}`));
+  return `${fn}(${refs.join(",")})`;
+}
+const ROW_TOTAL_FN = { sum: "SUM", min: "MIN", max: "MAX" };
+
+/* Returns what the totals row needs: the cells and number formats */
+function writeDataTable(ws, r, col, item, tableName, widths, lay, number) {
+  const fonts = lay.fonts;
+  const cls = classifyColumns(item.rows);
+  const header = uniqueHeaders(item.rows[0]);
+  const dayFirst = dayFirstColumns(header, cls.data);   // 05/01/2023 is 5 January in a column that also has 15/01/2023
+  const data = cls.data.map((row) => header.map((_, i) => toCellValue(row[i], dayFirst[i])));
+  const formats = readableFormats(header, data).map((f, ci) => (item.cellFormats && item.cellFormats[ci]) || f);
+  const n = data.length;
+  const executive = !BUILT_IN_STYLES.includes(lay.tableStyle);
+
+  const units = tableColumnUnits(header, data, cls.numeric, formats);
+  writeExhibitHead(ws, r, col, item, header, units, widths, fonts, number);
 
   // Trend cards, then the table
   const hr = r + headRows(item) - 1;
@@ -1759,8 +2215,123 @@ function writeDataTable(ws, r, col, item, tableName, widths, lay, number) {
     }
   });
 
+  // Sparkline columns: each row's points on the page's hidden "Trends" sheet, its line in the cell
+  for (const sc of item.sparkCols || []) {
+    if (!lay.trendSheet) break;
+    const color = lay.palette ? readableOnWhite(toArgb(lay.palette[0])) : lay.accent.cap;
+    widths.want(col + sc.ci, 18);
+    const page = `'${lay.sheetName}'!`;
+    const rows = data.map((row, ri) => ({
+      key: sc.keyCols.map((k) => keyText(row[k].value)).join("|"),
+      keyExpr: sc.keyCols.map((k) => page + "$" + ws.getColumn(col + k).letter + "$" + (hr + 1 + ri)).join('&"|"&'),
+      points: sc.series[ri] || [],
+    }));
+    const ranges = lay.trendSheet.add(sc.axis, rows);
+    ranges.forEach((at, ri) => {
+      (lay.sparklines = lay.sparklines || []).push({ cell: ws.getCell(hr + 1 + ri, col + sc.ci).address, values: at, dates: null, color, min: null, max: null });
+    });
+  }
+
+  // A matrix's Total columns: live sums (minimum / maximum) across the row
+  for (const [ci, t] of Object.entries(item.rowTotals || {})) {
+    for (let ri = 0; ri < n; ri++) {
+      const cell = ws.getCell(hr + 1 + ri, col + Number(ci));
+      const result = data[ri][ci].value;
+      cell.value = { formula: rowFormula(ws, ROW_TOTAL_FN[t.kind], hr + 1 + ri, t.of.map((c) => col + c)), result: typeof result === "number" ? result : 0 };
+    }
+  }
+
   if (item.colors) applyVisualColors(ws, hr, col, item, item.colors, lay);
   if (item.tableFormat) applyTableFormats(ws, hr, col, item, header, data, lay);
+  return { data, formats };
+}
+
+/*
+ * A matrix in Power BI's stepped layout (item.stepped, from matrixLayout): a header row, each
+ * group's name (bold), its rows indented one step per level, the group's total row, and a
+ * grand total on the closing row (`closeRow`). Totals are live SUBTOTALs over the group's rows
+ * (SUBTOTAL leaves out the subtotals inside its range, so nothing counts twice). Rows get Excel
+ * outline levels, folding each group into its total row with the [–] buttons beside the row
+ * numbers. Not an Excel Table: a stepped report doesn't sort or filter as a list.
+ * Returns the deepest outline level used.
+ */
+function writeSteppedMatrix(ws, r, col, item, widths, lay, number, closeRow) {
+  const fonts = lay.fonts, st = item.stepped;
+  const executive = !BUILT_IN_STYLES.includes(lay.tableStyle);
+  const header = uniqueHeaders(item.rows[0]);
+  const cls = classifyColumns(item.rows);
+  const data = cls.data.map((row) => header.map((_, i) => toCellValue(row[i])));
+  const formats = readableFormats(header, data).map((f, ci) => (item.cellFormats && item.cellFormats[ci]) || f);
+  const numeric = header.map((_, ci) => ci > 0);
+  const units = tableColumnUnits(header, data, numeric, formats, (ri) => st.body[ri].depth);
+  // Totals can outgrow every row: size the value columns for the grand total too
+  const kinds = item.columnKinds || [];
+  units.forEach((u, ci) => {
+    if (!kinds[ci]) return;
+    const total = subtotalOf(kinds[ci], data.filter((_, ri) => st.body[ri].type === "leaf").map((row) => row[ci].value));
+    units[ci] = Math.max(u, Math.ceil(displayText(Math.abs(total), formats[ci]).length * 0.95) + 5);
+  });
+  writeExhibitHead(ws, r, col, item, header, units, widths, fonts, number);
+
+  const hr = r + 2;
+  const bold = { ...fonts.body, bold: true, color: { argb: C.INK } };
+  header.forEach((h, ci) => {
+    const cell = ws.getCell(hr, col + ci);
+    cell.value = h;
+    cell.font = executive ? fonts.header : fonts.headerOnStyle;
+    cell.fill = executive ? SURFACE_FILL : solidFill(C.INK);
+    if (executive) cell.border = HEADER_BORDER;
+    cell.alignment = { vertical: "middle", horizontal: ci ? "right" : "left", indent: ci ? 2 : 1 };
+  });
+
+  const fnOf = (ci) => SUBTOTAL_FN[kinds[ci]];
+  const resultOf = (ci, from, to) => subtotalOf(kinds[ci], data.slice(from, to + 1).filter((_, i) => st.body[from + i].type === "leaf").map((row) => row[ci].value));
+  let deepest = 0;
+  st.body.forEach((x, ri) => {
+    const sr = hr + 1 + ri;
+    const level = x.type === "total" ? x.depth : x.depth + (x.type === "leaf" ? 0 : 1);
+    const outline = Math.min(7, x.type === "leaf" ? st.levels - 1 : level);
+    if (outline) ws.getRow(sr).outlineLevel = outline;
+    deepest = Math.max(deepest, outline);
+    const strong = x.type !== "leaf";
+    header.forEach((_, ci) => {
+      const cell = ws.getCell(sr, col + ci);
+      cell.font = strong ? bold : fonts.body;
+      if (executive) cell.border = x.type === "total" ? { top: { style: "thin", color: { argb: C.RULE } } } : BODY_BORDER;
+      if (ci === 0) {
+        cell.value = x.label;
+        cell.alignment = { vertical: "middle", indent: 1 + x.depth };
+        return;
+      }
+      cell.alignment = { vertical: "middle", horizontal: "right", indent: 2 };
+      if (formats[ci]) cell.numFmt = formats[ci];
+      if (x.type === "leaf") {
+        const t = item.rowTotals && item.rowTotals[ci];
+        const v = data[ri][ci].value;
+        cell.value = t ? { formula: rowFormula(ws, ROW_TOTAL_FN[t.kind], sr, t.of.map((c) => col + c)), result: typeof v === "number" ? v : 0 } : v;
+      } else if (x.type === "total" && fnOf(ci)) {
+        cell.value = { formula: `SUBTOTAL(${fnOf(ci)},${colRange(ws, col + ci, hr + 1 + x.from, hr + 1 + x.to)})`, result: resultOf(ci, x.from, x.to) };
+      }
+    });
+  });
+
+  // Grand total, on the closing row
+  const n = st.body.length;
+  header.forEach((_, ci) => {
+    const cell = ws.getCell(closeRow, col + ci);
+    cell.font = bold;
+    if (ci === 0) { cell.value = "Total"; cell.alignment = { vertical: "middle", indent: 1 }; return; }
+    cell.alignment = { vertical: "middle", horizontal: "right", indent: 2 };
+    if (formats[ci]) cell.numFmt = formats[ci];
+    if (fnOf(ci) && n) cell.value = { formula: `SUBTOTAL(${fnOf(ci)},${colRange(ws, col + ci, hr + 1, hr + n)})`, result: resultOf(ci, 0, n - 1) };
+  });
+
+  if (item.tableFormat) {
+    const leafRows = [], leafData = [];
+    st.body.forEach((x, ri) => { if (x.type === "leaf") { leafRows.push(hr + 1 + ri); leafData.push(data[ri]); } });
+    applyTableFormats(ws, hr, col, item, header, leafData, lay, leafRows);
+  }
+  return deepest;
 }
 
 /* Excel icon sets for Power BI icon rules: the same number of icons, the closest family */
@@ -1793,8 +2364,10 @@ function iconRank(name) {
  * A format names its column by field; matrices export rows then values in field order,
  * so a value field not found by name is found by its position among the values.
  */
-function applyTableFormats(ws, hr, col, item, header, data, lay) {
+function applyTableFormats(ws, hr, col, item, header, data, lay, rowsOf) {
   const info = item.tableFormat;
+  // Sheet row of each data row (a stepped matrix's value rows sit between group rows)
+  const rowAt = (ri) => (rowsOf ? rowsOf[ri] : hr + 1 + ri);
   const norm = header.map((h) => normalizeField(h));
   const lowerHeader = header.map((h) => String(h).trim().toLowerCase());
   const values = info.measures || [];
@@ -1821,22 +2394,35 @@ function applyTableFormats(ws, hr, col, item, header, data, lay) {
       if (ci < 0 && c >= 0 && c < header.length && !taken.has(c)) { valueCol[k] = c; taken.add(c); }
     });
   }
-  const columnOf = (name) => {
+  // A field's columns: one, or a pivoted matrix's column per column value (item.valueCols)
+  const columnsOf = (name) => {
     const n = normalizeField(String(name || "").toLowerCase());
     const k = values.findIndex((m) => m.ref === n);
-    if (k >= 0 && valueCol[k] >= 0) return valueCol[k];
-    return norm.indexOf(n);
+    if (item.valueCols && k >= 0) return item.valueCols[k] || [];
+    if (k >= 0 && valueCol[k] >= 0) return [valueCol[k]];
+    const ci = norm.indexOf(n);
+    return ci >= 0 ? [ci] : [];
   };
-  const first = hr + 1, last = hr + data.length;
   if (!data.length) return;
+  // Excel's range for some columns over the data rows: runs of rows, joined by spaces
+  const runs = [];
+  data.forEach((_, ri) => {
+    const r = rowAt(ri), last = runs[runs.length - 1];
+    if (last && r === last[1] + 1) last[1] = r; else runs.push([r, r]);
+  });
+  const refOf = (cols) => cols.flatMap((ci) => runs.map(([a, b]) => colRange(ws, col + ci, a, b))).join(" ");
 
-  // One colour per row for a column: a fixed colour, or its fx rule (null = left as is)
-  const column = (name) => {
-    const ci = columnOf(name);
-    return ci >= 0 ? data.map((r) => r[ci].value ?? null) : null;
-  };
-  const rowColors = (f) => {
+  // One colour per row for a column: a fixed colour, or its fx rule (null = left as is). A
+  // rule reads its fields in the same column value's columns as the cell it colours
+  const rowColors = (f, ci) => {
     if (f.color) return data.map(() => toArgb(f.color));
+    const at = item.valueCols ? item.valueCols.findIndex((cols) => cols.includes(ci)) : -1;
+    const pos = at >= 0 ? item.valueCols[at].indexOf(ci) : -1;
+    const column = (name) => {
+      const cols = columnsOf(name);
+      const c = pos >= 0 && cols.length > pos ? cols[pos] : cols[0];
+      return c !== undefined ? data.map((r) => r[c].value ?? null) : null;
+    };
     return evaluateColorRule(f.rule, column, data.length).colors.map((c) => (c ? toArgb(c) : null));
   };
 
@@ -1857,15 +2443,20 @@ function applyTableFormats(ws, hr, col, item, header, data, lay) {
     }
     const targets = f.target === "all"
       ? header.map((_, ci) => ci).filter((ci) => data.some((r) => typeof r[ci].value === "number"))
-      : [columnOf(f.target.slice(2))].filter((ci) => ci >= 0);
+      : [...columnsOf(f.target.slice(2))];
+    // Data bars and icons run over all of a field's columns as one range (one scale)
+    if ((f.kind === "bar" || f.kind === "icon") && targets.length > 1 && item.valueCols) {
+      targets.splice(1);
+      targets.ref = refOf(columnsOf(f.target.slice(2)));
+    }
     for (const ci of targets) {
       const c = col + ci;
-      const L = ws.getColumn(c).letter;
+      const ref = targets.ref || refOf([ci]);
       if (f.kind === "back" || f.kind === "font") {
-        const colors = rowColors(f);
+        const colors = rowColors(f, ci);
         colors.forEach((argb, ri) => {
           if (!argb) return;
-          const cell = ws.getCell(first + ri, c);
+          const cell = ws.getCell(rowAt(ri), c);
           if (f.kind === "back") {
             cell.fill = solidFill(argb);
             cell.font = fontIn(textOn(argb));
@@ -1880,7 +2471,7 @@ function applyTableFormats(ws, hr, col, item, header, data, lay) {
         if (f.bar.negative) { bar.negativeBarColorSameAsPositive = false; bar.negativeFillColor = { argb: toArgb(f.bar.negative) }; }
         if (f.bar.axis) bar.axisColor = { argb: toArgb(f.bar.axis) };
         if (f.bar.reverse) bar.direction = "rightToLeft";
-        ws.addConditionalFormatting({ ref: `${L}${first}:${L}${last}`, rules: [bar] });
+        ws.addConditionalFormatting({ ref, rules: [bar] });
       } else if (f.kind === "icon") {
         // Excel thresholds: % of range, a number or a percentile, like the report's
         const cfvo = (at) => (at.num !== undefined ? { type: "num", value: at.num }
@@ -1894,7 +2485,7 @@ function applyTableFormats(ws, hr, col, item, header, data, lay) {
         const steps = cases.map((x) => cfvo(x.from));
         if (steps[0].type === "num") steps[0] = { type: "min" };   // the lowest icon starts at the lowest value
         ws.addConditionalFormatting({
-          ref: `${L}${first}:${L}${last}`,
+          ref,
           rules: [{ type: "iconSet", iconSet, reverse, showValue: true, cfvo: steps }],
         });
       }
@@ -2129,6 +2720,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
   const threshold = options.collapse ? options.visibleRows : Infinity;
   const maxExtend = Math.max(12, options.visibleRows);
   const tables = [];
+  let outline = 0;     // deepest Excel outline level (stepped matrices)
   const rowUse = [];  // per Excel row: does it hold collapsible table rows ("deep") / anything else ("other")?
   const mark = (r, kind) => { (rowUse[r] = rowUse[r] || { deep: false, other: false })[kind] = true; };
 
@@ -2136,6 +2728,8 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
   // numbered) and colours
   const usedTitles = {};
   const colorNotes = [];
+  // A new card with several measures: one tile per measure
+  items = items.flatMap((item) => splitCards(item, visualInfo(lay.reportColors, item.page, item.name)));
   for (const item of items) {
     const info = visualInfo(lay.reportColors, item.page, item.name);
     if (item.isKpi) mainValueFirst(item, info);
@@ -2143,6 +2737,10 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     if ((customVisual(item.type) || {}).layout === "grid") comparisonRows(item, info);
     if ((customVisual(item.type) || {}).layout === "bins") histogramRows(item, info);
     if ((customVisual(item.type) || {}).layout === "trend") dualKpiTrend(item, info, !!lay.palette);
+    if (item.type === "kpi" && !item.isKpi) kpiTrend(item, info, !!lay.palette);
+    if (item.type === "pivotTable" && info) matrixLayout(item, info);
+    if (item.sparklines && item.sparklines.length && !item.stepped) addSparklineColumns(item);
+    if (TABLE_VISUAL_TYPES.includes(item.type) && !item.stepped) item.totals = totalsPlan(item, info);
     // A title turned off in the report isn't shown either (it is often an internal name such
     // as "TYS Card"): a table is titled from its columns instead, a KPI tile by its label
     const hidden = !!(info && info.titleHidden);
@@ -2201,7 +2799,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
         if (inStrip) size.height = strip.height;
         const n = item.rows.length - 1;
         plan.push({
-          item, col, r, size, stackIndex, vis: threshold, extra: 0,
+          item, col, r, size, stackIndex, vis: item.stepped ? Infinity : threshold, extra: 0,
           noteRow: size.note ? r + headRows(item) + n : null,
           divider: allCards && stackIndex > 0,
           strip: inStrip ? strip : null,
@@ -2231,15 +2829,22 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
         for (let i = 0; i < size.height; i++) mark(r + i, "other");
       } else {
         const number = options.exhibitNumbers ? ++exhibit : null;
-        writeDataTable(ws, r, col, item, nameTable(item.displayTitle), widths, lay, number);
         const n = item.rows.length - 1, head = headRows(item);
+        const closeRow = p.noteRow || r + head + n;
+        if (item.stepped) {
+          outline = Math.max(outline, writeSteppedMatrix(ws, r, col, item, widths, lay, number, closeRow));
+        } else {
+          const table = writeDataTable(ws, r, col, item, nameTable(item.displayTitle), widths, lay, number);
+          // The totals row is the closing row; a "rows grouped" note goes on the row below
+          if (item.totals) writeTotalsRow(ws, closeRow, col, item, r + head - 1, n, lay, table);
+        }
         for (let i = 0; i < head; i++) mark(r + i, "other");
         for (let i = 0; i < n; i++) mark(r + head + i, i >= p.vis ? "deep" : "other");
-        const closeRow = p.noteRow || r + head + n;
         for (let x = r + head + n; x < closeRow; x++) mark(x, "deep");   // padding lined up with a neighbour
         mark(closeRow, "other");
-        if (executive) paintRange(ws, closeRow, col, col + size.width - 1, { border: { top: INK_RULE } });
-        tables.push({ top: r, head, col, w: size.width, n, vis: p.vis, noteRow: p.noteRow });
+        if (item.totals && p.noteRow) mark(closeRow + 1, "other");
+        if (executive || item.totals || item.stepped) paintRange(ws, closeRow, col, col + size.width - 1, { border: { top: INK_RULE } });
+        tables.push({ top: r, head, col, w: size.width, n, vis: p.vis, noteRow: p.noteRow ? p.noteRow + (item.totals ? 1 : 0) : null });
       }
       bandBottom = Math.max(bandBottom, r + size.height);
     }
@@ -2268,7 +2873,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     if (hidden) pendingNotes.push({ row: t.noteRow, col: t.col, w: t.w, n: t.n, hidden });
   }
 
-  return { nextRow, lastCol, tableCount: tables.length, grouped, pendingNotes, colorNotes };
+  return { nextRow, lastCol, tableCount: tables.length, grouped, outline: Math.max(outline, grouped ? 1 : 0), pendingNotes, colorNotes };
 }
 
 /* ── Collecting a page ────────────────────────────────────────────────── */
@@ -2320,6 +2925,15 @@ async function activatePage(page) {
   });
 }
 
+/* A report's, page's or visual's filters, or none when Power BI won't say */
+async function filtersOf(target) {
+  try {
+    return (target && typeof target.getFilters === "function" && (await target.getFilters())) || [];
+  } catch (e) {
+    return [];
+  }
+}
+
 /*
  * Reads one page: filter chips, exportable items and notes. Visuals are exported one
  * at a time (Power BI rejects concurrent exportData calls).
@@ -2330,9 +2944,10 @@ async function collectPage(page, options, onProgress, isCancelled) {
     (a.layout.y - b.layout.y) || (a.layout.x - b.layout.x));
 
   const filterChips = [];
+  // The filters as models too: table sparklines are queried under them
+  const queryFilters = [...await filtersOf(embeddedReport), ...await filtersOf(page)];
   if (options.includeFilters) {
-    filterParts(await embeddedReport.getFilters()).forEach((p) => filterChips.push({ all: false, ...p }));
-    filterParts(await page.getFilters()).forEach((p) => filterChips.push({ all: false, ...p }));
+    filterParts(queryFilters).forEach((p) => filterChips.push({ all: false, ...p }));
   }
 
   const items = [];
@@ -2346,9 +2961,13 @@ async function collectPage(page, options, onProgress, isCancelled) {
     // Slicers become filter chips: "Field  selection", or "Field  All". A hidden slicer still
     // filters the page (bookmarks often hide them), so it gets a chip too.
     if (isSlicerType(v.type)) {
-      if (!options.includeFilters) continue;
+      if (!options.includeFilters) {
+        try { queryFilters.push(...((await v.getSlicerState()).filters || [])); } catch (e) { /* not readable */ }
+        continue;
+      }
       try {
         const state = await v.getSlicerState();
+        queryFilters.push(...(state.filters || []));
         const parts = filterParts(state.filters);
         if (parts.length) {
           parts.forEach((p) => filterChips.push({ all: false, ...p }));
@@ -2391,16 +3010,26 @@ async function collectPage(page, options, onProgress, isCancelled) {
         }
         continue;
       }
-      items.push({ title, name: v.name, page: page.name, type: v.type, layout: v.layout, rows, isKpi });
+      const visualFilters = TABLE_VISUAL_TYPES.includes(v.type) ? await filtersOf(v) : [];
+      items.push({ title, name: v.name, page: page.name, type: v.type, layout: v.layout, rows, isKpi, visualFilters });
       log(`Exported "${title}" (${rows.length - 1} rows)`);
     } catch (e) {
       if (NON_DATA_TYPES.includes(v.type)) continue;
-      notes.push(`Export failed for "${title}" (${v.type}): ${errorText(e)}`);
+      // Visuals Power BI never exports from: say so plainly rather than as a failure
+      const blocked = NOT_EXPORTABLE[v.type];
+      notes.push(blocked ? `Not included: "${title}" – Power BI doesn't export data from ${blocked}.`
+        : `Export failed for "${title}" (${v.type}): ${errorText(e)}`);
       log(`Export failed for "${title}": ${errorText(e)}`);
     }
   }
-  return { filterChips, items, notes };
+  return { filterChips, items, notes, queryFilters };
 }
+
+/* Visuals whose data Power BI doesn't export, by type: what to call them in a note */
+const NOT_EXPORTABLE = {
+  keyDriversVisual: "key influencers visuals", qnaVisual: "Q&A visuals", scriptVisual: "R visuals", pythonVisual: "Python visuals",
+  rdlVisual: "paginated report visuals", powerApps: "Power Apps visuals", PowerApps_PowerBI_Visual: "Power Apps visuals",
+};
 
 /* ── Writing a sheet ──────────────────────────────────────────────────── */
 
@@ -2443,6 +3072,7 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
   const fonts = makeFonts(branding.titleFont);
   const lay = {
     fonts, accent, sheetName,
+    trendSheet: ctx.trendSheet ? makeTrendSheet(ctx.trendSheet) : null,
     tableStyle: branding.tableStyle || EXECUTIVE,
     palette: options.matchColors ? options.palette : null,
     reportColors: options.matchColors ? options.reportColors || null : null,
@@ -2609,7 +3239,7 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
   for (let r = layoutStart; r <= footerRow; r++) ws.getRow(r).height = ROW_H;
   // outlineProperties is never set: Excel's default puts [+] on the note row, and
   // setting it together with fitToPage makes ExcelJS write invalid sheet XML
-  if (layout.grouped) ws.properties.outlineLevelRow = 1;
+  if (layout.outline) ws.properties.outlineLevelRow = layout.outline;
 
   const letterPaper = /^(en-US|en-CA|fr-CA|es-MX|es-US|en-PH)/i.test((typeof navigator !== "undefined" && navigator.language) || "");
   Object.assign(ws.pageSetup, {
@@ -2633,6 +3263,7 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
     kpis: data.items.filter((it) => it.isKpi).length,
     charts: lay.charts || [],   // charts mode: charts to add to this sheet (Step 9)
     sparklines: lay.sparklines || [],   // trend cards' sparklines, added by addSparklinesToFile
+    trendSheet: lay.trendSheet && lay.trendSheet.blocks.length ? lay.trendSheet : null,
   };
 }
 
@@ -3059,8 +3690,10 @@ function funnelPlan(item) {
 }
 
 /* Value labels in the middle of each bar (used by the funnel) */
-function dataLabelsXml(fmt) {
-  return `<c:dLbls><c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>` +
+function dataLabelsXml(fmt, argb) {
+  // Labels inside a bar: white or ink, whichever reads on the bar's colour (Power BI's white)
+  const text = argb ? `<c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="900" b="1">${fillXml(textOn(argb))}</a:defRPr></a:pPr><a:endParaRPr lang="en-US"/></a:p></c:txPr>` : "";
+  return `<c:dLbls><c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>${text}` +
     `<c:dLblPos val="ctr"/><c:showLegendKey val="0"/><c:showVal val="1"/><c:showCatName val="0"/><c:showSerName val="0"/>` +
     `<c:showPercent val="0"/><c:showBubbleSize val="0"/></c:dLbls>`;
 }
@@ -3198,6 +3831,12 @@ function waterfallLabel(v, fmt, precision) {
   const f = String(fmt || "");
   if (f.includes("%")) return (v * 100).toFixed(precision ?? 0) + "%";
   const prefix = (f.match(/^"([^"]*)"/) || [])[1] || "";
+  // Without decimals set in the report, large steps read like Power BI's auto units (2.47M)
+  const a = Math.abs(v);
+  if (precision === undefined && a >= 1e4) {
+    const [div, unit] = a >= 1e9 ? [1e9, "bn"] : a >= 1e6 ? [1e6, "M"] : [1e3, "K"];
+    return (v < 0 ? "-" : "") + prefix + (a / div).toLocaleString("en-US", { maximumFractionDigits: 2 }) + unit;
+  }
   const dec = precision ?? (((f.match(/\.(0+)/) || [])[1] || "").length);
   return (v < 0 ? "-" : "") + prefix + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: dec, maximumFractionDigits: dec });
 }
@@ -3333,7 +3972,7 @@ function chartSeriesXml(kind, s, i, plan, ref) {
   }
   const sp = s.hidden ? `<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>`
     : s.color ? `<c:spPr>${fillXml(s.color)}</c:spPr>` : "";
-  const labels = s.labels ? dataLabelsXml(s.fmt) : "";
+  const labels = s.labels ? dataLabelsXml(s.fmt, s.color || (s.pointColors && s.pointColors.find(Boolean)) || null) : "";
   if (kind === "bar") return `<c:ser>${head}${sp}<c:invertIfNegative val="0"/>${points}${labels}${cat}${val}</c:ser>`;
   if (kind === "area") return `<c:ser>${head}${sp}${cat}${val}</c:ser>`;
   const pieLabels = s.pieLabels ? pieLabelsXml(s.pieLabelPos) : "";
@@ -3370,8 +4009,9 @@ function axisTitles(plan, main, lines) {
   };
 }
 
-function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true, hidden = false, title = null, axis = null, labels = true } = {}) {
-  const bounds = axis ? `<c:max val="${axis.max}"/><c:min val="${axis.min}"/>` : "";
+function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true, hidden = false, title = null, axis = null, labels = true, zero = false } = {}) {
+  // zero: bars and columns start at 0 as Power BI's do; Excel's own minimum can cut close values short
+  const bounds = axis ? `<c:max val="${axis.max}"/><c:min val="${axis.min}"/>` : zero ? `<c:min val="0"/>` : "";
   return `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/>${bounds}</c:scaling><c:delete val="${hidden ? 1 : 0}"/><c:axPos val="${pos}"/>` +
     (grid ? `<c:majorGridlines><c:spPr><a:ln w="6350">${fillXml(C.HAIR)}</a:ln></c:spPr></c:majorGridlines>` : "") +
     (title ? axisTitleXml(title) : "") +
@@ -3427,7 +4067,8 @@ function chartXml(plan) {
     const titles = axisTitles(plan, main, lines);
     let axes = catAxXml(A1, A2, horizontal ? "l" : "b", { reverse: horizontal, title: titles.cat, hidden: !titles.catShow, count: plan.categories.length }) +
       valAxXml(A2, A1, horizontal ? "b" : "l", valFmt, { crosses: horizontal ? "max" : "autoZero", grid: !spec.hideValueAxis,
-        hidden: !!spec.hideValueAxis || !titles.valShow, title: spec.hideValueAxis ? null : titles.val });
+        hidden: !!spec.hideValueAxis || !titles.valShow, title: spec.hideValueAxis ? null : titles.val,
+        zero: (kind === "bar" || kind === "combo") && main.every(([s]) => s.values.every((v) => v === null || v >= 0)) });
     if (lines.length) {
       groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
         lines.map(([s, i]) => chartSeriesXml("line", s, i, plan, refs.series[i])).join("") +
@@ -3623,6 +4264,209 @@ async function addSparklinesToFile(buffer, sparkSheets) {
   return zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
 }
 
+/* ── Table sparklines ──────────────────────────────────────────────────────
+ * A table's sparkline column (a measure over a field, e.g. Sales by Month) isn't in Power
+ * BI's exported data. Its points are read with one DAX query per sparkline through the
+ * Power BI executeQueries API, grouped by the table's row fields and the sparkline's field,
+ * under the same report, page, slicer and visual filters. This needs the report file (to
+ * know the fields) and the user's permission to query the semantic model (Build); otherwise
+ * a note says why the trend lines are missing.
+ */
+
+/* A DAX literal for a filter value */
+function daxLiteral(v) {
+  if (v === null || v === undefined) return "BLANK()";
+  if (typeof v === "boolean") return v ? "TRUE()" : "FALSE()";
+  if (typeof v === "number") return String(v);
+  const s = String(v);
+  const d = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}):(\d{2}))?/);
+  if (d) return d[4] && (+d[4] || +d[5] || +d[6]) ? `DATE(${+d[1]},${+d[2]},${+d[3]})+TIME(${+d[4]},${+d[5]},${+d[6]})` : `DATE(${+d[1]},${+d[2]},${+d[3]})`;
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+const daxColumn = (table, column) => `'${String(table).replace(/'/g, "''")}'[${String(column).replace(/]/g, "]]")}]`;
+
+/* A filter model (report, page, slicer or visual filter) as a DAX filter table; throws on a
+   kind of filter that can't be written (relative dates, Top N, hierarchy filters) */
+const DAX_CONDITIONS = {
+  Is: (c, v) => `${c} = ${v}`, IsNot: (c, v) => `${c} <> ${v}`, LessThan: (c, v) => `${c} < ${v}`, LessThanOrEqual: (c, v) => `${c} <= ${v}`,
+  GreaterThan: (c, v) => `${c} > ${v}`, GreaterThanOrEqual: (c, v) => `${c} >= ${v}`, Contains: (c, v) => `CONTAINSSTRING(${c}, ${v})`,
+  DoesNotContain: (c, v) => `NOT CONTAINSSTRING(${c}, ${v})`, StartsWith: (c, v) => `LEFT(${c}, LEN(${v})) = ${v}`,
+  DoesNotStartWith: (c, v) => `LEFT(${c}, LEN(${v})) <> ${v}`, IsBlank: (c) => `ISBLANK(${c})`, IsNotBlank: (c) => `NOT ISBLANK(${c})`,
+};
+function daxFilter(f) {
+  const t = f && f.target;
+  if (!t || !t.table || !t.column || f.timeUnitType !== undefined || f.itemCount !== undefined || f.hierarchyData) {
+    throw new Error(`filter on ${targetName(t)} can't be applied to the query`);
+  }
+  const c = daxColumn(t.table, t.column);
+  if (f.values) {
+    if (!f.values.length || f.operator === "All") return null;
+    if (f.values.some(Array.isArray)) throw new Error(`filter on ${targetName(t)} can't be applied to the query`);
+    const list = `{${f.values.map(daxLiteral).join(", ")}}`;
+    return f.operator === "NotIn" || f.isExclude ? `FILTER(ALL(${c}), NOT ${c} IN ${list})` : `TREATAS(${list}, ${c})`;
+  }
+  if (f.conditions) {
+    if (!f.conditions.length) return null;
+    const parts = f.conditions.map((x) => {
+      const fn = DAX_CONDITIONS[x.operator];
+      if (!fn) throw new Error(`filter "${x.operator}" on ${t.column} can't be applied to the query`);
+      return `(${fn(c, daxLiteral(x.value))})`;
+    });
+    return `FILTER(ALL(${c}), ${parts.join(f.logicalOperator === "Or" ? " || " : " && ")})`;
+  }
+  return null;
+}
+
+/* The DAX for a field's value: a measure, or a column's aggregation */
+const DAX_AGGREGATIONS = { 0: "SUM", 1: "AVERAGE", 2: "DISTINCTCOUNT", 3: "MIN", 4: "MAX", 5: "COUNTA", 6: "MEDIAN", 7: "STDEV.P", 8: "VAR.P" };
+function daxValue(f) {
+  if (!f || !f.entity || !f.prop) return null;
+  if (f.kind === "measure") return daxColumn(f.entity, f.prop);
+  if (f.kind === "agg" && DAX_AGGREGATIONS[f.agg]) return `${DAX_AGGREGATIONS[f.agg]}(${daxColumn(f.entity, f.prop)})`;
+  return null;
+}
+
+/* Text that matches a value however it was written: "2023-01-15 00:00:00", "1/15/2023", a JSON date */
+function matchKey(v) {
+  if (v === null || v === undefined) return "";
+  const s = String(v).trim();
+  const d = parseDate(s) || parseDate(s.replace(/T.*$/, ""));
+  if (d) return d.date.toISOString().slice(0, 10);
+  const n = toCellValue(s).value;
+  return typeof n === "number" ? String(n) : s.toLowerCase();
+}
+
+/* Sparkline points in the order Power BI draws them: dates and numbers ascending, month
+   and quarter names in calendar order, other text as the query returned it */
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+function axisOrder(values) {
+  const key = (v) => {
+    if (v === null || v === undefined) return [3, ""];
+    const s = String(v).trim();
+    const d = parseDate(s.replace(/T(\d\d:\d\d:\d\d).*$/, " $1"));
+    if (d) return [0, d.date.getTime()];
+    if (typeof v === "number" || /^-?\d+(\.\d+)?$/.test(s)) return [0, Number(s)];
+    const m = MONTHS.indexOf(s.slice(0, 3).toLowerCase());
+    if (m >= 0) return [1, m];
+    const q = s.match(/^(?:q|qtr|quarter)\s*(\d)$/i);
+    if (q) return [1, Number(q[1])];
+    return [2, 0];
+  };
+  return (a, b) => {
+    const [ka, va] = key(a), [kb, vb] = key(b);
+    return ka !== kb ? ka - kb : va < vb ? -1 : va > vb ? 1 : 0;
+  };
+}
+
+/* The table's sparkline fields, with the table's grouping fields, from the report file */
+function sparklineFields(item, info) {
+  if (!info || !["tableEx", "pivotTable"].includes(item.type)) return null;
+  const roles = info.roles || {};
+  if (item.type === "pivotTable" && (roles.Columns || []).length) return null;   // a pivoted matrix: not supported
+  const groupRole = item.type === "pivotTable" ? roles.Rows || [] : (roles.Values || []).filter((e) => e.field && e.field.kind === "column");
+  const values = roles.Values || [];
+  const sparks = values.filter((e) => e.field && e.field.kind === "spark");
+  if (!sparks.length) return null;
+  return { groups: groupRole, sparks, values };
+}
+
+async function querySparklines(item, info, filters) {
+  const plan = sparklineFields(item, info);
+  if (!plan) return null;
+  const [header] = item.rows;
+  if (plan.groups.some((g) => !g.field || g.field.kind !== "column" || !g.field.entity)) {
+    return { note: `"${item.title}": its trend lines (sparklines) run over a hierarchy level, which the export can't query.` };
+  }
+  const found = fieldsByColumn(header, plan.groups);
+  const where = plan.groups.map((g) => found.indexOf(g));
+  if (where.some((ci) => ci < 0)) return null;
+  let filterTables;
+  try {
+    filterTables = filters.map(daxFilter).filter(Boolean);
+  } catch (e) {
+    return { note: `"${item.title}": its trend lines (sparklines) weren't added: a ${e.message}.` };
+  }
+  const groupBy = plan.groups.map((g) => daxColumn(g.field.entity, g.field.prop));
+  const out = [];
+  for (const sp of plan.sparks) {
+    const s = sp.field;
+    const axis = (s.groupings || [])[0];
+    const value = daxValue(s.measure);
+    if (!value || !axis || axis.kind !== "column" || !axis.entity) {
+      out.push({ entry: sp, error: "its field isn't a column the export can query" });
+      continue;
+    }
+    const query = `EVALUATE SUMMARIZECOLUMNS(${[...groupBy, daxColumn(axis.entity, axis.prop), ...filterTables, `"v", ${value}`].join(", ")})`;
+    const res = await executeDaxQuery(query);
+    if (res.error) { out.push({ entry: sp, error: res.error }); continue; }
+    // Rows come back as { "Table[Column]": …, "[v]": … }
+    const keyName = (g) => `${g.field.entity}[${g.field.prop}]`;
+    const axisName = `${axis.entity}[${axis.prop}]`;
+    const byRow = new Map();
+    const points = new Set();
+    for (const row of res.rows) {
+      const k = plan.groups.map((g) => matchKey(row[keyName(g)])).join("\u0001");
+      if (!byRow.has(k)) byRow.set(k, new Map());
+      byRow.get(k).set(row[axisName], typeof row["[v]"] === "number" ? row["[v]"] : null);
+      points.add(row[axisName]);
+    }
+    const axisValues = [...points].sort(axisOrder([...points]));
+    const name = `${s.measure.prop} by ${axis.prop}`;
+    const series = item.rows.slice(1).map((r) => {
+      const m = byRow.get(where.map((ci) => matchKey(r[ci])).join("\u0001"));
+      return axisValues.map((a) => (m && m.has(a) ? m.get(a) : null));
+    });
+    out.push({ entry: sp, index: plan.values.indexOf(sp), keyCols: where, name, axis: axisValues.map((a) => (typeof a === "string" && /T\d\d:/.test(a) ? a.slice(0, 10) : a)), series });
+  }
+  return { sparks: out };
+}
+
+/* Runs a DAX query on the report's semantic model; { rows } or { error } */
+async function executeDaxQuery(query) {
+  try {
+    const token = await getDesignToken({ quiet: true });
+    if (!token) return { error: "the export doesn't have permission to query the data (Export options → Colours → Allow exact colours)" };
+    let datasetId = currentReport.datasetId;
+    const groupId = new URL(currentReport.embedUrl).searchParams.get("groupId");
+    if (!datasetId) {
+      const r = await fetch(`${PBI_API}${groupId ? `/groups/${groupId}` : ""}/reports/${currentReport.id}`, { headers: { Authorization: `Bearer ${token}` } });
+      datasetId = r.ok ? (await r.json()).datasetId : null;
+      currentReport.datasetId = datasetId;
+    }
+    if (!datasetId) return { error: "the report's semantic model couldn't be found" };
+    const res = await fetch(`${PBI_API}${groupId ? `/groups/${groupId}` : ""}/datasets/${datasetId}/executeQueries`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ queries: [{ query }], serializerSettings: { includeNulls: true } }),
+    });
+    if (res.status === 401 || res.status === 403) return { error: "querying the semantic model needs Build permission on it" };
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) return { error: `the query failed (${res.status}${body.error ? ": " + (body.error.message || body.error.code) : ""})` };
+    const result = body.results && body.results[0];
+    if (result && result.error) return { error: `the query failed (${result.error.message || result.error.code})` };
+    return { rows: ((result && result.tables && result.tables[0]) || {}).rows || [] };
+  } catch (e) {
+    return { error: `the query failed (${errorText(e)})` };
+  }
+}
+
+/* For every table with sparklines: their points (item.sparklines), or a note */
+async function loadSparklines(collected, options) {
+  for (const { page, data } of collected) {
+    for (const item of data.items) {
+      const info = visualInfo(options.reportColors, item.page, item.name);
+      if (!sparklineFields(item, info)) continue;
+      const res = await querySparklines(item, info, [...(data.queryFilters || []), ...(item.visualFilters || [])]);
+      if (!res) continue;
+      if (res.note) { data.notes.push(res.note); continue; }
+      item.sparklines = res.sparks.filter((s) => !s.error);
+      for (const s of res.sparks.filter((x) => x.error)) data.notes.push(`"${item.title}": a trend line (sparkline) wasn't added: ${s.error}.`);
+      log(`Sparklines for "${item.title}" on ${page.displayName}: ${item.sparklines.length}`);
+    }
+  }
+}
+
 /* ── Orchestrator ─────────────────────────────────────────────────────── */
 /*
  * pages: Power BI Page objects to export, in order.
@@ -3686,6 +4530,12 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
     if (colorNote && collected.length) collected[0].data.notes.push(colorNote);
   }
 
+  // Table sparklines: their points, queried from the semantic model (needs the report file)
+  if (options.reportColors) {
+    onProgress({ pageIndex: pages.length, pageCount: pages.length, pageName: pages[pages.length - 1].displayName, visualIndex: 0, visualCount: 0, visualTitle: "Reading sparklines…" });
+    await loadSparklines(collected, options);
+  }
+
   // "Match the report" accent: the report theme's main colour, else a neutral navy
   if (branding.accentAuto) {
     if (!theme) theme = await readThemeColors();
@@ -3729,14 +4579,17 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
   const left = collected.filter((c) => !sheets.includes(c)).map(({ page }) => `"${page.displayName}"`);
   if (left.length) sheets[0].data.notes.push(`Not included: ${left.join(", ")} – no visuals with data.`);
   sheets.forEach(({ page, data }, i) => {
-    const ctx = { pageIndex: i + 1, pageCount: sheets.length, dateText };
     const sheetName = nameSheet(page.displayName);
+    // A hidden sheet for the page's table sparklines, named next to the page
+    const trendSheet = data.items.some((it) => it.sparklines && it.sparklines.length) ? nameSheet(`Trends ${i + 1}`) : null;
+    const ctx = { pageIndex: i + 1, pageCount: sheets.length, dateText, trendSheet };
     const counts = writePageSheet(wb, sheetName, page, data, options, branding, logo, nameTable, ctx);
     // Charts mode: this page's chart numbers go on its own "Data" sheet, right after it
     if (counts.charts.length) {
       writeChartDataSheet(wb, nameSheet(`${page.displayName} – Data`), counts.charts);
       chartSheets.push({ sheetName, charts: counts.charts });
     }
+    if (counts.trendSheet) writeTrendSheet(wb, counts.trendSheet);
     if (counts.sparklines.length) sparkSheets.push({ sheetName, sparklines: counts.sparklines });
     totals.tables += counts.tables;
     totals.kpis += counts.kpis;

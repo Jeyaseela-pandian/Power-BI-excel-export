@@ -548,6 +548,33 @@ function fieldName(f) {
 }
 
 /*
+ * What a query field is, for totals and queries: a column, a measure, an aggregated column
+ * (agg: Power BI's aggregation code: 0 sum, 1 average, 2 distinct count, 3 min, 4 max,
+ * 5 count, 6 median, 7 standard deviation, 8 variance), a hierarchy level or a table
+ * sparkline (its measure and the fields it runs over); entity and prop name it in the model.
+ * sources: the classic format's query aliases ("s" → "Sales").
+ */
+function fieldInfo(f, sources = {}) {
+  if (!f) return null;
+  const entityOf = (x) => {
+    const ref = x && x.Expression && x.Expression.SourceRef;
+    return ref ? ref.Entity || sources[ref.Source] || null : null;
+  };
+  if (f.Column) return { kind: "column", entity: entityOf(f.Column), prop: f.Column.Property };
+  if (f.Measure) return { kind: "measure", entity: entityOf(f.Measure), prop: f.Measure.Property };
+  if (f.Aggregation) {
+    const inner = fieldInfo(f.Aggregation.Expression, sources);
+    return inner ? { ...inner, kind: "agg", agg: Number(f.Aggregation.Function) } : null;
+  }
+  if (f.HierarchyLevel) return { kind: "level", prop: f.HierarchyLevel.Level };
+  if (f.SparklineData) {
+    return { kind: "spark", measure: fieldInfo(f.SparklineData.Measure, sources),
+      groupings: (f.SparklineData.Groupings || []).map((g) => fieldInfo(g, sources)) };
+  }
+  return null;
+}
+
+/*
  * The classic format names each projection by a query alias. Usually that is
  * "Table.Field", but it can be "select", "select1"… (hierarchy levels, fields added in
  * some ways), so the real field comes from the visual's query (prototypeQuery.Select).
@@ -555,16 +582,20 @@ function fieldName(f) {
 function legacyVisual(config) {
   const sv = config.singleVisual || {};
   const props = sv.columnProperties || {};
-  const aliases = {};
+  const aliases = {}, fields = {};
+  const sources = Object.fromEntries((((sv.prototypeQuery || {}).From) || []).map((f) => [f.Name, f.Entity]));
   for (const sel of ((sv.prototypeQuery || {}).Select || [])) {
     const name = fieldName(sel);
     if (sel.Name && name) aliases[sel.Name] = name;
+    if (sel.Name) fields[sel.Name] = fieldInfo(sel, sources);
   }
   const roles = {};
   for (const [role, list] of Object.entries(sv.projections || {})) {
     roles[role] = (list || []).map((p) => ({
       ref: normalizeField(aliases[p.queryRef] || p.queryRef),
       label: props[p.queryRef] && props[p.queryRef].displayName ? String(props[p.queryRef].displayName).toLowerCase() : null,
+      field: fields[p.queryRef] || null,
+      queryRef: p.queryRef,
     }));
   }
   const o = sv.objects || {};
@@ -579,6 +610,8 @@ function pbirVisual(json) {
     roles[role] = ((state && state.projections) || []).map((p) => ({
       ref: normalizeField(fieldName(p.field) || p.queryRef || p.nativeQueryRef),
       label: p.displayName ? String(p.displayName).toLowerCase() : null,
+      field: fieldInfo(p.field),
+      queryRef: p.queryRef || null,
     }));
   }
   const o = v.objects || {};
@@ -667,6 +700,62 @@ function customTableFormats(custom, ownRoles, settings) {
   if (settings.headerBack) out.push({ target: "header", kind: "back", color: settings.headerBack });
   if (settings.headerText) out.push({ target: "header", kind: "font", color: settings.headerText });
   return out;
+}
+
+/*
+ * Settings of the built-in visuals the export rebuilds, at Power BI's defaults when the
+ * report leaves them: a table's totals, a matrix's subtotals, a KPI's goal and status
+ * colours (from the theme's good / neutral / bad), a new card's reference labels (each
+ * belongs to one of the card's measures: owner, its index among the Data fields).
+ */
+function builtInSettings(visual, theme) {
+  const o = visual.objects || {};
+  const entry = (name) => (o[name] || []).find((e) => !e.selector) || (o[name] || [])[0] || {};
+  const lit = (name, prop, dflt) => {
+    const v = ((entry(name).properties || {})[prop] || {}).expr;
+    if (!v || !v.Literal) return dflt;
+    const text = String(v.Literal.Value);
+    if (text === "true" || text === "false") return text === "true";
+    const n = text.match(/^(-?\d+(?:\.\d+)?)[LDM]?$/i);
+    return n ? Number(n[1]) : text.replace(/^'([\s\S]*)'$/, "$1").replace(/''/g, "'");
+  };
+  const color = (name, prop, dflt) => colorFromFill((entry(name).properties || {})[prop], theme) || dflt;
+  const keyword = (k) => (theme && theme.keywords && theme.keywords[k]) || KEYWORD_DEFAULTS[k];
+  switch (visual.type) {
+    case "tableEx":
+      return { totals: lit("total", "totals", true) };
+    case "pivotTable":
+      return { rowSubtotals: lit("subTotals", "rowSubtotals", true), columnSubtotals: lit("subTotals", "columnSubtotals", true) };
+    case "kpi":
+      return {
+        direction: lit("status", "direction", "Positive"),
+        good: color("status", "goodColor", keyword("good")),
+        neutral: color("status", "neutralColor", keyword("neutral")),
+        bad: color("status", "badColor", keyword("bad")),
+        showGoal: lit("goals", "showGoal", true),
+        goalText: lit("goals", "goalText", "Goal"),
+        showDistance: lit("goals", "showDistance", true),
+        distanceLabel: String(lit("goals", "distanceLabel", "Percent")),
+        distanceDirection: lit("goals", "direction", null),
+        showTrend: lit("trendline", "show", true),
+        showLastDate: lit("lastDate", "show", false),
+      };
+    case "cardVisual": {
+      const data = (visual.roles && visual.roles.Data) || [];
+      const refLabels = (o.referenceLabel || []).map((e) => {
+        const expr = e.properties && e.properties.value && e.properties.value.expr;
+        const name = fieldName(expr);
+        if (!name) return null;
+        const sel = e.selector || {};
+        let owner = data.findIndex((d) => d.queryRef && d.queryRef === sel.metadata);
+        if (owner < 0 && data.length === 1) owner = 0;
+        return { owner, ref: normalizeField(name), order: Number(sel.order) || 0 };
+      }).filter(Boolean).sort((a, b) => a.owner - b.owner || a.order - b.order);
+      return { refLabels };
+    }
+    default:
+      return {};
+  }
 }
 
 /* How a visual colours its data, with every colour set by hand resolved to a hex code */
@@ -788,6 +877,7 @@ function visualColorInfo(visual, theme) {
     titleHidden: visual.titleShown === false,
     axes: axisSettings(visual.objects),
     mainValue: (roles[(custom && custom.mainRole) || KPI_VALUE_ROLE[visual.type]] || [])[0] || null,
+    builtin: builtInSettings(visual, theme),
   };
 }
 
