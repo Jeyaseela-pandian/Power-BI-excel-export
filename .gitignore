@@ -1,8 +1,18 @@
-# Local Claude Code settings (preview server config)
+# Kept locally, not on GitHub
 .claude/
-
-# Test samples (local test reports and data)
 test-samples/
-
-# Documents, such as the setup and test guide (kept locally)
+docs/
 *.docx
+*.pdf
+*.xlsx
+*.pbix
+
+# Office lock files, editor and system clutter
+~$*
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
