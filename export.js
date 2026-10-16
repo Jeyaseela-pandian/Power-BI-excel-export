@@ -689,10 +689,22 @@ function columnColors(item, palette, info) {
     if (info && info.rule === "single") return color(0);
     return color(slot);
   };
+  // A treemap draws (and colours) its groups largest first; the exported rows come in the
+  // category's own order, so its groups are put in order of their totals before the colours
+  const largestFirst = (keyCol, values) => {
+    const ci = seriesCols[0];
+    if (item.type !== "treemap" || ci === undefined) return values;
+    const total = {};
+    data.forEach((r) => {
+      const k = (r[keyCol] ?? "").trim(), v = toCellValue(r[ci]).value;
+      if (k && typeof v === "number") total[k] = (total[k] || 0) + v;
+    });
+    return values.map((v, i) => ({ v, i })).sort((a, b) => ((total[b.v] || 0) - (total[a.v] || 0)) || (a.i - b.i)).map((x) => x.v);
+  };
   const keyedRows = (keyCol, colorOfValue, bySeries) => {
     const values = bySeries
       ? seriesOrder(data, keyCol, cols.filter((ci) => ci !== keyCol && !seriesCols.includes(ci) && !hex[ci]))
-      : [...new Set(filled(keyCol))];   // order of first appearance
+      : largestFirst(keyCol, [...new Set(filled(keyCol))]);   // order of first appearance (a treemap's largest first)
     return { col: keyCol, colorOf: Object.fromEntries(values.map((v, i) => [v, colorOfValue(v, i)])) };
   };
 
@@ -3534,6 +3546,7 @@ const EXCEL_CHARTS = {
   scatterChart: { kind: "scatter" },   // a bubble chart when the visual has a Size field
   waterfallChart: { kind: "waterfall" },
   funnel: { kind: "funnel" },
+  treemap: { kind: "treemap" },   // drawn as Power BI lays it out, its numbers on the Data sheet
 };
 const CHART_SCALE = 1;          // Power BI page pixels → chart pixels
 const CHART_MIN_W = 360;        // smallest chart, in pixels
@@ -3564,9 +3577,10 @@ function chartPlan(item) {
   const spec = EXCEL_CHARTS[item.type];
   if (!spec || item.isKpi) return null;
   // Scatter, waterfall and funnel have their own builders; any problem keeps the visual as a table
-  if (spec.kind === "scatter" || spec.kind === "waterfall" || spec.kind === "funnel") {
+  if (spec.kind === "scatter" || spec.kind === "waterfall" || spec.kind === "funnel" || spec.kind === "treemap") {
     try {
-      return spec.kind === "scatter" ? scatterPlan(item) : spec.kind === "waterfall" ? waterfallPlan(item) : funnelPlan(item);
+      return spec.kind === "scatter" ? scatterPlan(item) : spec.kind === "waterfall" ? waterfallPlan(item)
+        : spec.kind === "funnel" ? funnelPlan(item) : treemapPlan(item, spec);
     } catch (e) {
       log(`Chart for "${item.title}" not drawn, kept as a table: ${errorText(e)}`);
       return null;
@@ -3927,6 +3941,64 @@ function funnelPlan(item) {
   };
 }
 
+/*
+ * A Power BI treemap, drawn as the report lays it out: a tile per group (Group), split into its
+ * Details when the visual has them, sized by the value, each group in its colour from the report
+ * (its Details share it, as in Power BI), largest first; the numbers go on the Data sheet. Tiles
+ * can't be negative: those rows are left out of the drawing (Data tables mode still lists them).
+ */
+function treemapPlan(item, spec) {
+  const t = chartColumns(item);
+  const info = item.colorInfo || null;
+  const roles = (info && info.roles) || {};
+  const entries = info ? fieldsByColumn(t.header, Object.values(roles).flat()) : t.header.map(() => null);
+  const inRole = (ci, ...names) => names.some((r) => (roles[r] || []).includes(entries[ci]));
+  const groupCol = t.textCols.find((ci) => !info || inRole(ci, "Group", "Category")) ?? t.textCols[0];
+  if (groupCol === undefined) return null;
+  const detailCol = t.textCols.find((ci) => ci !== groupCol && (!info || inRole(ci, "Details")));
+  const valueCol = t.measureCols.find((ci) => !info || inRole(ci, "Values", "Y", "Size")) ?? t.measureCols[0];
+  if (valueCol === undefined) return null;
+  const additive = !NON_ADDITIVE.test(t.header[valueCol]);
+  // One tile per group (and detail): a hierarchy's rows added up, a ratio's first value kept
+  const tiles = [];
+  for (const r of t.data) {
+    const group = t.key(r, groupCol), detail = detailCol !== undefined ? t.key(r, detailCol) : "";
+    const v = t.num(r[valueCol]);
+    if (v === null) continue;
+    const tile = tiles.find((x) => x.group === group && x.detail === detail);
+    if (!tile) tiles.push({ group, detail, value: v });
+    else if (additive) tile.value += v;
+  }
+  const shown = tiles.filter((x) => x.value > 0);
+  if (!shown.length) return null;
+  // Largest group first, its largest tile first (Power BI's order)
+  const totals = {};
+  shown.forEach((x) => { totals[x.group] = (totals[x.group] || 0) + x.value; });
+  shown.sort((a, b) => (totals[b.group] - totals[a.group]) || (a.group < b.group ? -1 : a.group > b.group ? 1 : 0) || (b.value - a.value));
+  const colors = item.colors || null;
+  const byGroup = colors && colors.rowKey && colors.rowKey.col === groupCol ? colors.rowKey.colorOf : null;
+  const one = colors && colors.series && colors.series[valueCol] || null;
+  const label = (v) => axisLabel(v);
+  return {
+    spec,
+    title: item.displayTitle || item.title,
+    catName: t.header[detailCol ?? groupCol],
+    catLevels: detailCol !== undefined ? [{ name: t.header[groupCol], values: shown.map((x) => label(x.group)) }] : [],
+    categories: shown.map((x) => (detailCol !== undefined ? x.detail : x.group)),
+    series: [{ name: t.header[valueCol], values: shown.map((x) => x.value), fmt: t.formatOf(valueCol), color: one }],
+    // What's drawn: each group in its colour, with its tiles (without Details a group is one tile)
+    groups: shown.reduce((out, x) => {
+      const last = out[out.length - 1];
+      const tile = { name: label(detailCol !== undefined ? x.detail : x.group), value: x.value };
+      if (last && last.key === x.group && detailCol !== undefined) { last.value += x.value; last.tiles.push(tile); }
+      else out.push({ key: x.group, name: label(x.group), value: x.value, color: (byGroup && byGroup[x.group]) || one || null, tiles: [tile] });
+      return out;
+    }, []),
+    nested: detailCol !== undefined,
+    pbi: { w: (item.layout && item.layout.width) || 400, h: (item.layout && item.layout.height) || 260 },
+  };
+}
+
 /* Value labels in the middle of each bar (used by the funnel) */
 function dataLabelsXml(fmt, argb) {
   // Labels inside a bar: white or ink, whichever reads on the bar's colour (Power BI's white)
@@ -4141,36 +4213,41 @@ function writeChartDataSheet(wb, name, charts) {
     t.value = p.title;
     t.font = { name: "Calibri", size: 12, bold: true, color: { argb: C.INK } };
     const hr = row + 1;
-    const h0 = ws.getCell(hr, 2);
-    h0.value = p.catName || "Category";
-    h0.font = { name: "Calibri", size: 10, bold: true, color: { argb: C.INK } };
-    h0.fill = SURFACE_FILL;
+    // Higher category levels (a treemap's groups) come first, each in its own column
+    const levels = p.catLevels || [], off = levels.length;
+    [...levels.map((l) => l.name), p.catName || "Category"].forEach((name, k) => {
+      const h = ws.getCell(hr, 2 + k);
+      h.value = name;
+      h.font = { name: "Calibri", size: 10, bold: true, color: { argb: C.INK } };
+      h.fill = SURFACE_FILL;
+    });
     p.series.forEach((s, i) => {
-      const h = ws.getCell(hr, 3 + i);
+      const h = ws.getCell(hr, 3 + off + i);
       h.value = s.name;
       h.font = { name: "Calibri", size: 10, bold: true, color: { argb: C.INK } };
       h.fill = SURFACE_FILL;
       h.alignment = { horizontal: "right" };
     });
     p.categories.forEach((c, ri) => {
-      ws.getCell(hr + 1 + ri, 2).value = axisLabel(c);   // a date reads "1/15/2023" on the axis, an empty one "(Blank)"
+      levels.forEach((l, k) => { ws.getCell(hr + 1 + ri, 2 + k).value = l.values[ri]; });
+      ws.getCell(hr + 1 + ri, 2 + off).value = axisLabel(c);   // a date reads "1/15/2023" on the axis, an empty one "(Blank)"
       p.series.forEach((s, i) => {
-        const cell = ws.getCell(hr + 1 + ri, 3 + i);
+        const cell = ws.getCell(hr + 1 + ri, 3 + off + i);
         cell.value = s.values[ri];
         if (s.fmt && s.fmt !== "General") cell.numFmt = s.fmt;
       });
     });
     const first = hr + 1, last = hr + p.categories.length;
     p.refs = {
-      catRef: `${sheetRef}!${abs(first, 2)}:${abs(last, 2)}`,
+      catRef: `${sheetRef}!${abs(first, 2)}:${abs(last, 2 + off)}`,
       series: p.series.map((s, i) => ({
-        nameRef: `${sheetRef}!${abs(hr, 3 + i)}`,
-        valRef: `${sheetRef}!${abs(first, 3 + i)}:${abs(last, 3 + i)}`,
+        nameRef: `${sheetRef}!${abs(hr, 3 + off + i)}`,
+        valRef: `${sheetRef}!${abs(first, 3 + off + i)}:${abs(last, 3 + off + i)}`,
       })),
     };
     // Any block of rows in one Data column (scatter charts read one block per legend value)
-    p.refs.range = (i, from, to) => `${sheetRef}!${abs(first + from, 3 + i)}:${abs(first + to, 3 + i)}`;
-    widest = Math.max(widest, p.series.length);
+    p.refs.range = (i, from, to) => `${sheetRef}!${abs(first + from, 3 + off + i)}:${abs(first + to, 3 + off + i)}`;
+    widest = Math.max(widest, p.series.length + off);
     row = last + 3;
   }
   ws.getColumn(1).width = 3;
@@ -4334,6 +4411,121 @@ function chartXml(plan) {
     `</c:chartSpace>`;
 }
 
+/*
+ * Power BI's treemap layout (d3's squarify, aiming at golden-ratio tiles): the largest node
+ * first, nodes added to a row along the shorter side while the row's worst tile gets no
+ * worse, then the row is laid down and the rest fills what's left. Positions are rounded to
+ * whole pixels, as Power BI draws them. nodes: [{ value }] largest first → [{ x, y, w, h }].
+ */
+const TREEMAP_RATIO = 0.5 * (1 + Math.sqrt(5));
+function squarify(nodes, rect) {
+  const total = nodes.reduce((a, n) => a + n.value, 0);
+  const out = nodes.map(() => null);
+  if (!total || rect.w <= 0 || rect.h <= 0) return out.map(() => ({ x: rect.x, y: rect.y, w: 0, h: 0 }));
+  const k = (rect.w * rect.h) / total;
+  const area = nodes.map((n) => n.value * k);
+  const r = { ...rect };
+  const worst = (row, sum, u) => {
+    const areas = row.map((i) => area[i]).filter(Boolean);
+    if (!sum || !areas.length) return Infinity;
+    const s2 = sum * sum, u2 = u * u;
+    return Math.max((u2 * Math.max(...areas) * TREEMAP_RATIO) / s2, s2 / (u2 * Math.min(...areas) * TREEMAP_RATIO));
+  };
+  const place = (row, sum, u, flush) => {
+    let v = u ? Math.round(sum / u) : 0;
+    if (u === r.w) {   // a row across the top
+      if (flush || v > r.h) v = r.h;
+      let x = r.x;
+      row.forEach((i, j) => {
+        const w = j === row.length - 1 ? r.x + r.w - x : Math.min(r.x + r.w - x, v ? Math.round(area[i] / v) : 0);
+        out[i] = { x, y: r.y, w, h: v };
+        x += w;
+      });
+      r.y += v; r.h -= v;
+    } else {           // a column down the left
+      if (flush || v > r.w) v = r.w;
+      let y = r.y;
+      row.forEach((i, j) => {
+        const h = j === row.length - 1 ? r.y + r.h - y : Math.min(r.y + r.h - y, v ? Math.round(area[i] / v) : 0);
+        out[i] = { x: r.x, y, w: v, h };
+        y += h;
+      });
+      r.x += v; r.w -= v;
+    }
+  };
+  let row = [], sum = 0, best = Infinity, u = Math.min(r.w, r.h), next = 0;
+  while (next < nodes.length) {
+    const score = worst([...row, next], sum + area[next], u);
+    if (score <= best) { row.push(next); sum += area[next]; best = score; next++; continue; }
+    place(row, sum, u, false);
+    u = Math.min(r.w, r.h);
+    row = []; sum = 0; best = Infinity;
+  }
+  if (row.length) place(row, sum, u, true);
+  return out;
+}
+
+/* The tiles of a treemap plan in Power BI's pixels: groups over the plot, tiles inside each */
+const TREEMAP_TITLE_PX = 28;   // the visual's title, above the tiles
+function treemapTiles(plan) {
+  const plot = { x: 0, y: 0, w: plan.pbi.w, h: Math.max(1, plan.pbi.h - TREEMAP_TITLE_PX) };
+  const boxes = squarify(plan.groups, plot);
+  return plan.groups.map((g, i) => ({
+    ...g, box: boxes[i],
+    tiles: plan.nested ? squarify(g.tiles, boxes[i]).map((b, j) => ({ ...g.tiles[j], box: b })) : [],
+  }));
+}
+
+/*
+ * A treemap as Power BI draws it: the same tiles in the same places, each group in its
+ * colour with its name at the top left and its tiles' names at the bottom left (a name too
+ * long for its tile is cut short with "…", one with no room is left off). Excel's own
+ * treemap lays its tiles out its own way, so the tiles are drawn as shapes, grouped as one
+ * picture; the numbers behind them are on the Data sheet.
+ */
+function treemapShapesXml(ch, id) {
+  const p = ch.plan, E = CHART_PX_TO_EMU;
+  const W = ch.wPx, H = ch.hPx, titleH = Math.round(TREEMAP_TITLE_PX * (H / p.pbi.h));
+  const pad = 4;   // the frame's inner margin, in pixels
+  const sx = (W - 2 * pad) / p.pbi.w, sy = (H - titleH - pad) / Math.max(1, p.pbi.h - TREEMAP_TITLE_PX);
+  const at = (b) => ({ x: Math.round((pad + b.x * sx) * E), y: Math.round((titleH + b.y * sy) * E), w: Math.round(b.w * sx * E), h: Math.round(b.h * sy * E) });
+  let n = 0;
+  const shape = (name, box, fill, line, text) =>
+    `<xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="${id * 100 + ++n}" name="${xmlEsc(name)}"/><xdr:cNvSpPr/></xdr:nvSpPr>` +
+    `<xdr:spPr><a:xfrm><a:off x="${box.x}" y="${box.y}"/><a:ext cx="${box.w}" cy="${box.h}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>` +
+    `${fill ? fillXml(fill) : "<a:noFill/>"}${line || "<a:ln><a:noFill/></a:ln>"}</xdr:spPr>` +
+    `<xdr:txBody>${text || '<a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="en-US"/></a:p>'}</xdr:txBody></xdr:sp>`;
+  // A name in a tile, in white as Power BI writes it, cut to the tile's width (about 6 pixels a character at 9pt)
+  const label = (name, box, argb, anchor, bold) => {
+    const wPx = box.w / E - 8, hPx = box.h / E;
+    if (wPx < 12 || hPx < 16) return null;
+    const fit = Math.floor(wPx / 6);
+    const textOf = String(name).length > fit ? String(name).slice(0, Math.max(1, fit - 1)).trimEnd() + "…" : String(name);
+    return `<a:bodyPr wrap="none" lIns="45720" tIns="27432" rIns="45720" bIns="27432" anchor="${anchor}" vertOverflow="clip" horzOverflow="clip"/><a:lstStyle/>` +
+      `<a:p><a:r><a:rPr lang="en-US" sz="900" b="${bold ? 1 : 0}">${fillXml(C.WHITE)}<a:latin typeface="Segoe UI"/></a:rPr><a:t>${xmlEsc(textOf)}</a:t></a:r></a:p>`;
+  };
+  const white = `<a:ln w="9525">${fillXml(C.WHITE)}</a:ln>`;
+  let body = shape("Frame", { x: 0, y: 0, w: W * E, h: H * E }, C.WHITE, `<a:ln w="9525">${fillXml(C.HAIR)}</a:ln>`);
+  body += shape("Title", { x: 0, y: 0, w: W * E, h: titleH * E }, null, null,
+    `<a:bodyPr wrap="none" anchor="ctr" lIns="45720" rIns="45720"/><a:lstStyle/><a:p><a:pPr algn="ctr"/><a:r><a:rPr lang="en-US" sz="1200" b="1">${fillXml(C.INK)}` +
+    `<a:latin typeface="Calibri"/></a:rPr><a:t>${xmlEsc(p.title)}</a:t></a:r></a:p>`);
+  const fallback = p.series[0].color || C.INK;
+  for (const g of treemapTiles(p)) {
+    const color = g.color || fallback, gb = at(g.box);
+    if (!p.nested) { body += shape(g.name, gb, color, white, label(g.name, gb, color, "t")); continue; }
+    for (const tile of g.tiles) {
+      const tb = at(tile.box);
+      body += shape(`${g.name} – ${tile.name}`, tb, color, white, label(tile.name, tb, color, "b"));
+    }
+    body += shape(g.name, gb, null, `<a:ln w="19050">${fillXml(C.WHITE)}</a:ln>`, label(g.name, gb, color, "t"));   // the group's outline and name
+  }
+  const cx = Math.round(W * E), cy = Math.round(H * E);
+  return `<xdr:oneCellAnchor><xdr:from><xdr:col>${ch.col - 1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${ch.row - 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>` +
+    `<xdr:ext cx="${cx}" cy="${cy}"/><xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="${id}" name="${xmlEsc(p.title)}"/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>` +
+    `<xdr:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/><a:chOff x="0" y="0"/><a:chExt cx="${cx}" cy="${cy}"/></a:xfrm></xdr:grpSpPr>` +
+    `${body}</xdr:grpSp><xdr:clientData/></xdr:oneCellAnchor>`;
+}
+
 /* A chart's frame on the page sheet: its top-left cell and its size */
 function chartAnchorXml(ch, rid, id) {
   const cx = Math.round(ch.wPx * CHART_PX_TO_EMU), cy = Math.round(ch.hPx * CHART_PX_TO_EMU);
@@ -4411,6 +4603,7 @@ async function addChartsToFile(buffer, chartSheets) {
     if (!types.includes(`PartName="/${part}"`)) types = types.replace("</Types>", `<Override PartName="/${part}" ContentType="${type}"/></Types>`);
   };
   let chartNo = Object.keys(zip.files).filter((n) => /^xl\/charts\/chart\d+\.xml$/.test(n)).length;
+  let shapeNo = 0;
   let drawingNo = Object.keys(zip.files).filter((n) => /^xl\/drawings\/drawing\d+\.xml$/.test(n)).length;
   const sheetFiles = await sheetFileMap(zip);
 
@@ -4443,6 +4636,10 @@ async function addChartsToFile(buffer, chartSheets) {
 
     let anchors = "";
     for (const ch of charts) {
+      if (ch.plan.spec.kind === "treemap") {
+        anchors += treemapShapesXml(ch, 3000 + ++shapeNo);   // drawn as Power BI lays it out
+        continue;
+      }
       chartNo++;
       const chartPath = `xl/charts/chart${chartNo}.xml`;
       zip.file(chartPath, chartXml(ch.plan));
