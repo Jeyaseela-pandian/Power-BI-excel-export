@@ -1566,24 +1566,212 @@ function writeTotalsRow(ws, row, col, item, hr, n, lay, table) {
  * export always reflects it. AppSource visuals keep their roles (theirs mean something else).
  */
 const HIERARCHY_ROLES = ["Category", "Group", "Rows", "Columns"];
+// Field wells that group the data (the rest hold values)
+const KEY_ROLES = [...HIERARCHY_ROLES, "Series", "Legend", "Details", "Location", "Breakdown", "Axis"];
+
+/* The levels of a hierarchy the report shows: those its file marks active (the drill level;
+   several when expanded, "Chain Name"), else every level (no drill state saved) */
+function shownLevels(list) {
+  if (!list || list.length < 2 || !list.some((f) => f.active === true)) return list || [];
+  return list.filter((f) => f.active === true);
+}
+
 function atDrillLevel(item, info) {
   if (!info || !info.roles || !item.rows || !item.rows.length || customVisual(item.type)) return info;
   const header = item.rows[0].map((h) => String(h ?? "").trim());
   const lower = header.map((h) => h.toLowerCase());
   const norm = header.map((h) => normalizeField(h));
-  const shown = (f) => !!f && ((f.label && lower.includes(f.label)) || norm.includes(f.ref));
+  const present = (f) => !!f && ((f.label && lower.includes(f.label)) || norm.includes(f.ref));
   const roles = { ...info.roles };
   let changed = false;
   for (const r of HIERARCHY_ROLES) {
     const list = roles[r];
     if (!list || list.length < 2) continue;
-    const kept = list.filter(shown);
-    // None found means the export names them differently: keep the report's list
+    // The levels shown that are in the export; none found means the export names them
+    // differently, so the report's list stays
+    let kept = (item.drillKept ? list : shownLevels(list)).filter(present);
+    if (!kept.length) kept = list.filter(present);
     if (kept.length && kept.length < list.length) { roles[r] = kept; changed = true; }
   }
   if (!changed) return info;
   const cats = roles.Category || roles.Group || [];
   return { ...info, roles, category: cats[0] || null, categories: cats };
+}
+
+/*
+ * Power BI exports every level of a visual's hierarchy (Region and VP), even when the report
+ * shows only the top one (a bar per Region). The rows are rolled up to the levels shown, as
+ * the visual draws them: sums, counts, minimums and maximums from the exported rows; values
+ * that don't add up (ratios, percentages, averages) are queried at that level from the
+ * semantic model (needs Build permission); if that fails, the visual keeps every level Power BI
+ * exported (item.drillKept), with a note. Returns a note, or null.
+ */
+async function rollUpToDrillLevel(item, info, filters) {
+  if (!info || !info.roles || customVisual(item.type) || !item.rows || item.rows.length < 2) return null;
+  const roles = info.roles;
+  const hiddenFields = HIERARCHY_ROLES.flatMap((r) => {
+    const list = roles[r] || [], shown = shownLevels(list);
+    return list.filter((f) => !shown.includes(f));
+  });
+  if (!hiddenFields.length) return null;
+  const header = item.rows[0], data = item.rows.slice(1);
+  const keyFields = new Set(KEY_ROLES.flatMap((r) => shownLevels(roles[r] || [])));
+  const entries = fieldsByColumn(header, [...hiddenFields, ...keyFields, ...Object.values(roles).flat()]);
+  const hidden = header.map((_, ci) => hiddenFields.includes(entries[ci]));
+  if (!hidden.some(Boolean)) return null;   // already exported at the level shown
+  const cells = data.map((row) => header.map((_, ci) => toCellValue(row[ci])));
+  const isNum = header.map((_, ci) => cells.some((r) => typeof r[ci].value === "number") && cells.every((r) => r[ci].value === null || r[ci].value === "" || typeof r[ci].value === "number"));
+  const keyCols = header.map((_, ci) => ci).filter((ci) => !hidden[ci] && (keyFields.has(entries[ci]) || (!entries[ci] && !isNum[ci])));
+  const valueCols = header.map((_, ci) => ci).filter((ci) => !hidden[ci] && !keyCols.includes(ci));
+  const fmtOf = (ci) => (cells.find((r) => typeof r[ci].value === "number" && r[ci].numFmt) || [])[ci]?.numFmt || null;
+  const kinds = Object.fromEntries(valueCols.map((ci) => [ci, totalKind(entries[ci] && entries[ci].field, header[ci], fmtOf(ci))]));
+
+  // Group the rows by the levels (and legend) shown, in the export's order
+  const groups = new Map();
+  data.forEach((row, ri) => {
+    const k = keyCols.map((ci) => matchKey(row[ci])).join("\u0001");
+    if (!groups.has(k)) groups.set(k, { row, rows: [] });
+    groups.get(k).rows.push(ri);
+  });
+  const out = [...groups.values()].map((g) => header.map((_, ci) => {
+    if (!valueCols.includes(ci)) return g.row[ci];
+    const kind = kinds[ci];
+    if (!kind) return "";
+    const vals = g.rows.map((ri) => cells[ri][ci].value).filter((v) => typeof v === "number");
+    return vals.length ? displayText(subtotalOf(kind, vals), fmtOf(ci)) : "";
+  }));
+
+  // Values that don't add up: queried at the level shown. If that can't be done, nothing is
+  // rolled up (a value is never lost): the visual keeps every level Power BI exported
+  const open = valueCols.filter((ci) => !kinds[ci]);
+  if (open.length) {
+    const levelNames = keyCols.filter((ci) => entries[ci] && HIERARCHY_ROLES.some((r) => (roles[r] || []).includes(entries[ci]))).map((ci) => header[ci]);
+    let error = null;
+    const keyOk = keyCols.every((ci) => entries[ci] && entries[ci].field && ["column", "level"].includes(entries[ci].field.kind) && entries[ci].field.entity);
+    const measures = open.map((ci) => daxValue(entries[ci] && entries[ci].field));
+    if (!keyOk || measures.some((m) => !m)) error = "its fields can't be queried";
+    // A filter on a measure ("Actives is not blank") only drops rows, and the exported rows
+    // already reflect it, so the query leaves it out
+    let filterTables = [];
+    if (!error) {
+      try { filterTables = (filters || []).filter((f) => !(f && f.target && f.target.measure)).map(daxFilter).filter(Boolean); } catch (e) { error = `a ${e.message}`; }
+    }
+    if (!error) {
+      const groupBy = keyCols.map((ci) => daxColumn(entries[ci].field.entity, entries[ci].field.prop));
+      const query = `EVALUATE SUMMARIZECOLUMNS(${[...groupBy, ...filterTables, ...measures.map((m, i) => `"v${i}", ${m}`)].join(", ")})`;
+      const res = await executeDaxQuery(query);
+      if (res.error) error = res.error;
+      else {
+        const byKey = new Map(res.rows.map((r) => [keyCols.map((ci) => matchKey(r[`${entries[ci].field.entity}[${entries[ci].field.prop}]`])).join("\u0001"), r]));
+        const keys = [...groups.keys()];
+        if (keys.some((k) => !byKey.has(k))) error = "its answer didn't match the exported rows";
+        else keys.forEach((k, gi) => {
+          const r = byKey.get(k);
+          open.forEach((ci, i) => {
+            const v = r[`[v${i}]`];
+            out[gi][ci] = typeof v === "number" ? displayText(v, fmtOf(ci)) : "";
+          });
+        });
+      }
+    }
+    if (error) {
+      item.drillKept = true;   // the layout uses every exported level too
+      const per = levelNames.length ? `per ${levelNames.join(" / ")}` : "at its drill level";
+      const all = header.filter((_, ci) => hidden[ci] || levelNames.includes(header[ci]));
+      const names = open.map((ci) => header[ci]).join(", "), many = open.length > 1;
+      return `"${item.title}": shown at every level Power BI exported (${all.join(" › ")}), not ${per} as in the report: ` +
+        `${names} ${many ? "don't" : "doesn't"} add up from the exported rows, and querying ${many ? "them" : "it"} ${per} failed (${error}).`;
+    }
+  }
+  item.rows = [header.filter((_, ci) => !hidden[ci]), ...out.map((row) => row.filter((_, ci) => !hidden[ci]))];
+  log(`"${item.title}": rolled up to the drill level shown (${header.filter((_, ci) => keyCols.includes(ci)).join(", ")}), ${data.length} → ${out.length} rows`);
+  return null;
+}
+
+/*
+ * The drill state of the report as it is in the app right now: Power BI's embedding API can't
+ * report a visual's drill level, but a bookmark captured from the session holds it (each
+ * visual's active hierarchy levels, "activeProjections", and a matrix's expand / collapse
+ * state, "expansionStates"). Returns { page: { visual: singleVisual state } }, or null.
+ */
+async function captureLiveDrill(report) {
+  try {
+    const bm = await report.bookmarksManager.capture({ allPages: true });
+    const es = await decodeBookmarkState(bm && bm.state);
+    const sections = es && (es.sections || (es.explorationState && es.explorationState.sections));
+    if (!sections) { log("Live drill levels not read: the captured view had no pages"); return null; }
+    const out = {};
+    for (const [page, s] of Object.entries(sections)) {
+      out[page] = {};
+      for (const [name, vc] of Object.entries((s && s.visualContainers) || {})) {
+        if (vc && vc.singleVisual) out[page][name] = vc.singleVisual;
+      }
+    }
+    return out;
+  } catch (e) {
+    log(`Live drill levels not read (the saved levels are used): ${errorText(e)}`);
+    return null;
+  }
+}
+
+/* A captured bookmark's state: JSON, or base64 of JSON or of gzipped JSON */
+async function decodeBookmarkState(state) {
+  if (!state) return null;
+  const s = String(state).trim();
+  if (s.startsWith("{")) return JSON.parse(s);
+  const bytes = Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (ch) => ch.charCodeAt(0));
+  if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
+    const text = await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
+    return JSON.parse(text);
+  }
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+/* A visual's report-file info with its live drill state on top: the levels it shows now and
+   a matrix's expand / collapse state (the file's saved state where the session has none) */
+function withLiveDrill(item, info) {
+  const sv = item.liveDrill;
+  if (!info || !info.roles || !sv) return info;
+  const key = (f) => (f ? `${String(f.entity || "").toLowerCase()}|${String(f.prop || "").toLowerCase()}` : "");
+  const roles = { ...info.roles };
+  for (const [role, exprs] of Object.entries(sv.activeProjections || {})) {
+    const list = roles[role];
+    if (!list || !list.length || !Array.isArray(exprs)) continue;
+    const live = exprs.map((e) => fieldInfo(e)).filter(Boolean);
+    const isLive = (f) => !!f.field && live.some((l) => key(l) === key(f.field) || (!f.field.entity && String(l.prop).toLowerCase() === String(f.field.prop || "").toLowerCase()));
+    if (!list.some(isLive)) continue;   // the fields didn't match: keep the saved levels
+    roles[role] = list.map((f) => ({ ...f, active: isLive(f) }));
+  }
+  return { ...info, roles, expansion: sv.expansionStates || info.expansion };
+}
+
+/* For every visual: its rows at the drill level the report shows (needs the report file) */
+async function loadDrillLevels(collected, options) {
+  for (const { data } of collected) {
+    for (const item of data.items) {
+      const info = withLiveDrill(item, visualInfo(options.reportColors, item.page, item.name));
+      const note = await rollUpToDrillLevel(item, info, [...(data.queryFilters || []), ...(item.visualFilters || [])]);
+      if (note) data.notes.push(note);
+    }
+  }
+}
+
+/* A matrix group's saved expand / collapse state: collapsed when its level is collapsed by
+   default and the group isn't toggled, or expanded by default and toggled. path: the
+   group's labels from the top level */
+function groupCollapsed(expansion, role, path) {
+  const st = (expansion || []).find((e) => (e.roles || []).includes(role));
+  if (!st || !st.levels) return false;
+  const lit = (v) => {
+    const x = v && v.Literal ? String(v.Literal.Value) : "";
+    return matchKey(x.replace(/^datetime'(.*)'$/, "$1").replace(/^'(.*)'$/s, "$1").replace(/^(-?\d+(\.\d+)?)[LDM]$/, "$1").replace(/''/g, "'"));
+  };
+  let node = st.root || {};
+  for (const label of path) {
+    node = (node.children || []).find((c) => (c.identityValues || []).length && lit(c.identityValues[c.identityValues.length - 1]) === matchKey(label)) || {};
+  }
+  const level = st.levels[path.length - 1] || {};
+  return !!level.isCollapsed !== !!node.isToggled;
 }
 
 /*
@@ -1684,7 +1872,9 @@ function matrixLayout(item, info) {
   // Stepped: group names, indented rows, group totals; levels for Excel's outline
   const levels = rc.length;
   const body = [];   // { type: "group" | "leaf" | "total", depth, label, values, from, to (body indices a total covers) }
-  const walk = (list, depth) => {
+  // A group the report shows collapsed is folded in Excel's outline (its total row stays in
+  // view, as Power BI shows the collapsed group's row); the [+] beside it opens it
+  const walk = (list, depth, path) => {
     const groups = new Map();
     for (const l of list) {
       const g = l.labels[depth];
@@ -1696,13 +1886,18 @@ function matrixLayout(item, info) {
         for (const l of members) body.push({ type: "leaf", depth, label, values: columns.map((c) => valueOf(l, c)) });
         continue;
       }
-      body.push({ type: "group", depth, label, values: columns.map(() => "") });
+      const collapsed = groupCollapsed(info.expansion, "Rows", [...path, label]);
+      const head = body.length;
+      body.push({ type: "group", depth, label, values: columns.map(() => ""), collapsed });
       const from = body.length;
-      walk(members, depth + 1);
-      if (b.rowSubtotals !== false) body.push({ type: "total", depth, label: `${label} total`, values: columns.map(() => ""), from, to: body.length - 1 });
+      walk(members, depth + 1, [...path, label]);
+      if (b.rowSubtotals !== false) {
+        body.push({ type: "total", depth, label: collapsed ? label : `${label} total`, values: columns.map(() => ""), from, to: body.length - 1 });
+      }
+      if (collapsed) body[head].fold = { from: b.rowSubtotals !== false ? head : from, to: body.length - (b.rowSubtotals !== false ? 2 : 1) };
     }
   };
-  walk(leafList, 0);
+  walk(leafList, 0, []);
   item.stepped = { levels, body, subtotals: b.rowSubtotals !== false };
   item.rows = [[labelHead, ...columns.map((c) => c.head)], ...body.map((x) => [x.label, ...x.values])];
 }
@@ -2352,6 +2547,11 @@ function writeSteppedMatrix(ws, r, col, item, widths, lay, number, closeRow) {
     });
   });
 
+  // Groups the report shows collapsed: folded (their rows hidden under the outline's [+])
+  st.body.forEach((x) => {
+    if (x.fold) for (let i = x.fold.from; i <= x.fold.to; i++) ws.getRow(hr + 1 + i).hidden = true;
+  });
+
   // Grand total, on the closing row
   const n = st.body.length;
   header.forEach((_, ci) => {
@@ -2768,7 +2968,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
   // A new card with several measures: one tile per measure
   items = items.flatMap((item) => splitCards(item, visualInfo(lay.reportColors, item.page, item.name)));
   for (const item of items) {
-    const info = atDrillLevel(item, visualInfo(lay.reportColors, item.page, item.name));
+    const info = atDrillLevel(item, withLiveDrill(item, visualInfo(lay.reportColors, item.page, item.name)));
     if (item.isKpi) mainValueFirst(item, info);
     if ((customVisual(item.type) || {}).rule === "nested") nestedBarsRows(item, info, colorNotes);
     if ((customVisual(item.type) || {}).layout === "grid") comparisonRows(item, info);
@@ -3047,7 +3247,8 @@ async function collectPage(page, options, onProgress, isCancelled) {
         }
         continue;
       }
-      const visualFilters = TABLE_VISUAL_TYPES.includes(v.type) ? await filtersOf(v) : [];
+      // Visual-level filters: table sparklines and drill-level queries run under them too
+      const visualFilters = await filtersOf(v);
       items.push({ title, name: v.name, page: page.name, type: v.type, layout: v.layout, rows, isKpi, visualFilters });
       log(`Exported "${title}" (${rows.length - 1} rows)`);
     } catch (e) {
@@ -4525,6 +4726,8 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
       : Promise.reject(new Error("NOT_LOADED"));
     reportColorsJob.catch(() => {});   // handled below, after the pages
   }
+  // The drill levels as they are in the app now, before the export switches pages
+  const liveDrill = options.matchColors ? await captureLiveDrill(embeddedReport) : null;
   try {
     for (let p = 0; p < pages.length; p++) {
       const page = pages[p];
@@ -4533,6 +4736,7 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
       const data = await collectPage(page, options,
         (i, n, title) => onProgress({ pageIndex: p + 1, pageCount: pages.length, pageName: page.displayName, visualIndex: i, visualCount: n, visualTitle: title }),
         isCancelled);
+      if (liveDrill && liveDrill[page.name]) data.items.forEach((item) => { item.liveDrill = liveDrill[page.name][item.name] || null; });
       collected.push({ page, data });
     }
   } finally {
@@ -4567,8 +4771,10 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
     if (colorNote && collected.length) collected[0].data.notes.push(colorNote);
   }
 
-  // Table sparklines: their points, queried from the semantic model (needs the report file)
+  // Each visual at the drill level the report shows, then table sparklines (both need the report file)
   if (options.reportColors) {
+    onProgress({ pageIndex: pages.length, pageCount: pages.length, pageName: pages[pages.length - 1].displayName, visualIndex: 0, visualCount: 0, visualTitle: "Matching drill levels…" });
+    await loadDrillLevels(collected, options);
     onProgress({ pageIndex: pages.length, pageCount: pages.length, pageName: pages[pages.length - 1].displayName, visualIndex: 0, visualCount: 0, visualTitle: "Reading sparklines…" });
     await loadSparklines(collected, options);
   }

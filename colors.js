@@ -566,7 +566,11 @@ function fieldInfo(f, sources = {}) {
     const inner = fieldInfo(f.Aggregation.Expression, sources);
     return inner ? { ...inner, kind: "agg", agg: Number(f.Aggregation.Function) } : null;
   }
-  if (f.HierarchyLevel) return { kind: "level", prop: f.HierarchyLevel.Level };
+  if (f.HierarchyLevel) {
+    // A level of a hierarchy in a table: its column usually carries the level's name
+    const h = f.HierarchyLevel.Expression && f.HierarchyLevel.Expression.Hierarchy;
+    return { kind: "level", entity: (h && entityOf(h)) || null, prop: f.HierarchyLevel.Level };
+  }
   if (f.SparklineData) {
     return { kind: "spark", measure: fieldInfo(f.SparklineData.Measure, sources),
       groupings: (f.SparklineData.Groupings || []).map((g) => fieldInfo(g, sources)) };
@@ -596,11 +600,12 @@ function legacyVisual(config) {
       label: props[p.queryRef] && props[p.queryRef].displayName ? String(props[p.queryRef].displayName).toLowerCase() : null,
       field: fields[p.queryRef] || null,
       queryRef: p.queryRef,
+      active: p.active === true ? true : p.active === false ? false : null,   // the drill level shown
     }));
   }
   const o = sv.objects || {};
   return { type: sv.visualType, roles, objects: o, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [], values: [...(o.value || []), ...(o.labels || [])],
-    titleShown: titleShown(sv.vcObjects) };
+    titleShown: titleShown(sv.vcObjects), expansion: sv.expansionStates || null };
 }
 
 function pbirVisual(json) {
@@ -612,11 +617,12 @@ function pbirVisual(json) {
       label: p.displayName ? String(p.displayName).toLowerCase() : null,
       field: fieldInfo(p.field),
       queryRef: p.queryRef || null,
+      active: p.active === true ? true : p.active === false ? false : null,   // the drill level shown
     }));
   }
   const o = v.objects || {};
   return { type: v.visualType, roles, objects: o, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [], values: [...(o.value || []), ...(o.labels || [])],
-    titleShown: titleShown(v.visualContainerObjects) };
+    titleShown: titleShown(v.visualContainerObjects), expansion: v.expansionStates || null };
 }
 
 /* Icon rules ("fx" icons): each case's lower bound (a threshold) and its icon */
@@ -878,6 +884,8 @@ function visualColorInfo(visual, theme) {
     axes: axisSettings(visual.objects),
     mainValue: (roles[(custom && custom.mainRole) || KPI_VALUE_ROLE[visual.type]] || [])[0] || null,
     builtin: builtInSettings(visual, theme),
+    // A matrix's saved expand / collapse state: per role, each level's default and the groups toggled
+    expansion: visual.expansion || null,
   };
 }
 
