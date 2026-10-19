@@ -1582,6 +1582,29 @@ const HIERARCHY_ROLES = ["Category", "Group", "Rows", "Columns"];
 // Field wells that group the data (the rest hold values)
 const KEY_ROLES = [...HIERARCHY_ROLES, "Series", "Legend", "Details", "Location", "Breakdown", "Axis"];
 
+/* Whether a matrix's saved state opens any member below its top level shown: a level
+   expanded by default, or a member opened by hand (Apparel expanded, the rest closed) */
+function someExpanded(expansion, role) {
+  const st = (expansion || []).find((e) => (e.roles || []).includes(role));
+  if (!st) return false;
+  if ((st.levels || []).some((l) => l && l.isCollapsed === false)) return true;
+  const opened = (n) => !!n && (n.isToggled === true || (n.children || []).some(opened));
+  return opened(st.root);
+}
+
+/* The levels of one hierarchy role the export keeps. A matrix exported as a flat table can't
+   show some members open and others closed, so when the report opens any of them it keeps
+   every level from the first one shown (Category and Segment for every category); a matrix
+   drilled down past a level, or with every member closed, keeps just the levels shown */
+function levelsShown(item, info, role) {
+  const list = ((info && info.roles) || {})[role] || [];
+  const shown = shownLevels(list);
+  if (item.type !== "pivotTable" || !MATRIX_AS_TABLE || (role !== "Rows" && role !== "Columns") || shown.length === list.length) return shown;
+  if (!someExpanded(info.expansion, role)) return shown;
+  const first = list.indexOf(shown[0]);
+  return first < 0 ? list : list.slice(first);
+}
+
 /* The levels of a hierarchy the report shows: those its file marks active (the drill level;
    several when expanded, "Chain Name"), else every level (no drill state saved) */
 function shownLevels(list) {
@@ -1602,7 +1625,7 @@ function atDrillLevel(item, info) {
     if (!list || list.length < 2) continue;
     // The levels shown that are in the export; none found means the export names them
     // differently, so the report's list stays
-    let kept = (item.drillKept ? list : shownLevels(list)).filter(present);
+    let kept = (item.drillKept ? list : levelsShown(item, info, r)).filter(present);
     if (!kept.length) kept = list.filter(present);
     if (kept.length && kept.length < list.length) { roles[r] = kept; changed = true; }
   }
@@ -1623,12 +1646,12 @@ async function rollUpToDrillLevel(item, info, filters) {
   if (!info || !info.roles || customVisual(item.type) || !item.rows || item.rows.length < 2) return null;
   const roles = info.roles;
   const hiddenFields = HIERARCHY_ROLES.flatMap((r) => {
-    const list = roles[r] || [], shown = shownLevels(list);
+    const list = roles[r] || [], shown = levelsShown(item, info, r);
     return list.filter((f) => !shown.includes(f));
   });
   if (!hiddenFields.length) return null;
   const header = item.rows[0], data = item.rows.slice(1);
-  const keyFields = new Set(KEY_ROLES.flatMap((r) => shownLevels(roles[r] || [])));
+  const keyFields = new Set(KEY_ROLES.flatMap((r) => levelsShown(item, info, r)));
   const entries = fieldsByColumn(header, [...hiddenFields, ...keyFields, ...Object.values(roles).flat()]);
   const hidden = header.map((_, ci) => hiddenFields.includes(entries[ci]));
   if (!hidden.some(Boolean)) return null;   // already exported at the level shown
