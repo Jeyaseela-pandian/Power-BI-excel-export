@@ -3589,6 +3589,7 @@ const EXCEL_CHARTS = {
   waterfallChart: { kind: "waterfall" },
   funnel: { kind: "funnel" },
   treemap: { kind: "treemap" },   // an Excel treemap (Excel 2016 and later)
+  RadarChart1446119667547: { kind: "radar" },   // the AppSource Radar Chart: Excel's own filled radar
 };
 const CHART_SCALE = 1;          // Power BI page pixels → chart pixels
 const CHART_MIN_W = 360;        // smallest chart, in pixels
@@ -4902,6 +4903,20 @@ function chartXml(plan) {
       const hd = d * ratio;
       shapes.push(ellipseShapeXml(shapes.length + 2, look.frame.background || "#FFFFFF", (cx - hd / 2) / W, (cy - hd / 2) / H, hd / W, hd / H));
     }
+  } else if (kind === "radar") {
+    // A radar is a square web: placed by hand in the room the title, legend and the spoke
+    // labels leave
+    let x0 = 0, x1 = W, y0 = titleH, y1 = H;
+    if (legendOn) {
+      if (side === "l") x0 += legendW + 14; else if (side === "r") x1 -= legendW + 14;
+      else if (side === "t") y0 += legendH + 4; else y1 -= legendH + 8;
+    }
+    const mx = Math.min(90, Math.max(20, ...plan.categories.map((_, i) => textPx(catLabel(i), look.cat.text))) + 12);
+    const my = lineHeightPx(look.cat.text) + 10;
+    const d = Math.max(40, Math.min(x1 - x0 - 2 * mx, y1 - y0 - 2 * my));
+    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+    plotLayout = manualLayoutA((cx - d / 2) / W, (cy - d / 2) / H, d / W, d / H, true);
+    body = radarXml(plan, look, catLabel);
   } else {
     body = cartesianXml(plan, look, { titleH, legendOn, side, legendW, legendH, catLabel }, hidden);
   }
@@ -4920,6 +4935,38 @@ function chartXml(plan) {
     `<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart>${frame}${txPrA(LT)}` +
     (shapes.length ? `<c:userShapes r:id="${USER_SHAPES_RID}"/>` : "") + `</c:chartSpace>`;
   return { xml, shapes: shapes.length ? userShapesXml(shapes) : null };
+}
+
+/*
+ * Radar (the AppSource Radar Chart): Excel's filled radar, a spoke per category and a
+ * polygon per measure in its colour, see-through so overlapping polygons stay visible as in
+ * the visual, with rings of the value axis behind them
+ */
+function radarXml(plan, look, catLabel) {
+  const { series, refs } = plan;
+  const A1 = 60010, A2 = 60020;
+  const cats = plan.categories.map((_, i) => catLabel(i));
+  const sers = series.map((s, i) => {
+    const color = s.color || null;
+    const sp = color ? `<c:spPr>${fillA(color, 0.45)}${lineA({ color, width: 2 })}</c:spPr>` : "";
+    const ref = refs.series[i];
+    return `<c:ser><c:idx val="${i}"/><c:order val="${i}"/><c:tx><c:strRef><c:f>${xmlEsc(ref.nameRef)}</c:f>${strCacheXml([s.name])}</c:strRef></c:tx>${sp}` +
+      `<c:cat><c:strRef><c:f>${xmlEsc(refs.catRef)}</c:f>${strCacheXml(cats)}</c:strRef></c:cat>` +
+      `<c:val><c:numRef><c:f>${xmlEsc(ref.valRef)}</c:f>${numCacheXml(s.values, s.fmt)}</c:numRef></c:val></c:ser>`;
+  }).join("");
+  const values = series.flatMap((s) => s.values).filter((v) => typeof v === "number");
+  const fmt = axisNumFmt((series[0] || {}).fmt, null, look.val, values);
+  const web = lineA({ color: GRID_GREY, width: 1 });
+  return `<c:radarChart><c:radarStyle val="filled"/><c:varyColors val="0"/>${sers}<c:axId val="${A1}"/><c:axId val="${A2}"/></c:radarChart>` +
+    `<c:catAx><c:axId val="${A1}"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/>` +
+    `<c:majorGridlines><c:spPr>${web}</c:spPr></c:majorGridlines><c:numFmt formatCode="General" sourceLinked="1"/>` +
+    `<c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/><c:spPr>${web}</c:spPr>${txPrA(look.cat.text)}` +
+    `<c:crossAx val="${A2}"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/><c:noMultiLvlLbl val="0"/></c:catAx>` +
+    `<c:valAx><c:axId val="${A2}"/><c:scaling><c:orientation val="minMax"/><c:min val="0"/></c:scaling><c:delete val="0"/><c:axPos val="l"/>` +
+    `<c:majorGridlines><c:spPr>${web}</c:spPr></c:majorGridlines><c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/>` +
+    // No ring values, as the visual shows none (they'd sit over the top spoke's polygons)
+    `<c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="none"/><c:spPr><a:ln><a:noFill/></a:ln></c:spPr>${txPrA(look.val.text)}` +
+    `<c:crossAx val="${A1}"/><c:crosses val="autoZero"/><c:crossBetween val="between"/></c:valAx>`;
 }
 
 /*
