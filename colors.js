@@ -172,6 +172,10 @@ const CUSTOM_VISUALS = {
   // switches to theme colours), whether the sides are legend values or two measures
   TornadoChart1452517688218: { name: "Tornado chart", rule: "auto", roles: { Category: "Category", Series: "Series", Values: "Values" },
     palette: ["#800080", "#008080"] },
+  // Box and whisker (Jan Pieter Posthuma): a theme colour per category box, in order (a colour set
+  // per category kept); every box one colour when "one colour" is on (its own, else the first)
+  BoxWhiskerChart1455240051538: { name: "Box and whisker chart", rule: "item", roles: { Groups: "Category", Samples: "Samples", Values: "Values" },
+    settings: { oneColor: ["dataPoint", "oneColor", false], oneFill: ["dataPoint", "oneFill", null] } },
   // Filter visuals: filter chips
   Timeline1447991079100: { name: "Timeline", rule: "slicer", roles: { Time: "Values" } },
   textFilter25A4896A83E0487089E2B90C9AE57C8A: { name: "Text filter", rule: "slicer", roles: { field: "Values" } },

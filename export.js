@@ -754,7 +754,10 @@ function columnColors(item, palette, info) {
   if (info && (info.rule === "legend" || info.rule === "item")) {
     let keyCol = findCol(info.rule === "legend" ? info.series : info.category);
     if (keyCol < 0 && info.rule === "item" && !numeric[0] && !hex[0]) keyCol = 0;
-    const oneColor = custom && custom.settings && custom.settings.all && overrides.all;   // e.g. a word cloud's single colour
+    // One colour for every item: a word cloud's, or a box and whisker chart's "one colour" (its own, else the first)
+    const oneColor = (custom && custom.settings && custom.settings.all && overrides.all) ||
+      (custom && custom.settings && custom.settings.oneColor && customSetting(item.type, info, "oneColor") === true
+        ? customSetting(item.type, info, "oneFill") || palette[0] : null);
     if (keyCol >= 0) rowKey = keyedRows(keyCol, (v, i) => toArgb(itemOverride(v) || oneColor || palette[i % palette.length]), info.rule === "legend");
   } else if (info && seriesCols.length === 1 && Object.keys(overrides).some((k) => k.startsWith("i:"))) {
     // One series with colours set per bar ("Show all"): set bars keep theirs, the rest the series colour
@@ -3928,18 +3931,43 @@ function boxPlan(item) {
   const inRole = (ci, ...names) => names.some((r) => (roles[r] || []).includes(entries[ci]));
   const valueCol = t.measureCols.find((ci) => inRole(ci, "Values", "Value", "Y", "Measure")) ?? t.measureCols[t.measureCols.length - 1];
   if (valueCol === undefined) return null;
-  const catCol = t.textCols.find((ci) => inRole(ci, "Category", "Axis", "Group")) ?? t.textCols[0] ?? -1;
+  // The boxes' category (Jan Pieter Posthuma's visual calls it Groups); its Samples are the points
+  // in each box, never a category. With the report file and no category field: one box.
+  const grouped = t.textCols.find((ci) => inRole(ci, "Groups", "Category", "Axis", "Group"));
+  const catCol = grouped ?? (info && info.roles ? -1 : t.textCols.find((ci) => !inRole(ci, "Samples")) ?? -1);
   const rows = t.data.filter((r) => t.num(r[valueCol]) !== null);
   if (rows.length < 2) return null;
-  const color = (item.colors && item.colors.series && item.colors.series[valueCol]) || null;
+  const fmt = t.formatOf(valueCol);
+  // Each category box in its own colour (Excel colours a box & whisker series as one): a series
+  // per category, named in the legend, side by side. One colour for every box: one series.
+  const catOf = (r) => t.key(r, catCol) || "(Blank)";
+  const byKey = item.colors && item.colors.rowKey && item.colors.rowKey.col === catCol ? item.colors.rowKey.colorOf : null;
+  const groups = catCol >= 0 ? [...new Set(rows.map(catOf))] : [];
+  const colorOf = (g, k) => (byKey && byKey[g]) || (item.colors ? null : toArgb(DEFAULT_THEME_COLORS[k % DEFAULT_THEME_COLORS.length]));
+  const oneColor = customSetting(item.type, info, "oneColor") === true || new Set(groups.map((g, k) => colorOf(g, k))).size <= 1;
+  if (groups.length > 1 && groups.length <= 12 && !oneColor) {
+    const lists = groups.map((g) => rows.filter((r) => catOf(r) === g).map((r) => t.num(r[valueCol])));
+    const n = Math.max(...lists.map((l) => l.length));
+    return {
+      spec: { kind: "boxWhisker" }, perGroup: true,
+      title: item.displayTitle || item.title,
+      catName: null,   // the legend names the boxes
+      valueName: t.header[valueCol], legendName: t.header[catCol],
+      axes: (info && info.axes) || null,
+      categories: Array.from({ length: n }, () => ""),
+      series: groups.map((g, k) => ({ name: g, values: Array.from({ length: n }, (_, i) => (i < lists[k].length ? lists[k][i] : null)), fmt, color: colorOf(g, k) })),
+      pointColors: null,
+    };
+  }
+  const color = (groups.length && colorOf(groups[0], 0)) || (item.colors && item.colors.series && item.colors.series[valueCol]) || null;
   return {
     spec: { kind: "boxWhisker" },
     title: item.displayTitle || item.title,
-    catName: catCol >= 0 ? t.header[catCol] : "Category",
+    catName: catCol >= 0 ? t.header[catCol] : null,   // one box: no category axis title
     valueName: t.header[valueCol],
     axes: (info && info.axes) || null,
     categories: rows.map((r) => (catCol >= 0 ? t.key(r, catCol) || "(Blank)" : t.header[valueCol])),
-    series: [{ name: t.header[valueCol], values: rows.map((r) => t.num(r[valueCol])), fmt: t.formatOf(valueCol), color }],
+    series: [{ name: t.header[valueCol], values: rows.map((r) => t.num(r[valueCol])), fmt, color }],
     pointColors: null,
   };
 }
@@ -5410,6 +5438,11 @@ function chartExTitleXml(plan, look) {
 function chartExTxPr(t) {
   return `<cx:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr>${runPrA(t)}</a:pPr><a:endParaRPr lang="en-US"/></a:p></cx:txPr>`;
 }
+/* A chartEx legend where the report puts it (top left by default), below the title */
+function chartExLegendXml(look) {
+  const [side, align] = LEGEND_SPOTS[String(look.legend.position).toLowerCase()] || ["t", "start"];
+  return `<cx:legend pos="${side}" align="${align === "center" ? "ctr" : align === "end" ? "max" : "min"}" overlay="0">${chartExTxPr(look.legend.text)}</cx:legend>`;
+}
 /* A chartEx axis title */
 function chartExAxisTitle(text, t) {
   return text ? `<cx:title><cx:tx><cx:rich><a:bodyPr/><a:lstStyle/>${paraA(text, t, "ctr")}</cx:rich></cx:tx><cx:spPr><a:noFill/><a:ln><a:noFill/></a:ln></cx:spPr></cx:title>` : "";
@@ -5451,9 +5484,7 @@ function waterfallChartExXml(plan) {
     ? `<cx:dataLabels><cx:numFmt formatCode="${xmlEsc(labelFmt || "General")}" sourceLinked="0"/>` +
       `${chartExTxPr(look.labels.text)}<cx:visibility seriesName="0" categoryName="0" value="1"/></cx:dataLabels>` : "";
   const titles = axisTitles(plan, [], []);
-  const [side, align] = LEGEND_SPOTS[String(look.legend.position).toLowerCase()] || ["t", "start"];
-  const legend = look.legend.show === false ? ""
-    : `<cx:legend pos="${side}" align="${align === "center" ? "ctr" : align === "end" ? "max" : "min"}" overlay="0">${chartExTxPr(look.legend.text)}</cx:legend>`;
+  const legend = look.legend.show === false ? "" : chartExLegendXml(look);
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>${CHARTEX_SPACE}` +
     `<cx:chartData><cx:data id="0">` +
     `<cx:strDim type="cat"><cx:f>${xmlEsc(plan.refs.catRef)}</cx:f><cx:lvl ptCount="${cats.length}">${pts(cats)}</cx:lvl></cx:strDim>` +
@@ -5472,29 +5503,35 @@ function waterfallChartExXml(plan) {
 
 /* Excel's own box & whisker chart: a box per category, with its mean marker and outliers */
 function boxWhiskerXml(plan) {
-  const s = plan.series[0], r = plan.refs;
+  const r = plan.refs, series = plan.series;
   const look = plan.look || chartLook({ type: "boxWhisker" }, null);
-  const cats = plan.categories.map(axisLabel);
   const pts = (list) => list.map((v, i) => (v === null || v === undefined || v === "" ? "" : `<cx:pt idx="${i}">${xmlEsc(v)}</cx:pt>`)).join("");
-  const color = s.color || toArgb(DEFAULT_THEME_COLORS[0]);
-  const vals = s.values.filter((v) => typeof v === "number");
+  const vals = series.flatMap((s) => s.values).filter((v) => typeof v === "number");
+  const fmt = series[0].fmt || "General";
   const axis = valueScale(vals, ((plan.sizePx && plan.sizePx.h) || 300) - 100, 75, { round: false });
-  const titles = axisTitles(plan, [[s]], []);
+  const titles = axisTitles(plan, [[series[0]]], []);
+  // A box per category: each category its own series (its colour, its legend entry), drawn side
+  // by side with no category axis; else one series, its boxes along the category axis
+  const cats = plan.perGroup ? null : plan.categories.map(axisLabel);
+  const data = series.map((s, k) => `<cx:data id="${k}">` +
+    (cats ? `<cx:strDim type="cat"><cx:f>${xmlEsc(r.catRef)}</cx:f><cx:lvl ptCount="${cats.length}">${pts(cats)}</cx:lvl></cx:strDim>` : "") +
+    `<cx:numDim type="val"><cx:f>${xmlEsc(r.series[k].valRef)}</cx:f><cx:lvl ptCount="${s.values.length}" formatCode="${xmlEsc(s.fmt || "General")}">${pts(s.values)}</cx:lvl></cx:numDim></cx:data>`).join("");
+  const boxes = series.map((s, k) => {
+    const color = s.color || toArgb(DEFAULT_THEME_COLORS[k % DEFAULT_THEME_COLORS.length]);
+    return `<cx:series layoutId="boxWhisker" uniqueId="{7C1E4A92-3B6D-4E85-A0F7-${String(k).padStart(12, "0")}}">` +
+      `<cx:tx><cx:txData><cx:f>${xmlEsc(r.series[k].nameRef)}</cx:f><cx:v>${xmlEsc(s.name)}</cx:v></cx:txData></cx:tx>` +
+      `<cx:spPr>${fillA(color, 0.85)}<a:ln w="9525">${fillXml(color)}</a:ln></cx:spPr>` +
+      `<cx:dataId val="${k}"/><cx:layoutPr><cx:visibility meanLine="0" meanMarker="1" nonoutliers="0" outliers="1"/><cx:statistics quartileMethod="exclusive"/></cx:layoutPr></cx:series>`;
+  }).join("");
+  const legend = plan.perGroup && look.legend.show !== false ? chartExLegendXml(look) : "";
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>${CHARTEX_SPACE}` +
-    `<cx:chartData><cx:data id="0">` +
-    `<cx:strDim type="cat"><cx:f>${xmlEsc(r.catRef)}</cx:f><cx:lvl ptCount="${cats.length}">${pts(cats)}</cx:lvl></cx:strDim>` +
-    `<cx:numDim type="val"><cx:f>${xmlEsc(r.series[0].valRef)}</cx:f><cx:lvl ptCount="${s.values.length}" formatCode="${xmlEsc(s.fmt || "General")}">${pts(s.values)}</cx:lvl></cx:numDim>` +
-    `</cx:data></cx:chartData>` +
-    `<cx:chart>${chartExTitleXml(plan, look)}<cx:plotArea><cx:plotAreaRegion>` +
-    `<cx:series layoutId="boxWhisker" uniqueId="{7C1E4A92-3B6D-4E85-A0F7-5D2C8B9E1F36}">` +
-    `<cx:tx><cx:txData><cx:f>${xmlEsc(r.series[0].nameRef)}</cx:f><cx:v>${xmlEsc(s.name)}</cx:v></cx:txData></cx:tx>` +
-    `<cx:spPr>${fillA(color, 0.85)}<a:ln w="9525">${fillXml(color)}</a:ln></cx:spPr>` +
-    `<cx:dataId val="0"/><cx:layoutPr><cx:visibility meanLine="0" meanMarker="1" nonoutliers="0" outliers="1"/><cx:statistics quartileMethod="exclusive"/></cx:layoutPr></cx:series>` +
-    `</cx:plotAreaRegion>` +
-    `<cx:axis id="0"${titles.catShow ? "" : ' hidden="1"'}><cx:catScaling gapWidth="1"/>${chartExAxisTitle(titles.cat, look.cat.titleFont || look.cat.text)}<cx:tickLabels/>` +
+    `<cx:chartData>${data}</cx:chartData>` +
+    `<cx:chart>${chartExTitleXml(plan, look)}<cx:plotArea><cx:plotAreaRegion>${boxes}</cx:plotAreaRegion>` +
+    `<cx:axis id="0"${titles.catShow && !plan.perGroup ? "" : ' hidden="1"'}><cx:catScaling gapWidth="${plan.perGroup ? 0.3 : 1}"/>` +
+    `${plan.perGroup ? "" : chartExAxisTitle(titles.cat, look.cat.titleFont || look.cat.text)}<cx:tickLabels/>` +
     `<cx:spPr><a:ln><a:noFill/></a:ln></cx:spPr>${chartExTxPr(look.cat.text)}</cx:axis>` +
-    chartExValueAxis(1, axis, axisNumFmt(s.fmt, axis, look.val, vals), look, titles.val, titles.valShow) +
-    `</cx:plotArea></cx:chart>${CHARTEX_FRAME}</cx:chartSpace>`;
+    chartExValueAxis(1, axis, axisNumFmt(fmt, axis, look.val, vals), look, titles.val, titles.valShow) +
+    `</cx:plotArea>${legend}</cx:chart>${CHARTEX_FRAME}</cx:chartSpace>`;
 }
 
 /* A chart's alt text, for screen readers and Excel's Alt Text pane: what it shows, and its
@@ -5514,7 +5551,8 @@ function chartAltText(plan) {
   const names = plan.spec.kind === "waterfall" ? [plan.valueName] : plan.legendName && plan.valueName ? [plan.valueName] : [...new Set(shown.map((s) => s.name))];
   const list = names.filter(Boolean).slice(0, 4);
   const what = list.length ? ` of ${list.length > 1 ? `${list.slice(0, -1).join(", ")} and ${list[list.length - 1]}` : list[0]}` : "";
-  const by = plan.legendName && plan.valueName ? ` by ${plan.catName} and ${plan.legendName}` : plan.catName ? ` by ${plan.catName}` : "";
+  const byNames = [plan.catName, plan.legendName && plan.valueName ? plan.legendName : null].filter(Boolean);
+  const by = byNames.length ? ` by ${byNames.join(" and ")}` : "";
   let text = `${plan.title ? plan.title + ": " : ""}${/^[aeiou]/i.test(kind) ? "an" : "a"} ${kind}${what}${by}.`;
   const one = shown.length === 1 && !["scatter", "boxWhisker", "waterfall"].includes(plan.spec.kind) ? shown[0] : null;
   if (one && plan.categories && plan.categories.length > 1) {
