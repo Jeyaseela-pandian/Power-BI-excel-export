@@ -3019,6 +3019,12 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     item.tableFormat = item.gridFormat || (info && info.tableFormats && info.tableFormats.length ? info : null);
     item.colorInfo = info;
     item.chart = options.visualsAs === "charts" && !item.trend ? chartPlan(item) : null;   // charts mode only
+    if (item.chart) {
+      // The visual's format settings (Power BI's defaults without the report file)
+      const look = (info && info.look) || chartLook({ type: item.type }, null);
+      Object.assign(item.chart, { look, sizePx: item.chart.sizePx || chartSizePx(item), showTitle: !(info && info.titleHidden) && look.title.show !== false });
+      item.chart = withDateAxis(item.chart);
+    }
     if (item.chart && item.chart.note) colorNotes.push(item.chart.note);
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
   }
@@ -3663,7 +3669,22 @@ function chartPlan(item) {
     });
   };
   const base = { spec, title: item.displayTitle || item.title, catName: levelCols.map((c) => header[c]).join(" / "), categories, pointColors: null,
-    axes: (info && info.axes) || null };
+    axes: (info && info.axes) || null, legendName: null };
+  // A hierarchy shown with its labels not joined (Power BI's default): Excel's multi-level
+  // axis labels, each higher level's value under its first category (Quarter, then Year below)
+  const look = (info && info.look) || null;
+  if (levelCols.length > 1 && !(look && look.cat.concatenate) && ["bar", "line", "area", "combo"].includes(spec.kind)) {
+    const firstRows = categories.map((c) => data[firstRowOf(c)]);
+    const label = (r, ci) => String(axisLabel(key(r, ci)));
+    base.multiLevel = true;
+    base.catTitle = header[levelCols[levelCols.length - 1]];   // Power BI titles the axis by its lowest level
+    base.catText = firstRows.map((r) => label(r, levelCols[levelCols.length - 1]));
+    base.catLevels = levelCols.slice(0, -1).map((ci, k) => {
+      const values = firstRows.map((r) => label(r, ci));
+      const outer = (i) => levelCols.slice(0, k + 1).map((c) => key(firstRows[i], c)).join("\u0001");
+      return { name: header[ci], values, starts: values.map((_, i) => i === 0 || outer(i) !== outer(i - 1)) };
+    });
+  }
 
   // Pie / donut: one series, a colour per slice
   if (spec.kind === "pie" || spec.kind === "doughnut") {
@@ -3671,6 +3692,7 @@ function chartPlan(item) {
     const byKey = colors && colors.rowKey && colors.rowKey.col === catCol ? colors.rowKey.colorOf : null;
     return {
       ...base,
+      legendName: base.catName,
       series: [{ name: header[vc], values: valuesFor(vc, data), fmt: formatOf(vc), color: null }],
       pointColors: byKey ? categories.map((c) => byKey[c] || null) : null,
     };
@@ -3698,6 +3720,7 @@ function chartPlan(item) {
     return {
       ...base,
       valueName: header[vc],
+      legendName: header[legendCol],
       series: [
         ...legends.map((name) => ({
           name,
@@ -3733,6 +3756,34 @@ function chartPlan(item) {
     else if (colors.tabColors) pointColors = categories.map((c) => colors.tabColors[firstRowOf(c)] || null);
   }
   return { ...base, series, pointColors };
+}
+
+/*
+ * Dates on a line or area chart's axis are spaced by date, as Power BI's continuous axis
+ * spaces them (its default for a date field): an Excel date axis with labels every few months
+ * or years ("Jul 2023"), and the blank date left out as Power BI leaves it out.
+ */
+const DATE_STEPS = [[1, "days", 1], [7, "days", 7], [1, "months", 30.44], [2, "months", 60.9], [3, "months", 91.3], [6, "months", 182.6],
+  [1, "years", 365.25], [2, "years", 730.5], [5, "years", 1826], [10, "years", 3652]];
+function withDateAxis(plan) {
+  if (!plan || !["line", "area"].includes(plan.spec.kind) || plan.multiLevel) return plan;
+  if (plan.look && plan.look.cat.continuous === false) return plan;
+  const parsed = plan.categories.map((c) => { const t = String(c ?? "").trim(); return t ? parseDate(t) : null; });
+  const blank = plan.categories.map((c) => !String(c ?? "").trim());
+  if (parsed.filter(Boolean).length < 2 || parsed.some((p, i) => !p && !blank[i])) return plan;
+  const pick = (list) => list.filter((_, i) => !blank[i]);
+  const serials = pick(parsed).map((p) => Math.round((p.date.getTime() / 86400000 + 25569) * 1e6) / 1e6);
+  const span = Math.max(...serials) - Math.min(...serials);
+  const most = Math.max(2, ((plan.sizePx ? plan.sizePx.w : 400) - 70) / 85);
+  const [unit, timeUnit, days] = DATE_STEPS.find(([, , d]) => span / d <= most) || DATE_STEPS[DATE_STEPS.length - 1];
+  const fmt = timeUnit === "years" ? "yyyy" : timeUnit === "months" ? "mmm yyyy" : "d mmm";
+  return {
+    ...plan,
+    categories: pick(plan.categories),
+    series: plan.series.map((s) => ({ ...s, values: pick(s.values) })),
+    pointColors: plan.pointColors ? pick(plan.pointColors) : null,
+    dateAxis: { serials, unit, timeUnit, fmt, days },
+  };
 }
 
 /* Shared helpers for the chart builders below */
@@ -3846,6 +3897,7 @@ function scatterPlan(item) {
     series: valueCols.map((ci, k) => ({ name: header[ci], values: points.map((p) => p.values[k]), fmt: fmts[k], color: null })),
     groups,
     perPoint,
+    legendName: legendCol >= 0 ? header[legendCol] : null,
     sizePx: chartSizePx(item),   // the visual's size on the report page, for Power BI-like axis steps
     pointColors: null,
     note: merged ? `"${title}" shows one bubble per ${header[labelCol]}, but Power BI exported several rows for some of them. They were combined, so averages and percentages in that chart are approximate.` : null,
@@ -3867,12 +3919,13 @@ function waterfallPlan(item) {
   const starts = [], ends = [];
   let running = 0;
   steps.forEach((s) => { starts.push(running); running += s.value; ends.push(running); });
-  // The axis like Power BI's (-40% to 20% in 20% steps), ending exactly on a step
+  // The axis like Power BI's (0M to 2M in 1M steps for a 2.47M total), on to the next step
+  // when the labels need the room
   const size = chartSizePx(item);
-  const axis = niceAxis([0, ...starts, ...ends], size.h - 100, 45, 0) || { min: Math.min(0, ...ends), max: Math.max(0, ...ends), step: 0 };
   const tidy = (x) => Number(x.toFixed(12));
-  const d = item.colorInfo && item.colorInfo.display;
-  const showLabels = !(d && d.labels && d.labels.show === false);   // labels on unless switched off in the report
+  const lookLabels = item.colorInfo && item.colorInfo.look ? item.colorInfo.look.labels : null;
+  const showLabels = !!(lookLabels && lookLabels.show === true);   // Power BI's waterfall has no labels unless the report turns them on
+  const axis = valueScale([0, ...starts, ...ends], size.h - 100, 75, { zero: true, round: showLabels }) || { min: Math.min(0, ...ends), max: Math.max(0, ...ends), step: 0 };
   // Each label needs room outside its bar (above an increase, below a decrease). Where the
   // axis edge leaves too little, the label goes inside the end of the bar in white, as Power
   // BI does; a bar too short to hold it makes the axis one step longer instead. The total is
@@ -3922,7 +3975,7 @@ function waterfallPlan(item) {
     axis, fmt,
     showLabels,
     labelInside: inside,   // per bar: label inside the bar's end (white) instead of beside it
-    labelPrecision: d && d.labels ? d.labels.precision : undefined,
+    labelPrecision: lookLabels && lookLabels.precision !== null ? lookLabels.precision : undefined,
     pointColors: null,
   };
 }
@@ -4012,46 +4065,144 @@ function treemapPlan(item, spec) {
   };
 }
 
+const NO_BOX = "<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>";
+const labelFlags = ({ val = false, cat = false, ser = false, pct = false } = {}) =>
+  `<c:showLegendKey val="0"/><c:showVal val="${val ? 1 : 0}"/><c:showCatName val="${cat ? 1 : 0}"/><c:showSerName val="${ser ? 1 : 0}"/>` +
+  `<c:showPercent val="${pct ? 1 : 0}"/><c:showBubbleSize val="0"/>`;
+
 /* Value labels in the middle of each bar (used by the funnel) */
-function dataLabelsXml(fmt, argb) {
+function dataLabelsXml(fmt, argb, t) {
   // Labels inside a bar: white or ink, whichever reads on the bar's colour (Power BI's white)
-  const text = argb ? `<c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="900" b="1">${fillXml(textOn(argb))}</a:defRPr></a:pPr><a:endParaRPr lang="en-US"/></a:p></c:txPr>` : "";
-  return `<c:dLbls><c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>${text}` +
-    `<c:dLblPos val="ctr"/><c:showLegendKey val="0"/><c:showVal val="1"/><c:showCatName val="0"/><c:showSerName val="0"/>` +
-    `<c:showPercent val="0"/><c:showBubbleSize val="0"/></c:dLbls>`;
+  const text = { ...LOOK_TEXT, ...(t || {}), ...(argb ? { color: textOn(argbOf(argb)) } : {}) };
+  return `<c:dLbls><c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/>${NO_BOX}${txPrA(text)}` +
+    `<c:dLblPos val="ctr"/>${labelFlags({ val: true })}</c:dLbls>`;
+}
+
+/*
+ * A series' data labels as the report sets them: position (only where Excel allows it for the
+ * chart type), display units and decimals, font, background. Inside a bar they take white or
+ * ink, whichever reads on the bar, unless the report sets their colour.
+ */
+const LABEL_POSITIONS = { insideend: "inEnd", outsideend: "outEnd", insidecenter: "ctr", insidebase: "inBase", above: "t", under: "b", below: "b", left: "l", right: "r", center: "ctr" };
+function seriesLabelsXml(kind, grouping, color, numFmt, labels) {
+  let pos = LABEL_POSITIONS[String(labels.position || "").toLowerCase()] || null;
+  if (kind === "bar") {
+    const allowed = grouping === "clustered" ? ["ctr", "inEnd", "inBase", "outEnd"] : ["ctr", "inEnd", "inBase"];
+    if (!allowed.includes(pos)) pos = grouping === "clustered" ? "outEnd" : "ctr";
+  } else if (kind === "line") {
+    if (!["t", "b", "l", "r", "ctr"].includes(pos)) pos = "t";
+  } else {
+    pos = null;   // area: Excel places them
+  }
+  const inside = kind === "bar" && pos !== "outEnd";
+  const own = labels.text.color && hexOf(labels.text.color) !== hexOf(LOOK_TEXT.color);
+  const text = inside && !own && color ? { ...labels.text, color: textOn(argbOf(color)) } : labels.text;
+  const back = labels.background ? fillA(labels.background.color, 1 - labels.background.transparency / 100) : "<a:noFill/>";
+  return `<c:dLbls><c:numFmt formatCode="${xmlEsc(numFmt || "General")}" sourceLinked="0"/><c:spPr>${back}<a:ln><a:noFill/></a:ln></c:spPr>${txPrA(text)}` +
+    (pos ? `<c:dLblPos val="${pos}"/>` : "") + `${labelFlags({ val: true })}</c:dLbls>`;
+}
+
+/* Labels written as text, one per point (pie slices, totals, analytics lines): [{ idx, text, pos }] */
+function textLabelsXml(points, t) {
+  return `<c:dLbls>${points.map((p) => `<c:dLbl><c:idx val="${p.idx}"/>${richA(p.text, t)}${NO_BOX}` +
+    (p.pos ? `<c:dLblPos val="${p.pos}"/>` : "") + `${labelFlags({ val: true })}</c:dLbl>`).join("")}` +
+    `${NO_BOX}${labelFlags()}${points.some((p) => p.leader) ? '<c:showLeaderLines val="1"/>' : ""}</c:dLbls>`;
+}
+
+/* A linear trend line in the report's colour and dash */
+function trendlineXml(trend) {
+  return `<c:trendline><c:spPr>${lineA({ color: trend.color, width: 1.5, style: trend.style, alpha: 1 - trend.transparency / 100 })}</c:spPr>` +
+    `<c:trendlineType val="linear"/><c:dispRSqr val="0"/><c:dispEq val="0"/></c:trendline>`;
 }
 
 /* Scatter / bubble chart XML: each legend group reads its own block of rows on the Data sheet */
 function scatterXml(plan) {
+  const look = plan.look || chartLook({ type: "scatterChart" }, null);
   const bubble = plan.spec.kind === "bubble";
   const [xs, ys, ss] = plan.series;
   const range = plan.refs.range;
-  const labels = plan.perPoint ? nameLabelsXml() : "";
+  // Each point's name beside it only when the report turns category labels on (it still shows on hover)
+  const labels = plan.perPoint && look.categoryLabels ? nameLabelsXml(look.labels.text) : "";
+  const trend = look.trend && !bubble && !plan.perPoint ? trendlineXml(look.trend) : "";
   const numRef = (i, g, s) => `<c:numRef><c:f>${xmlEsc(range(i, g.start, g.end))}</c:f>` +
     `${numCacheXml(s.values.slice(g.start, g.end + 1), s.fmt)}</c:numRef>`;
   const fill = (argb) => (argb ? `<a:solidFill><a:srgbClr val="${String(argb).slice(-6).toUpperCase()}"><a:alpha val="85000"/></a:srgbClr></a:solidFill>` : "");
   const sers = plan.groups.map((g, i) => {
     const head = `<c:idx val="${i}"/><c:order val="${i}"/><c:tx><c:v>${xmlEsc(g.name)}</c:v></c:tx>`;
     const xv = `<c:xVal>${numRef(0, g, xs)}</c:xVal>`, yv = `<c:yVal>${numRef(1, g, ys)}</c:yVal>`;
-    const look = `<c:spPr>${fill(g.color)}<a:ln w="9525">${fillXml(C.WHITE)}</a:ln></c:spPr>`;
+    const sp = `<c:spPr>${fill(g.color)}<a:ln w="9525">${fillXml(C.WHITE)}</a:ln></c:spPr>`;
     if (bubble) {
-      return `<c:ser>${head}${look}<c:invertIfNegative val="0"/>${labels}${xv}${yv}<c:bubbleSize>${numRef(2, g, ss)}</c:bubbleSize><c:bubble3D val="0"/></c:ser>`;
+      return `<c:ser>${head}${sp}<c:invertIfNegative val="0"/>${labels}${xv}${yv}<c:bubbleSize>${numRef(2, g, ss)}</c:bubbleSize><c:bubble3D val="0"/></c:ser>`;
     }
     return `<c:ser>${head}<c:spPr><a:ln w="19050"><a:noFill/></a:ln></c:spPr>` +
-      `<c:marker><c:symbol val="circle"/><c:size val="8"/>${look}</c:marker>${labels}${xv}${yv}<c:smooth val="0"/></c:ser>`;
+      `<c:marker><c:symbol val="circle"/><c:size val="8"/>${sp}</c:marker>${labels}${trend}${xv}${yv}<c:smooth val="0"/></c:ser>`;
   }).join("");
+  // Axis range and steps like Power BI's automatic scatter axes: not from zero, a step about
+  // every 200 px across and 75 px up, so the gridlines fall on the same values as in the
+  // report; constant lines are kept in view
+  const size = plan.sizePx || { w: 0, h: 0 };
+  const constants = (k) => look.refLines.filter((l) => l.kind === "constant" && l.axis === k).map((l) => l.value);
+  // Bubbles need room beyond the outermost centres, so their edges aren't cut off
+  const roomy = (vals) => { const v = vals.filter((x) => typeof x === "number" && isFinite(x)); if (!bubble || v.length < 2) return v; const d = (Math.max(...v) - Math.min(...v)) * 0.08; return [...v, Math.min(...v) - d, Math.max(...v) + d]; };
+  const xAxis = valueScale([...roomy(xs.values), ...constants("x")], size.w - 90, 200, { round: false, start: look.cat.start, end: look.cat.end });
+  const yAxis = valueScale([...roomy(ys.values), ...constants("y")], size.h - 100, 75, { round: false, start: look.val.start, end: look.val.end });
+  // Constant and analytics lines: two-point lines across the plot, on the same axes
+  const lines = [];
+  for (const l of look.refLines) {
+    const vertical = l.axis === "x";
+    const v = l.kind === "constant" ? l.value : analyticValue(l, vertical ? xs.values : ys.values);
+    if (v === null || !xAxis || !yAxis) continue;
+    const pts = vertical ? [[v, yAxis.min], [v, yAxis.max]] : [[xAxis.min, v], [xAxis.max, v]];
+    lines.push(refLineSeriesXml(plan.groups.length + lines.length, l, pts, vertical ? xs.fmt : ys.fmt, vertical, v));
+  }
+  plan.hiddenLegend = lines.map((_, k) => plan.groups.length + k);
   const A1 = 50110, A2 = 50120;
   const chart = bubble
-    ? `<c:bubbleChart><c:varyColors val="0"/>${sers}<c:bubbleScale val="40"/><c:showNegBubbles val="0"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:bubbleChart>`
-    : `<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>${sers}<c:axId val="${A1}"/><c:axId val="${A2}"/></c:scatterChart>`;
+    ? `<c:bubbleChart><c:varyColors val="0"/>${sers}<c:bubbleScale val="40"/><c:showNegBubbles val="0"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:bubbleChart>` +
+      (lines.length ? `<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>${lines.join("")}<c:axId val="${A1}"/><c:axId val="${A2}"/></c:scatterChart>` : "")
+    : `<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>${sers}${lines.join("")}<c:axId val="${A1}"/><c:axId val="${A2}"/></c:scatterChart>`;
   // Axes along the bottom and left edges with their field names, as Power BI draws them
-    // Axis range and steps like Power BI's automatic axes, sized to the visual (one step per
-  // ~110 px across, ~45 px up), so the gridlines fall on the same values as in the report
-  const size = plan.sizePx || { w: 0, h: 0 };
-  const xAxis = niceAxis(xs.values, size.w - 90, 110), yAxis = niceAxis(ys.values, size.h - 100, 45);
+  const a = plan.axes || {};
+  const on = (x, key) => !x || x[key] !== false;
+  const xTitle = on(a.cat, "title") ? look.cat.titleText || xs.name : null, yTitle = on(a.val, "title") ? look.val.titleText || ys.name : null;
   return chart +
-    valAxXml(A1, A2, "b", stepFormat(xs.fmt, xAxis, xs.values), { crosses: "min", title: xs.name, axis: xAxis }) +
-    valAxXml(A2, A1, "l", stepFormat(ys.fmt, yAxis, ys.values), { crosses: "min", title: ys.name, axis: yAxis });
+    valAxXml(A1, A2, "b", axisNumFmt(xs.fmt, xAxis, look.cat, xs.values), { crosses: "min", title: xTitle, axis: xAxis, hidden: !on(a.cat, "show"), look: { ...look.cat, grid: look.cat.grid || look.val.grid } }) +
+    valAxXml(A2, A1, "l", axisNumFmt(ys.fmt, yAxis, look.val, ys.values), { crosses: "min", title: yTitle, axis: yAxis, hidden: !on(a.val, "show"), look: look.val });
+}
+
+/* An analytics line's value from the points it summarises: min, max, average, median, percentile */
+function analyticValue(line, values) {
+  const v = values.filter((x) => typeof x === "number" && isFinite(x)).sort((a, b) => a - b);
+  if (!v.length) return null;
+  switch (line.kind) {
+    case "min": return v[0];
+    case "max": return v[v.length - 1];
+    case "average": return v.reduce((a, b) => a + b, 0) / v.length;
+    case "median": return v.length % 2 ? v[(v.length - 1) / 2] : (v[v.length / 2 - 1] + v[v.length / 2]) / 2;
+    case "percentile": {
+      const p = Math.max(0, Math.min(100, line.percentile ?? 50)) / 100 * (v.length - 1);
+      const lo = Math.floor(p);
+      return v[lo] + (v[Math.min(v.length - 1, lo + 1)] - v[lo]) * (p - lo);
+    }
+    default: return null;
+  }
+}
+
+/* One constant or analytics line: a two-point scatter series ([x, y] pairs), with its label
+   (the value, its name, or both) at the line's start, as Power BI places it */
+function refLineSeriesXml(idx, line, pts, fmt, vertical, value) {
+  const lit = (vals) => `<c:numLit><c:formatCode>General</c:formatCode><c:ptCount val="${vals.length}"/>${vals.map((v, i) => `<c:pt idx="${i}"><c:v>${v}</c:v></c:pt>`).join("")}</c:numLit>`;
+  let labels = "";
+  if (line.label) {
+    const unit = line.label.units > 0 ? line.label.units : 1;
+    const valueText = displayValue(value, fmt, unit, line.label.precision);
+    const name = line.label.name || (line.kind === "constant" ? "" : line.kind[0].toUpperCase() + line.kind.slice(1));
+    const text = /^name$/i.test(line.label.text) ? name : /name/i.test(line.label.text) ? `${name} ${valueText}`.trim() : valueText;
+    labels = textLabelsXml([{ idx: vertical ? 1 : 0, text, pos: vertical ? "r" : "t" }], { ...LOOK_TEXT, color: line.label.color });
+  }
+  return `<c:ser><c:idx val="${idx}"/><c:order val="${idx}"/><c:tx><c:v>${xmlEsc(line.label && line.label.name ? line.label.name : line.kind)}</c:v></c:tx>` +
+    `<c:spPr>${lineA({ color: line.color, width: line.width, style: line.style, alpha: 1 - line.transparency / 100 })}</c:spPr>` +
+    `<c:marker><c:symbol val="none"/></c:marker>${labels}<c:xVal>${lit(pts.map((p) => p[0]))}</c:xVal><c:yVal>${lit(pts.map((p) => p[1]))}</c:yVal><c:smooth val="0"/></c:ser>`;
 }
 
 /* Number format for axis labels, shortened the way Power BI does: "$4,000,000" → "$4.0M", "34.28%" → "34%" */
@@ -4067,27 +4218,43 @@ function axisFormat(fmt, values) {
   return f;
 }
 
-/* A small grey axis title, like Power BI's */
-function axisTitleXml(text) {
-  return `<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="900" b="0"/></a:pPr>` +
-    `<a:r><a:rPr lang="en-US" sz="900" b="0">${fillXml(C.SLATE)}</a:rPr><a:t>${xmlEsc(text)}</a:t></a:r></a:p></c:rich></c:tx>` +
-    `<c:overlay val="0"/></c:title>`;
+/* An axis title in the report's font (Power BI's DIN, about 10pt, by default) */
+const AXIS_TITLE_TEXT = { face: "Bahnschrift", size: 10, color: "#252423", bold: false, italic: false };
+function axisTitleXml(text, font) {
+  return `<c:title>${richA(text, font || AXIS_TITLE_TEXT)}<c:overlay val="0"/></c:title>`;
 }
 
 /* Bubble labels: each bubble's name beside it ("050-Shoes") */
-function nameLabelsXml() {
-  return `<c:dLbls><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>` +
-    `<c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="800">${fillXml(C.SLATE)}</a:defRPr></a:pPr><a:endParaRPr lang="en-US"/></a:p></c:txPr>` +
-    `<c:dLblPos val="r"/><c:showLegendKey val="0"/><c:showVal val="0"/><c:showCatName val="0"/><c:showSerName val="1"/>` +
-    `<c:showPercent val="0"/><c:showBubbleSize val="0"/></c:dLbls>`;
+function nameLabelsXml(t) {
+  return `<c:dLbls>${NO_BOX}${txPrA({ ...LOOK_TEXT, ...(t || {}) })}<c:dLblPos val="r"/>${labelFlags({ ser: true })}</c:dLbls>`;
 }
 
-/* Pie labels: each slice's share (the value shows on hover) */
-function pieLabelsXml(pos) {
-  return `<c:dLbls><c:numFmt formatCode="0.00%" sourceLinked="0"/><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>` +
-    (pos ? `<c:dLblPos val="${pos}"/>` : "") +
-    `<c:showLegendKey val="0"/><c:showVal val="0"/><c:showCatName val="0"/><c:showSerName val="0"/>` +
-    `<c:showPercent val="1"/><c:showBubbleSize val="0"/><c:showLeaderLines val="1"/></c:dLbls>`;
+/*
+ * Pie and donut labels as Power BI writes them, per its label style ("Data value, percent of
+ * total" → "$6K (26.95%)", "Category, percent of total" → "Shoes 39.08%"), outside the slices
+ * with leader lines. Written as text, so they read exactly as in the report.
+ */
+function pieLabelPoints(plan, look) {
+  const s = plan.series[0];
+  const values = s.values.map((v) => (typeof v === "number" && v > 0 ? v : 0));
+  const total = values.reduce((a, b) => a + b, 0) || 1;
+  const L = look.labels;
+  const style = String(L.style || "Data value, percent of total").toLowerCase();
+  const unit = L.units > 0 ? L.units : autoUnit(maxAbsOf(values));
+  const dec = L.precision !== null && L.precision !== undefined ? L.precision : null;
+  const pctDec = L.percentPrecision !== null && L.percentPrecision !== undefined ? L.percentPrecision : 2;
+  const pctText = (v) => (v / total * 100).toLocaleString("en-US", { minimumFractionDigits: L.percentPrecision !== null && L.percentPrecision !== undefined ? pctDec : 0, maximumFractionDigits: pctDec }) + "%";
+  return values.map((v, idx) => {
+    if (!v) return null;
+    const cat = String(plan.catText ? plan.catText[idx] : axisLabel(plan.categories[idx]));
+    const val = displayValue(v, s.fmt, unit, dec);
+    const pct = pctText(v);
+    const text = style === "category" ? cat : style === "data value" ? val : style === "percent of total" ? pct
+      : style === "category, data value" ? `${cat} ${val}` : style === "category, percent of total" ? `${cat} ${pct}`
+        : style === "all detail labels" ? `${cat} ${val} (${pct})` : `${val} (${pct})`;
+    // A long label takes two lines, the share under the value, as Power BI fits them beside the slice
+    return { idx, text: textPx(text, L.text) > 70 ? text.replace(/ (?=\()/, "\n") : text, pos: "outEnd", leader: true };
+  }).filter(Boolean);
 }
 
 /* Which columns are X, Y and Size: the report file's field wells when it could be read, else
@@ -4114,25 +4281,6 @@ function scatterFields(t, item, info, nums) {
     .sort((a, b) => a.at - b.at);
   if (found.length >= 2) return [found[0].ci, found[1].ci, found[2] ? found[2].ci : undefined];
   return [nums[0], nums[1], nums[2]];
-}
-
-/* Axis range and step like Power BI's automatic axes: the step is the first of 1, 2, 5, 10…
-   that leaves room for each label (minGapPx between gridlines on a plot plotPx long) */
-function niceAxis(values, plotPx, minGapPx, pad = 0.03) {
-  const v = (values || []).filter((x) => typeof x === "number" && isFinite(x));
-  if (!v.length || !plotPx) return null;
-  let lo = Math.min(...v), hi = Math.max(...v);
-  if (lo === hi) { const d = Math.abs(lo) || 1; lo -= d / 2; hi += d / 2; }
-  const range = hi - lo, padded = range * 1.1;
-  const most = Math.max(2, plotPx / minGapPx);
-  const p = Math.pow(10, Math.floor(Math.log10(padded / most)));
-  const step = [1, 2, 5, 10, 20, 50, 100].map((m) => m * p).find((s) => padded / s <= most) || 100 * p;
-  const tidy = (x) => Number(x.toFixed(12));
-  // pad: room beyond the data (bubbles need some; waterfall bars end exactly on a step)
-  let min = tidy(Math.floor((lo - range * pad) / step + 1e-9) * step);
-  const max = tidy(Math.ceil((hi + range * pad) / step - 1e-9) * step);
-  if (lo >= 0 && min < 0) min = 0;
-  return { min, max, step: tidy(step) };
 }
 
 /* Axis label format with as many decimals as the step needs: 10% steps → "-30%", 0.5 steps → "$12.5" */
@@ -4172,13 +4320,14 @@ function waterfallLabel(v, fmt, precision) {
  */
 function waterfallXml(plan) {
   const { series, refs, categories, axis } = plan;
+  const look = plan.look || chartLook({ type: "waterfallChart" }, null);
   const A1 = 50210, A2 = 50220, A3 = 50230, A4 = 50240;
   const last = categories.length - 1;
-  const noBox = `<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>`;
-  const flags = (show) => `<c:showLegendKey val="0"/><c:showVal val="${show ? 1 : 0}"/><c:showCatName val="0"/><c:showSerName val="0"/><c:showPercent val="0"/><c:showBubbleSize val="0"/>`;
-  // Small labels like Power BI's: 8pt grey beside a bar, white bold inside one
-  const label = (i, pos, argb, bold) => `<c:dLbl><c:idx val="${i}"/><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="800"/></a:pPr>` +
-    `<a:r><a:rPr lang="en-US" sz="800" b="${bold ? 1 : 0}">${fillXml(argb)}</a:rPr><a:t>${xmlEsc(waterfallLabel(plan.steps[i], plan.fmt, plan.labelPrecision))}</a:t></a:r></a:p></c:rich></c:tx>` +
+  const noBox = NO_BOX;
+  const flags = (show) => labelFlags({ val: show });
+  // Labels like Power BI's: in the label font beside a bar, white bold inside one
+  const label = (i, pos, argb, bold) => `<c:dLbl><c:idx val="${i}"/>` +
+    richA(waterfallLabel(plan.steps[i], plan.fmt, plan.labelPrecision ?? look.labels.precision ?? undefined), { ...look.labels.text, color: argb === C.WHITE ? C.WHITE : look.labels.text.color, bold: bold || look.labels.text.bold }) +
     `${noBox}<c:dLblPos val="${pos}"/>${flags(true)}</c:dLbl>`;
   const cat = `<c:cat><c:strRef><c:f>${xmlEsc(refs.catRef)}</c:f>${strCacheXml(categories.map(axisLabel))}</c:strRef></c:cat>`;
   const head = (i) => `<c:idx val="${i}"/><c:order val="${i}"/>` +
@@ -4204,8 +4353,8 @@ function waterfallXml(plan) {
   return `<c:barChart><c:barDir val="col"/><c:grouping val="stacked"/><c:varyColors val="0"/>${bars}` +
       `<c:gapWidth val="60"/><c:overlap val="100"/><c:axId val="${A3}"/><c:axId val="${A4}"/></c:barChart>` +
     `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>${line}<c:marker val="1"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:lineChart>` +
-    catAxXml(A1, A2, "b", { title: titles.cat, hidden: !titles.catShow, count: categories.length }) +
-    valAxXml(A2, A1, "l", stepFormat(plan.fmt, axis), { axis, title: titles.val, hidden: !titles.valShow }) +
+    catAxXml(A1, A2, "b", { title: titles.cat, hidden: !titles.catShow, count: categories.length, look: look.cat }) +
+    valAxXml(A2, A1, "l", axisNumFmt(plan.fmt, axis, look.val), { axis, title: titles.val, hidden: !titles.valShow, look: look.val }) +
     catAxXml(A3, A4, "b", { hidden: true }) +
     valAxXml(A4, A3, "r", "General", { crosses: "max", grid: false, labels: false,
       axis: { min: 0, max: Number((axis.max - axis.min).toFixed(12)), step: axis.step } });
@@ -4242,8 +4391,15 @@ function writeChartDataSheet(wb, name, charts) {
       h.alignment = { horizontal: "right" };
     });
     p.categories.forEach((c, ri) => {
-      levels.forEach((l, k) => { ws.getCell(hr + 1 + ri, 2 + k).value = l.values[ri]; });
-      ws.getCell(hr + 1 + ri, 2 + off).value = axisLabel(c);   // a date reads "1/15/2023" on the axis, an empty one "(Blank)"
+      // A multi-level axis groups by blank cells: a higher level's value only where its group starts
+      levels.forEach((l, k) => { if (!p.multiLevel || l.starts[ri]) ws.getCell(hr + 1 + ri, 2 + k).value = l.values[ri]; });
+      const cat = ws.getCell(hr + 1 + ri, 2 + off);
+      if (p.dateAxis) {
+        cat.value = p.dateAxis.serials[ri];
+        cat.numFmt = "m/d/yyyy";
+      } else {
+        cat.value = p.catText ? p.catText[ri] : axisLabel(c);   // a date reads "1/15/2023" on the axis, an empty one "(Blank)"
+      }
       p.series.forEach((s, i) => {
         const cell = ws.getCell(hr + 1 + ri, 3 + off + i);
         cell.value = s.values[ri];
@@ -4285,38 +4441,255 @@ function numCacheXml(values, fmt) {
     values.map((v, i) => (v === null || v === undefined ? "" : `<c:pt idx="${i}"><c:v>${v}</c:v></c:pt>`)).join("") + `</c:numCache>`;
 }
 
+/* ── The visual's look in chart XML: text, fills, lines (sizes in points, widths in pixels) ── */
+const LOOK_TEXT = { face: "Segoe UI", size: 9, color: "#605E5C", bold: false, italic: false };
+const r4 = (x) => Number(Math.max(0, Math.min(1, x)).toFixed(4));
+function hexOf(c) {
+  return String(c || "000000").replace(/^#/, "").slice(-6).toUpperCase();
+}
+const argbOf = (c) => "FF" + hexOf(c);
+/* A fill, optionally see-through (alpha 0–1); no colour: no fill */
+function fillA(c, alpha = 1) {
+  if (!c) return "<a:noFill/>";
+  return `<a:solidFill><a:srgbClr val="${hexOf(c)}">${alpha < 1 ? `<a:alpha val="${Math.round(Math.max(0, alpha) * 100000)}"/>` : ""}</a:srgbClr></a:solidFill>`;
+}
+const DASHES = { dashed: "dash", dotted: "sysDot", dash: "dash", dot: "sysDot" };
+function lineA({ color = null, width = 1, style = "solid", alpha = 1 } = {}) {
+  if (!color) return "<a:ln><a:noFill/></a:ln>";
+  const dash = DASHES[style] ? `<a:prstDash val="${DASHES[style]}"/>` : "";
+  return `<a:ln w="${Math.round(width * CHART_PX_TO_EMU)}" cap="${dash ? "flat" : "rnd"}">${fillA(color, alpha)}${dash}<a:round/></a:ln>`;
+}
+function runPrA(t, tag = "a:defRPr") {
+  const x = { ...LOOK_TEXT, ...(t || {}) }, face = xmlEsc(x.face);
+  return `<${tag}${tag === "a:rPr" ? ' lang="en-US"' : ""} sz="${Math.round(x.size * 100)}" b="${x.bold ? 1 : 0}" i="${x.italic ? 1 : 0}">` +
+    `${fillA(x.color)}<a:latin typeface="${face}"/><a:cs typeface="${face}"/></${tag}>`;
+}
+function txPrA(t, rot) {
+  return `<c:txPr><a:bodyPr${rot !== undefined ? ` rot="${rot}" vert="horz"` : ""}/><a:lstStyle/><a:p><a:pPr>${runPrA(t)}</a:pPr><a:endParaRPr lang="en-US"/></a:p></c:txPr>`;
+}
+function paraA(text, t, align) {
+  return `<a:p><a:pPr${align ? ` algn="${align}"` : ""}>${runPrA(t)}</a:pPr><a:r>${runPrA(t, "a:rPr")}<a:t>${xmlEsc(text)}</a:t></a:r></a:p>`;
+}
+/* Rich text; "\n" starts a new line */
+function richA(text, t) {
+  return `<c:tx><c:rich><a:bodyPr/><a:lstStyle/>${String(text).split("\n").map((line) => paraA(line, t)).join("")}</c:rich></c:tx>`;
+}
+/* A position inside the chart, in fractions of its width and height */
+function manualLayoutA(x, y, w, h, inner) {
+  return `<c:layout><c:manualLayout>${inner ? '<c:layoutTarget val="inner"/>' : ""}<c:xMode val="edge"/><c:yMode val="edge"/>` +
+    `<c:x val="${r4(x)}"/><c:y val="${r4(y)}"/>${w !== undefined ? `<c:w val="${r4(w)}"/><c:h val="${r4(h)}"/>` : ""}</c:manualLayout></c:layout>`;
+}
+/* About how wide a line of text is, in pixels (Bahnschrift, Power BI's DIN, runs narrower than Segoe UI) */
+function textPx(text, t) {
+  const x = { ...LOOK_TEXT, ...(t || {}) };
+  const per = /bahnschrift|din/i.test(x.face) ? 0.48 : 0.45;
+  return String(text ?? "").length * x.size * (4 / 3) * per * (x.bold ? 1.06 : 1);
+}
+const lineHeightPx = (t) => ({ ...LOOK_TEXT, ...(t || {}) }).size * (4 / 3) * 1.3;
+/* Text broken into lines no wider than maxPx, word by word, as Power BI wraps titles */
+function wrapLines(text, t, maxPx) {
+  const lines = [];
+  let line = "";
+  for (const word of String(text ?? "").split(/\s+/).filter(Boolean)) {
+    const next = line ? `${line} ${word}` : word;
+    if (line && textPx(next, t) > maxPx) { lines.push(line); line = word; } else line = next;
+  }
+  if (line) lines.push(line);
+  return lines.length ? lines : [""];
+}
+
+/* ── Number formats as Power BI shows them: display units (K, M, bn, T) and decimals ── */
+const PBI_UNITS = { 1000: ["K", ","], 1000000: ["M", ",,"], 1000000000: ["bn", ",,,"], 1000000000000: ["T", ",,,,"] };
+function fmtPrefix(f) {
+  const m = String(f || "").match(/^(?:"[^"]*"|\\.|[$€£¥₹])/);
+  return m ? m[0] : "";
+}
+function fmtDecimals(f) {
+  const m = String(f || "").split(";")[0].match(/\.(0+)/);
+  return m ? m[1].length : 0;
+}
+function unitFormat(f, unit, dec) {
+  const s = String(f || "General");
+  if (s.includes("%")) return `0${dec ? "." + "0".repeat(dec) : ""}%`;
+  const d = dec ?? fmtDecimals(s);
+  const body = `${fmtPrefix(s)}#,##0${d ? "." + "0".repeat(d) : ""}`;
+  return PBI_UNITS[unit] ? `${body}${PBI_UNITS[unit][1]}"${PBI_UNITS[unit][0]}"` : body;
+}
+function autoUnit(maxAbs) {
+  return maxAbs >= 1e12 ? 1e12 : maxAbs >= 1e9 ? 1e9 : maxAbs >= 1e6 ? 1e6 : maxAbs >= 1e3 ? 1e3 : 1;
+}
+function maxAbsOf(values) {
+  let m = 0;
+  for (const v of values) if (typeof v === "number" && isFinite(v)) m = Math.max(m, Math.abs(v));
+  return m;
+}
+/* A data label's number format. Display units "Auto" pick one unit for the whole visual from
+   its largest value; with them Power BI keeps the measure's decimals, at least minDecimals
+   (bar, line and area labels show one: $7.1K, $0.4K) */
+function labelNumFmt(fmt, values, cfg, minDecimals = 0) {
+  const s = String(fmt || "General");
+  const precision = cfg && cfg.precision !== null && cfg.precision !== undefined ? cfg.precision : null;
+  if (s.includes("%")) return precision !== null ? unitFormat(s, 1, precision) : s;
+  const unit = cfg && cfg.units > 0 ? cfg.units : autoUnit(maxAbsOf(values));
+  if (unit <= 1 && precision === null) return s;
+  return unitFormat(s, unit, precision !== null ? precision : unit > 1 ? Math.max(minDecimals, fmtDecimals(s)) : null);
+}
+/* A number as label text, for labels written as text (pie slices, analytics lines) */
+function displayValue(v, fmt, unit = 1, dec = null) {
+  const s = String(fmt || "General");
+  const fixed = (x, d) => x.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+  if (s.includes("%")) return fixed(v * 100, dec ?? fmtDecimals(s)) + "%";
+  const prefix = fmtPrefix(s).replace(/^"|"$/g, "").replace(/^\\/, "");
+  const d = dec ?? fmtDecimals(s);   // Power BI keeps the measure's own decimals with auto units: 1.10M, $8K
+  return `${v < 0 ? "-" : ""}${prefix}${fixed(Math.abs(v) / (unit || 1), d)}${PBI_UNITS[unit] ? PBI_UNITS[unit][0] : ""}`;
+}
+
+/* A tick step of 1, 2 or 5 × 10ⁿ giving about `count` steps across lo…hi (d3's rule, which Power BI's axes follow) */
+function tickStep(lo, hi, count) {
+  const raw = Math.abs(hi - lo) / Math.max(1, count);
+  if (!raw || !isFinite(raw)) return 1;
+  const power = Math.pow(10, Math.floor(Math.log10(raw)));
+  const err = raw / power;
+  return (err >= 7.0710678 ? 10 : err >= 3.1622777 ? 5 : err >= 1.4142136 ? 2 : 1) * power;
+}
+
+/*
+ * A value axis like Power BI's automatic one: about one tick every gapPx pixels (Power BI
+ * spaces them ~75 px up, ~200 px across), ending just past the data. round: run on to the
+ * next tick when that adds no more than a quarter, then take the steps that range wants (0 to
+ * $10K in $5K steps for an $8.4K top), as Power BI does to make room for labels over bars.
+ * start / end: the report's own axis range.
+ */
+function valueScale(values, plotPx, gapPx, { zero = false, round = true, start = null, end = null } = {}) {
+  const v = values.filter((x) => typeof x === "number" && isFinite(x));
+  if (zero) v.push(0);
+  if (!v.length && (start === null || end === null)) return null;
+  const tidy = (x) => Number(x.toFixed(12));
+  let lo = start !== null ? start : Math.min(...v), hi = end !== null ? end : Math.max(...v);
+  if (lo === hi) { const d = Math.abs(lo) || 1; lo -= d / 2; hi += d / 2; if (zero && lo < 0 && hi > 0 && Math.min(...v) >= 0) lo = 0; }
+  // Values all but equal (a margin of 43.934% everywhere): a little room around them
+  else if (hi - lo < Math.abs(hi) * 1e-3 && start === null && end === null) { const d = Math.abs(hi) * 5e-3; lo -= d; hi += d; }
+  const count = Math.max(1.5, Math.max(60, plotPx) / gapPx);
+  let step = tickStep(lo, hi, count);
+  const floorTo = (x, s) => tidy(Math.floor(x / s + 1e-9) * s);
+  let min = start !== null ? start : zero && lo >= 0 ? 0 : floorTo(lo, step);
+  let max;
+  if (end !== null) max = end;
+  else {
+    const niceMax = tidy(Math.ceil(hi / step - 1e-9) * step);
+    if (round && hi > 0 && (niceMax - hi) / hi <= 0.25) {
+      step = tickStep(min, niceMax, count);
+      max = tidy(Math.ceil(niceMax / step - 1e-9) * step);
+      if (start === null && !(zero && lo >= 0)) min = floorTo(lo, step);
+    } else {
+      max = tidy(hi + (hi - min) * 0.03);
+    }
+  }
+  if (max <= min) max = tidy(min + step);
+  return { min, max, step };
+}
+/* A value axis's number format: display units from the step ($5K steps, $500 steps), as many decimals as the step needs */
+function axisNumFmt(fmt, axis, cfg, values) {
+  const s = String(fmt || "General");
+  const precision = cfg && cfg.precision !== null && cfg.precision !== undefined ? cfg.precision : null;
+  if (!axis) return axisFormat(fmt, values || []);
+  if (s.includes("%")) return precision !== null ? unitFormat(s, 1, precision) : stepFormat(s, axis, values || []);
+  const step = axis.step || Math.abs(axis.max - axis.min) || 1;
+  // Power BI's auto units: from the axis's largest value once it reaches 10,000 ($20K, 1.0M);
+  // below that, thousands only when the steps are whole thousands ($2K, but $1,500)
+  const top = Math.max(Math.abs(axis.min), Math.abs(axis.max));
+  const unit = cfg && cfg.units > 0 ? cfg.units : top >= 1e4 ? autoUnit(top) : autoUnit(step);
+  const dec = precision !== null ? precision : Math.max(0, Math.min(4, -Math.floor(Math.log10(step / unit) + 1e-9)));
+  return unitFormat(s, unit, dec);
+}
+
+/* A series' categories: dates on a date axis, Excel's multi-level labels for a hierarchy, else text */
+function categoryXml(plan) {
+  const ref = xmlEsc(plan.refs.catRef);
+  if (plan.dateAxis) return `<c:cat><c:numRef><c:f>${ref}</c:f>${numCacheXml(plan.dateAxis.serials, "m/d/yyyy")}</c:numRef></c:cat>`;
+  if (plan.multiLevel) {
+    const lvl = (vals, starts) => `<c:lvl>${vals.map((v, i) => (starts && !starts[i] ? "" : `<c:pt idx="${i}"><c:v>${xmlEsc(v)}</c:v></c:pt>`)).join("")}</c:lvl>`;
+    return `<c:cat><c:multiLvlStrRef><c:f>${ref}</c:f><c:multiLvlStrCache><c:ptCount val="${plan.categories.length}"/>` +
+      lvl(plan.catText) + [...plan.catLevels].reverse().map((l) => lvl(l.values, l.starts)).join("") + `</c:multiLvlStrCache></c:multiLvlStrRef></c:cat>`;
+  }
+  return `<c:cat><c:strRef><c:f>${ref}</c:f>${strCacheXml(plan.catText || plan.categories.map(axisLabel))}</c:strRef></c:cat>`;
+}
+
+const MARKER_SYMBOLS = { circle: "circle", square: "square", diamond: "diamond", triangle: "triangle", x: "x", plus: "plus", shortdash: "dash", longdash: "dash", star: "star" };
+const DEFAULT_LINE_LOOK = { width: 3, style: "solid", markers: null, smooth: false };
+
+/*
+ * One series. s.literal: values written into the chart (overlay lines, total labels), not
+ * read from the Data sheet. s.labelsXml / s.trendXml: its data labels and trend line;
+ * s.lineLook: its line (width, dash, markers); s.alpha: a see-through fill (areas).
+ */
 function chartSeriesXml(kind, s, i, plan, ref) {
-  const head = `<c:idx val="${i}"/><c:order val="${i}"/>` +
-    `<c:tx><c:strRef><c:f>${xmlEsc(ref.nameRef)}</c:f>${strCacheXml([s.name])}</c:strRef></c:tx>`;
-  const cat = `<c:cat><c:strRef><c:f>${xmlEsc(plan.refs.catRef)}</c:f>${strCacheXml(plan.categories.map(axisLabel))}</c:strRef></c:cat>`;
-  const val = `<c:val><c:numRef><c:f>${xmlEsc(ref.valRef)}</c:f>${numCacheXml(s.values, s.fmt)}</c:numRef></c:val>`;
+  const head = s.literal ? `<c:idx val="${i}"/><c:order val="${i}"/><c:tx><c:v>${xmlEsc(s.name)}</c:v></c:tx>`
+    : `<c:idx val="${i}"/><c:order val="${i}"/><c:tx><c:strRef><c:f>${xmlEsc(ref.nameRef)}</c:f>${strCacheXml([s.name])}</c:strRef></c:tx>`;
+  const cat = categoryXml(plan);
+  const val = s.literal
+    ? `<c:val><c:numLit><c:formatCode>${xmlEsc(s.fmt || "General")}</c:formatCode><c:ptCount val="${s.values.length}"/>` +
+      s.values.map((v, k) => (v === null || v === undefined ? "" : `<c:pt idx="${k}"><c:v>${v}</c:v></c:pt>`)).join("") + `</c:numLit></c:val>`
+    : `<c:val><c:numRef><c:f>${xmlEsc(ref.valRef)}</c:f>${numCacheXml(s.values, s.fmt)}</c:numRef></c:val>`;
   // Hidden helper series (waterfall base, funnel offset) take no bar colours
   const points = s.hidden ? "" : (plan.pointColors || []).map((c, pi) => (c
     ? `<c:dPt><c:idx val="${pi}"/>${kind === "bar" ? '<c:invertIfNegative val="0"/>' : ""}<c:bubble3D val="0"/><c:spPr>${fillXml(c)}</c:spPr></c:dPt>`
     : "")).join("");
+  const look = plan.look;
+  const labels = s.labelsXml || (s.labels
+    ? dataLabelsXml(labelNumFmt(s.fmt, s.values, look && look.labels), s.color || (plan.pointColors && plan.pointColors.find(Boolean)) || null, look && look.labels.text) : "");
+  const trend = s.trendXml || "";
   if (kind === "line") {
-    const ln = s.color ? `<c:spPr><a:ln w="28575" cap="rnd">${fillXml(s.color)}<a:round/></a:ln></c:spPr>` : "";
-    return `<c:ser>${head}${ln}<c:marker><c:symbol val="none"/></c:marker>${cat}${val}<c:smooth val="0"/></c:ser>`;
+    const ls = s.lineLook || (look && look.lines) || DEFAULT_LINE_LOOK;
+    const sp = s.hidden ? NO_BOX : s.color ? `<c:spPr>${lineA({ color: s.color, width: ls.width, style: ls.style })}</c:spPr>` : "";
+    const m = ls.markers && !s.hidden
+      ? `<c:marker><c:symbol val="${MARKER_SYMBOLS[String(ls.markers.shape).toLowerCase()] || "circle"}"/><c:size val="${Math.max(2, Math.min(72, Math.round(ls.markers.size * 0.9)))}"/>` +
+        `<c:spPr>${fillA(ls.markers.color || s.color)}${lineA({ color: ls.markers.color || s.color, width: 1 })}</c:spPr></c:marker>`
+      : `<c:marker><c:symbol val="none"/></c:marker>`;
+    return `<c:ser>${head}${sp}${m}${labels}${trend}${cat}${val}<c:smooth val="${ls.smooth && !s.hidden ? 1 : 0}"/></c:ser>`;
   }
-  const sp = s.hidden ? `<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>`
-    : s.color ? `<c:spPr>${fillXml(s.color)}</c:spPr>` : "";
-  const labels = s.labels ? dataLabelsXml(s.fmt, s.color || (s.pointColors && s.pointColors.find(Boolean)) || null) : "";
-  if (kind === "bar") return `<c:ser>${head}${sp}<c:invertIfNegative val="0"/>${points}${labels}${cat}${val}</c:ser>`;
-  if (kind === "area") return `<c:ser>${head}${sp}${cat}${val}</c:ser>`;
-  const pieLabels = s.pieLabels ? pieLabelsXml(s.pieLabelPos) : "";
-  return `<c:ser>${head}${sp}${points}${pieLabels}${cat}${val}</c:ser>`;   // pie, doughnut
+  const sp = s.hidden ? NO_BOX
+    : s.color ? `<c:spPr>${fillA(s.color, s.alpha ?? 1)}${s.alpha !== undefined ? "<a:ln><a:noFill/></a:ln>" : ""}</c:spPr>` : "";
+  if (kind === "bar") return `<c:ser>${head}${sp}<c:invertIfNegative val="0"/>${points}${labels}${trend}${cat}${val}</c:ser>`;
+  if (kind === "area") return `<c:ser>${head}${sp}${labels}${cat}${val}</c:ser>`;
+  return `<c:ser>${head}${sp}${points}${labels}${cat}${val}</c:ser>`;   // pie
 }
-/* A category axis. Every label is drawn (Excel otherwise skips some when it thinks they are
-   crowded, so labels came and went with the chart's size); up to 60 categories, beyond which
-   Excel's own spacing reads better */
-function catAxXml(id, crossId, pos, { reverse = false, hidden = false, title = null, count = 0 } = {}) {
+
+/* Gridlines in the report's colour, width and dash (Power BI's: dotted, light grey) */
+function gridXml(grid) {
+  return grid ? `<c:majorGridlines><c:spPr>${lineA({ color: grid.color, width: grid.width, style: grid.style })}</c:spPr></c:majorGridlines>` : "";
+}
+
+/* A category axis, without an axis line as in Power BI. Every label is drawn (Excel otherwise
+   skips some when it thinks they are crowded, so labels came and went with the chart's size);
+   up to 60 categories, beyond which Excel's own spacing reads better */
+function catAxXml(id, crossId, pos, { reverse = false, hidden = false, title = null, count = 0, look = null, multi = false } = {}) {
+  const lk = look || {};
   return `<c:catAx><c:axId val="${id}"/><c:scaling><c:orientation val="${reverse ? "maxMin" : "minMax"}"/></c:scaling>` +
-    `<c:delete val="${hidden && !title ? 1 : 0}"/><c:axPos val="${pos}"/>` + (title ? axisTitleXml(title) : "") +
+    `<c:delete val="${hidden && !title ? 1 : 0}"/><c:axPos val="${pos}"/>${hidden ? "" : gridXml(lk.grid)}` + (title ? axisTitleXml(title, lk.titleFont) : "") +
     `<c:numFmt formatCode="General" sourceLinked="1"/>` +
     `<c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="${hidden ? "none" : "low"}"/>` +
-    `<c:spPr><a:ln w="9525">${hidden ? "<a:noFill/>" : fillXml(C.RULE)}</a:ln></c:spPr>` +
+    `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr>${txPrA(lk.text)}` +
     `<c:crossAx val="${crossId}"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/>` +
-    (count && count <= 60 && !hidden ? `<c:tickLblSkip val="1"/>` : "") + `<c:noMultiLvlLbl val="0"/></c:catAx>`;
+    (count && count <= 60 && !hidden && !multi ? `<c:tickLblSkip val="1"/>` : "") + `<c:noMultiLvlLbl val="0"/></c:catAx>`;
+}
+
+/* A date axis: dates spaced by time, labelled every few months or years ("Jul 2023") */
+function dateAxXml(id, crossId, { hidden = false, title = null, look = null, date }) {
+  const lk = look || {};
+  return `<c:dateAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/></c:scaling>` +
+    `<c:delete val="${hidden && !title ? 1 : 0}"/><c:axPos val="b"/>${hidden ? "" : gridXml(lk.grid)}` + (title ? axisTitleXml(title, lk.titleFont) : "") +
+    `<c:numFmt formatCode="${xmlEsc(date.fmt)}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/>` +
+    `<c:tickLblPos val="${hidden ? "none" : "low"}"/><c:spPr><a:ln><a:noFill/></a:ln></c:spPr>${txPrA(lk.text)}` +
+    `<c:crossAx val="${crossId}"/><c:crosses val="autoZero"/><c:auto val="0"/><c:lblOffset val="100"/><c:baseTimeUnit val="days"/>` +
+    `<c:majorUnit val="${date.unit}"/><c:majorTimeUnit val="${date.timeUnit}"/></c:dateAx>`;
+}
+
+/* An axis the chart doesn't show, giving overlay lines their scale */
+function hiddenValAxXml(id, crossId, pos, axis) {
+  return `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/><c:max val="${axis.max}"/><c:min val="${axis.min}"/></c:scaling>` +
+    `<c:delete val="1"/><c:axPos val="${pos}"/><c:numFmt formatCode="General" sourceLinked="0"/><c:majorTickMark val="none"/>` +
+    `<c:minorTickMark val="none"/><c:tickLblPos val="none"/><c:crossAx val="${crossId}"/><c:crosses val="min"/><c:crossBetween val="midCat"/></c:valAx>`;
 }
 
 /* A chart's axis titles as Power BI draws them by default: the category field, and the value
@@ -4326,6 +4699,8 @@ function axisTitles(plan, main, lines) {
     // A funnel has no axis titles in Power BI: only its stage names and values
   if (plan.funnel) return { catShow: true, valShow: true, secShow: true, cat: null, val: null, sec: null };
   const a = plan.axes || {};
+  const lk = plan.look || {};
+  const own = (k) => (lk[k] && lk[k].titleText ? { text: lk[k].titleText } : null);
   const on = (x, key) => !x || x[key] !== false;
   const names = (list) => {
     const n = [...new Set(list.map(([s]) => s.name))];
@@ -4335,96 +4710,342 @@ function axisTitles(plan, main, lines) {
     catShow: on(a.cat, "show"), valShow: on(a.val, "show"), secShow: on(a.sec, "show"),
     // An axis turned off loses its labels, not its title (Power BI still draws the title)
         // The author's own title text ("Revenue") when the report sets one, else the field names
-    cat: on(a.cat, "title") ? (a.cat && a.cat.text) || plan.catName : null,
-    val: on(a.val, "title") ? (a.val && a.val.text) || plan.valueName || names(main) : null,
-    sec: lines.length && on(a.sec, "title") ? (a.sec && a.sec.text) || names(lines) : null,
+    cat: on(a.cat, "title") ? (own("cat") || a.cat || {}).text || plan.catTitle || plan.catName : null,
+    val: on(a.val, "title") ? (own("val") || a.val || {}).text || plan.valueName || names(main) : null,
+    sec: lines.length && on(a.sec, "title") ? (own("sec") || a.sec || {}).text || names(lines) : null,
   };
 }
 
-function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true, hidden = false, title = null, axis = null, labels = true, zero = false } = {}) {
+/*
+ * A value axis in the report's look: labels' font, gridlines (none when the axis is hidden, as
+ * in Power BI), log scale, reversed order, title font.
+ */
+function valAxXml(id, crossId, pos, fmt, { crosses = "autoZero", grid = true, hidden = false, title = null, axis = null, labels = true, zero = false, look = null } = {}) {
+  const lk = look || {};
+  const log = !!lk.log;
   // zero: bars and columns start at 0 as Power BI's do; Excel's own minimum can cut close values short
-  const bounds = axis ? `<c:max val="${axis.max}"/><c:min val="${axis.min}"/>` : zero ? `<c:min val="0"/>` : "";
-  return `<c:valAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/>${bounds}</c:scaling><c:delete val="${hidden && !title ? 1 : 0}"/><c:axPos val="${pos}"/>` +
-    (grid ? `<c:majorGridlines><c:spPr><a:ln w="6350">${fillXml(C.HAIR)}</a:ln></c:spPr></c:majorGridlines>` : "") +
-    (title ? axisTitleXml(title) : "") +
+  const bounds = log ? (lk.end > 0 ? `<c:max val="${lk.end}"/>` : "") + (lk.start > 0 ? `<c:min val="${lk.start}"/>` : "")
+    : axis ? `<c:max val="${axis.max}"/><c:min val="${axis.min}"/>` : zero ? `<c:min val="0"/>` : "";
+  const lines = grid && !hidden ? (look ? gridXml(lk.grid) : `<c:majorGridlines><c:spPr><a:ln w="6350">${fillXml(C.HAIR)}</a:ln></c:spPr></c:majorGridlines>`) : "";
+  return `<c:valAx><c:axId val="${id}"/><c:scaling>${log ? '<c:logBase val="10"/>' : ""}<c:orientation val="${lk.invert ? "maxMin" : "minMax"}"/>${bounds}</c:scaling>` +
+    `<c:delete val="${hidden && !title ? 1 : 0}"/><c:axPos val="${pos}"/>${lines}` +
+    (title ? axisTitleXml(title, lk.titleFont) : "") +
     `<c:numFmt formatCode="${xmlEsc(fmt || "General")}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="${labels && !hidden ? "nextTo" : "none"}"/>` +
-    `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:crossAx val="${crossId}"/><c:crosses val="${crosses}"/><c:crossBetween val="between"/>` +
-    (axis ? `<c:majorUnit val="${axis.step}"/>` : "") + `</c:valAx>`;
+    `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr>${txPrA(lk.text)}<c:crossAx val="${crossId}"/><c:crosses val="${crosses}"/><c:crossBetween val="between"/>` +
+    (axis && !log ? `<c:majorUnit val="${axis.step}"/>` : "") + `</c:valAx>`;
 }
 
+/* Where a legend goes in Power BI → Excel's side, and whether it starts at the edge or is centred */
+const LEGEND_SPOTS = { top: ["t", "start"], topcenter: ["t", "center"], topright: ["t", "end"], bottom: ["b", "start"], bottomcenter: ["b", "center"],
+  bottomright: ["b", "end"], left: ["l", "start"], leftcenter: ["l", "center"], right: ["r", "start"], rightcenter: ["r", "center"] };
+const DONUT_HOLE = 0.62;   // Power BI's donut hole, as a share of the donut's width, when the report leaves it
+const USER_SHAPES_RID = "rId1";
+
+/* Shapes drawn over a chart (a legend's title, a donut's hole), placed in fractions of the chart */
+function shapeAnchorXml(x, y, w, h, inner) {
+  return `<cdr:relSizeAnchor xmlns:cdr="http://schemas.openxmlformats.org/drawingml/2006/chartDrawing"><cdr:from><cdr:x>${r4(x)}</cdr:x><cdr:y>${r4(y)}</cdr:y></cdr:from>` +
+    `<cdr:to><cdr:x>${r4(x + w)}</cdr:x><cdr:y>${r4(y + h)}</cdr:y></cdr:to>${inner}</cdr:relSizeAnchor>`;
+}
+function textShapeXml(id, text, t, x, y, w, h) {
+  return shapeAnchorXml(x, y, w, h, `<cdr:sp macro="" textlink=""><cdr:nvSpPr><cdr:cNvPr id="${id}" name="Legend title"/><cdr:cNvSpPr txBox="1"/></cdr:nvSpPr>` +
+    `<cdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></cdr:spPr>` +
+    `<cdr:txBody><a:bodyPr vertOverflow="overflow" horzOverflow="overflow" wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="ctr"/><a:lstStyle/>` +
+    `<a:p><a:r>${runPrA(t, "a:rPr")}<a:t>${xmlEsc(text)}</a:t></a:r></a:p></cdr:txBody></cdr:sp>`);
+}
+function ellipseShapeXml(id, color, x, y, w, h) {
+  return shapeAnchorXml(x, y, w, h, `<cdr:sp macro="" textlink=""><cdr:nvSpPr><cdr:cNvPr id="${id}" name="Donut hole"/><cdr:cNvSpPr/></cdr:nvSpPr>` +
+    `<cdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></a:xfrm><a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom>${fillA(color)}<a:ln><a:noFill/></a:ln></cdr:spPr></cdr:sp>`);
+}
+function userShapesXml(shapes) {
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<c:userShapes xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">${shapes.join("")}</c:userShapes>`;
+}
+
+/* Per category: the tops of the positive and the bottoms of the negative stacks */
+function stackExtents(list, count) {
+  const out = [];
+  for (let ci = 0; ci < count; ci++) {
+    let up = 0, down = 0;
+    for (const s of list) { const v = s.values[ci]; if (typeof v === "number") { if (v >= 0) up += v; else down += v; } }
+    out.push(up, down);
+  }
+  return out;
+}
+
+/*
+ * The chart part for a chart plan, in the visual's look (plan.look): title and subtitle where the
+ * report puts them, legend (with its title) where the report puts it, fonts, gridlines, axis
+ * ranges and number formats as Power BI draws them, data labels, total labels, constant and
+ * analytics lines, trend lines, the visual's background, border and shadow.
+ * Returns { xml, shapes }: shapes is the chart's drawing of shapes over it, or null.
+ */
 function chartXml(plan) {
+  const look = plan.look || chartLook({ type: "" }, null);
   const { spec, series } = plan;
   const kind = spec.kind;
   const refs = plan.refs;
+  const W = (plan.sizePx && plan.sizePx.w) || 400, H = (plan.sizePx && plan.sizePx.h) || 300;
   const scatter = kind === "scatter" || kind === "bubble";
-  let body;
-    if (scatter) {
+  const round = kind === "pie" || kind === "doughnut";
+  const shapes = [];
+  const catLabel = (i) => String(plan.catText ? plan.catText[i] : axisLabel(plan.categories[i]));
+
+  // Title (and subtitle) at the top, aligned as in the report
+  const T = look.title;
+  const showTitle = plan.showTitle !== false && !!plan.title;
+  // Lines broken where Power BI breaks them (Excel would wrap a title at three quarters of the chart)
+  const titleLines = showTitle ? wrapLines(plan.title, T, W - 16) : [];
+  const subLines = showTitle && look.subtitle ? wrapLines(look.subtitle.text, look.subtitle, W - 16) : [];
+  const titleH = showTitle ? titleLines.length * lineHeightPx(T) + subLines.length * lineHeightPx(look.subtitle) + 8 : 4;
+  let title = `<c:autoTitleDeleted val="1"/>`;
+  if (showTitle) {
+    const algn = T.align === "center" ? "ctr" : T.align === "right" ? "r" : "l";
+    const paras = titleLines.map((l) => paraA(l, T, algn)).join("") + subLines.map((l) => paraA(l, look.subtitle, algn)).join("");
+    const widest = Math.min(W - 16, Math.max(...titleLines.map((l) => textPx(l, T)), ...subLines.map((l) => textPx(l, look.subtitle))));
+    const layout = algn === "ctr" ? "" : manualLayoutA(algn === "l" ? 8 / W : 1 - (widest + 10) / W, 4 / H);
+    title = `<c:title><c:tx><c:rich><a:bodyPr rot="0" vert="horz" wrap="none" anchor="ctr" anchorCtr="1"/><a:lstStyle/>${paras}</c:rich></c:tx>${layout}<c:overlay val="0"/>` +
+      `${T.background ? `<c:spPr>${fillA(T.background)}</c:spPr>` : ""}</c:title><c:autoTitleDeleted val="0"/>`;
+  }
+
+  // Legend: one entry per visible series (a slice, a scatter group); shown as Power BI shows it
+  const legendNames = scatter ? (plan.perPoint ? [] : plan.groups.map((g) => g.name))
+    : round ? plan.categories.map((_, i) => catLabel(i)) : series.filter((s) => !s.noLegend).map((s) => s.name);
+  const legendOn = look.legend.show !== false && (round ? legendNames.length > 0 : legendNames.length > 1);
+  const LT = look.legend.text;
+  const [side, align] = LEGEND_SPOTS[String(look.legend.position).toLowerCase()] || ["t", "start"];
+  const legendTitle = legendOn && look.legend.title ? look.legend.titleText || plan.legendName || null : null;
+  const legendTitleFont = { ...LT, bold: true };
+  const lineH = lineHeightPx(LT) + 2;
+  // Each entry's width as Excel draws it: its key (a line's key is wider than a box's), the
+  // name and the gap to the next entry
+  const legendLines = scatter || round ? [] : series.filter((s) => !s.noLegend).map((s) => kind === "line" || !!s.line);
+  const entryW = legendNames.map((n, i) => textPx(n, LT) * 1.12 + (legendLines[i] ? 40 : 26));
+  const titleW = legendTitle ? textPx(legendTitle, legendTitleFont) + 8 : 0;
+  const across = side === "t" || side === "b";
+  // Excel lays a top or bottom legend out in equal columns, each as wide as its widest entry
+  const room = Math.max(40, W - 16 - titleW);
+  const colW = Math.max(20, ...entryW);
+  const perRow = Math.max(1, Math.min(legendNames.length, Math.floor(room / colW)));
+  const legendRows = Math.max(1, Math.ceil(legendNames.length / perRow));
+  // A box a little too small makes Excel leave entries out, so it gets room to spare
+  const rowH = lineH + 5;
+  const legendW = across ? Math.min(room, perRow * colW + 12) : Math.min(W * 0.4, Math.max(titleW, ...entryW, 20) + 12);
+  const legendH = across ? rowH * legendRows + 6 : rowH * legendNames.length + 6 + (legendTitle ? lineH : 0);
+  let legendBox = null;
+  if (legendOn) {
+    let x, y;
+    if (across) {
+      x = align === "center" ? Math.max(8, (W - titleW - legendW) / 2) : align === "end" ? Math.max(8, W - titleW - legendW - 8) : 8;
+      y = side === "t" ? titleH + 2 : H - legendH - 6;
+      if (legendTitle) shapes.push(textShapeXml(shapes.length + 2, legendTitle, legendTitleFont, x / W, y / H, titleW / W, lineH / H));
+      x += titleW;
+    } else {
+      x = side === "l" ? 6 : W - legendW - 8;
+      y = align === "center" ? Math.max(titleH + 4, (H - legendH) / 2) : titleH + 6;
+      if (legendTitle) { shapes.push(textShapeXml(shapes.length + 2, legendTitle, legendTitleFont, x / W, y / H, Math.max(titleW, 20) / W, lineH / H)); y += lineH; }
+    }
+    // The legend's whole box, not just its corner: given only a corner, Excel sizes the legend
+    // itself and slides it left when its entries run wider, over the legend's title
+    legendBox = { x, y, w: Math.min(legendW, W - x - 4), h: across ? legendH : legendH - (legendTitle ? lineH : 0) };
+  }
+
+  let body = "";
+  let hidden = series.map((s, i) => (s.noLegend ? i : -1)).filter((i) => i >= 0);
+  let plotLayout = "<c:layout/>";
+  if (scatter) {
     body = scatterXml(plan);
+    hidden = plan.hiddenLegend || [];
   } else if (kind === "waterfall") {
     body = waterfallXml(plan);
-  } else if (kind === "pie" || kind === "doughnut") {
-    const s0 = { ...series[0], pieLabels: true, pieLabelPos: kind === "pie" ? "outEnd" : null };
-    const ser = chartSeriesXml("pie", s0, 0, plan, refs.series[0]);
-    body = kind === "pie"
-      ? `<c:pieChart><c:varyColors val="1"/>${ser}<c:firstSliceAng val="0"/></c:pieChart>`
-      : `<c:doughnutChart><c:varyColors val="1"/>${ser}<c:firstSliceAng val="0"/><c:holeSize val="55"/></c:doughnutChart>`;
+  } else if (round) {
+    // Pie and donut: slices from 12 o'clock, labels outside with leader lines. A donut is a pie
+    // with its hole drawn over the centre, so its labels can sit outside as Power BI's do;
+    // the pie is placed by hand in the room the title, legend and labels leave.
+    const pts = look.labels.show === false ? [] : pieLabelPoints(plan, look);
+    const ser = chartSeriesXml("pie", { ...series[0], labelsXml: pts.length ? textLabelsXml(pts, look.labels.text) : "" }, 0, plan, refs.series[0]);
+    body = `<c:pieChart><c:varyColors val="1"/>${ser}<c:firstSliceAng val="${Math.round(((look.startAngle || 0) % 360 + 360) % 360)}"/></c:pieChart>`;
+    let x0 = 0, x1 = W, y0 = titleH, y1 = H;
+    if (legendOn) {
+      if (side === "l") x0 += legendW + 14; else if (side === "r") x1 -= legendW + 14;
+      else if (side === "t") y0 += legendH + 4; else y1 -= legendH + 8;
+    }
+    const mx = pts.length ? Math.min(110, Math.max(...pts.flatMap((p) => p.text.split("\n").map((l) => textPx(l, look.labels.text)))) + 16) : 8;
+    const my = pts.length ? lineHeightPx(look.labels.text) * Math.max(...pts.map((p) => p.text.split("\n").length)) + 6 : 8;
+    const d = Math.max(40, Math.min(x1 - x0 - 2 * mx, y1 - y0 - 2 * my));
+    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+    plotLayout = manualLayoutA((cx - d / 2) / W, (cy - d / 2) / H, d / W, d / H, true);
+    if (kind === "doughnut") {
+      const ratio = look.donutHole !== null && look.donutHole !== undefined ? Math.min(0.95, Math.max(0.05, look.donutHole / 100 * 0.6 + 0.37)) : DONUT_HOLE;
+      const hd = d * ratio;
+      shapes.push(ellipseShapeXml(shapes.length + 2, look.frame.background || "#FFFFFF", (cx - hd / 2) / W, (cy - hd / 2) / H, hd / W, hd / H));
+    }
   } else {
-    const indexed = series.map((s, i) => [s, i]);
-    const main = indexed.filter(([s]) => !s.line);
-    const lines = indexed.filter(([s]) => s.line);
-    const horizontal = spec.dir === "bar";
-    const pct = spec.grouping === "percentStacked";
-    // Axis labels shortened like Power BI ($4.0M, 30%); stacked bars are sized by their totals
-    const mainValues = main.flatMap(([s]) => s.values);
-    const stackTotals = spec.grouping === "stacked"
-      ? plan.categories.map((_, ci) => main.reduce((a, [s]) => a + Math.abs(s.values[ci] || 0), 0)) : [];
-    const valFmt = pct ? "0%" : axisFormat(main[0] ? main[0][0].fmt : series[0].fmt, [...mainValues, ...stackTotals]);
-    const A1 = 50010, A2 = 50020, A3 = 50030, A4 = 50040;
-    let groups = "";
-    if (kind === "bar" || kind === "combo") {
-      const grouping = spec.grouping || "clustered";
-      groups += `<c:barChart><c:barDir val="${horizontal ? "bar" : "col"}"/><c:grouping val="${grouping}"/><c:varyColors val="0"/>` +
-        main.map(([s, i]) => chartSeriesXml("bar", s, i, plan, refs.series[i])).join("") +
-        `<c:gapWidth val="60"/>${grouping !== "clustered" ? '<c:overlap val="100"/>' : ""}<c:axId val="${A1}"/><c:axId val="${A2}"/></c:barChart>`;
-    } else if (kind === "line") {
-      groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
-        main.map(([s, i]) => chartSeriesXml("line", s, i, plan, refs.series[i])).join("") +
-        `<c:marker val="1"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:lineChart>`;
-    } else if (kind === "area") {
-      groups += `<c:areaChart><c:grouping val="${spec.grouping || "standard"}"/><c:varyColors val="0"/>` +
-        main.map(([s, i]) => chartSeriesXml("area", s, i, plan, refs.series[i])).join("") +
-        `<c:axId val="${A1}"/><c:axId val="${A2}"/></c:areaChart>`;
-    }
-    // A funnel hides its value axis and gridlines: the offsets would make the numbers misleading
-    const titles = axisTitles(plan, main, lines);
-    let axes = catAxXml(A1, A2, horizontal ? "l" : "b", { reverse: horizontal, title: titles.cat, hidden: !titles.catShow, count: plan.categories.length }) +
-      valAxXml(A2, A1, horizontal ? "b" : "l", valFmt, { crosses: horizontal ? "max" : "autoZero", grid: !spec.hideValueAxis,
-        hidden: !!spec.hideValueAxis || !titles.valShow, title: spec.hideValueAxis ? null : titles.val,
-        zero: (kind === "bar" || kind === "combo") && main.every(([s]) => s.values.every((v) => v === null || v >= 0)) });
-    if (lines.length) {
-      groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
-        lines.map(([s, i]) => chartSeriesXml("line", s, i, plan, refs.series[i])).join("") +
-        `<c:marker val="1"/><c:axId val="${A3}"/><c:axId val="${A4}"/></c:lineChart>`;
-      const lineFmt = axisFormat(lines[0][0].fmt, lines.flatMap(([s]) => s.values));
-      axes += catAxXml(A3, A4, "b", { hidden: true }) + valAxXml(A4, A3, "r", lineFmt, { crosses: "max", grid: false, hidden: !titles.secShow, title: titles.sec });
-    }
-    body = groups + axes;
+    body = cartesianXml(plan, look, { titleH, legendOn, side, legendW, legendH, catLabel }, hidden);
   }
-  const round = kind === "pie" || kind === "doughnut";
-  // Legend: one entry per visible series (or per scatter group); helper series are left out
-  const entries = scatter ? (plan.perPoint ? 0 : plan.groups.length) : series.filter((s) => !s.noLegend).length;
-  const hiddenEntries = scatter ? "" : series.map((s, i) => (s.noLegend ? `<c:legendEntry><c:idx val="${i}"/><c:delete val="1"/></c:legendEntry>` : "")).join("");
-  const legend = entries > 1 || round
-    ? `<c:legend><c:legendPos val="${round ? "r" : "t"}"/>${hiddenEntries}<c:overlay val="0"/></c:legend>` : "";
-  const title = `<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="1200" b="1"/></a:pPr>` +
-    `<a:r><a:rPr lang="en-US" sz="1200" b="1">${fillXml(C.INK)}</a:rPr><a:t>${xmlEsc(plan.title)}</a:t></a:r></a:p></c:rich></c:tx>` +
-    `<c:overlay val="0"/></c:title><c:autoTitleDeleted val="0"/>`;
-  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+
+  const hiddenEntries = [...new Set(hidden)].sort((a, b) => a - b).map((i) => `<c:legendEntry><c:idx val="${i}"/><c:delete val="1"/></c:legendEntry>`).join("");
+  const legend = legendOn
+    ? `<c:legend><c:legendPos val="${side}"/>${hiddenEntries}${manualLayoutA(legendBox.x / W, legendBox.y / H, legendBox.w / W, legendBox.h / H)}<c:overlay val="0"/>${txPrA(LT)}</c:legend>` : "";
+  const F = look.frame;
+  const shadow = F.shadow
+    ? `<a:effectLst><a:outerShdw blurRad="57150" dist="19050" dir="2700000" algn="tl" rotWithShape="0"><a:srgbClr val="${hexOf(F.shadow.color)}"><a:alpha val="${Math.round((1 - F.shadow.transparency / 100) * 100000)}"/></a:srgbClr></a:outerShdw></a:effectLst>` : "";
+  const frame = `<c:spPr>${F.background ? fillA(F.background, 1 - (F.transparency || 0) / 100) : "<a:noFill/>"}` +
+    `${F.border ? lineA({ color: F.border.color, width: F.border.width }) : "<a:ln><a:noFill/></a:ln>"}${shadow}</c:spPr>`;
+  const xml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
     `<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">` +
-    `<c:roundedCorners val="0"/><c:chart>${title}<c:plotArea><c:layout/>${body}</c:plotArea>${legend}<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart>` +
-    `<c:spPr>${fillXml(C.WHITE)}<a:ln w="9525">${fillXml(C.HAIR)}</a:ln></c:spPr>` +
-    `<c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="900">${fillXml(C.SLATE)}<a:latin typeface="Calibri"/></a:defRPr></a:pPr><a:endParaRPr lang="en-US"/></a:p></c:txPr>` +
-    `</c:chartSpace>`;
+    `<c:roundedCorners val="${F.border && F.border.radius > 0 ? 1 : 0}"/><c:chart>${title}<c:plotArea>${plotLayout}${body}${NO_BOX}</c:plotArea>${legend}` +
+    `<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart>${frame}${txPrA(LT)}` +
+    (shapes.length ? `<c:userShapes r:id="${USER_SHAPES_RID}"/>` : "") + `</c:chartSpace>`;
+  return { xml, shapes: shapes.length ? userShapesXml(shapes) : null };
+}
+
+/*
+ * Bar, column, line, area and combo charts: their chart groups and axes. hidden collects the
+ * series kept out of the legend (overlay lines, total labels, analytics lines).
+ */
+function cartesianXml(plan, look, box, hidden) {
+  const { spec, series, refs } = plan;
+  const kind = spec.kind;
+  const W = (plan.sizePx && plan.sizePx.w) || 400, H = (plan.sizePx && plan.sizePx.h) || 300;
+  const indexed = series.map((s, i) => [s, i]);
+  const main = indexed.filter(([s]) => !s.line);
+  const lines = indexed.filter(([s]) => s.line);
+  const horizontal = spec.dir === "bar";
+  const grouping = spec.grouping || (kind === "area" ? "standard" : "clustered");
+  const pct = grouping === "percentStacked", stacked = grouping === "stacked";
+  const isBar = kind === "bar" || kind === "combo";
+  const shown = main.filter(([s]) => !s.hidden).map(([s]) => s);
+  const n = plan.categories.length;
+  const A1 = 50010, A2 = 50020, A3 = 50030, A4 = 50040, A7 = 50070, A8 = 50080;
+  let nextIdx = series.length;
+  const overlays = [];   // line series on the main axes: area tops, trend helper
+
+  // The value axis like Power BI's: room for its labels, a tick every ~55 px up or ~100 px across
+  const titles = axisTitles(plan, main, lines);
+  const mainVals = stacked ? stackExtents(main.map(([s]) => s), n) : main.flatMap(([s]) => s.values);
+  const refUsable = (l) => l.kind !== "constant" || l.axis === (horizontal ? "x" : "y");
+  const refConst = look.refLines.filter((l) => l.kind === "constant" && refUsable(l)).map((l) => l.value);
+  const legendBand = box.legendOn ? (box.side === "t" || box.side === "b" ? box.legendH + 6 : 0) : 0;
+  const legendSide = box.legendOn && (box.side === "l" || box.side === "r") ? box.legendW + 14 : 0;
+  const catW = horizontal ? Math.min(W * 0.35, Math.max(30, ...plan.categories.map((_, i) => textPx(box.catLabel(i), look.cat.text)))) + 8 : 0;
+  const plotH = H - box.titleH - legendBand - (titles.cat ? 22 : 0) - 28;
+  const plotW = W - catW - legendSide - (titles.val ? 22 : 0) - 30;
+  // Power BI runs a bar axis on to the next tick only to make room for labels outside the bars
+  const labelsOn = look.labels.show === true;
+  const roomForLabels = isBar && ((labelsOn && (grouping === "clustered" || /outside/i.test(look.labels.position))) || (stacked && look.totals.show));
+  const axisPx = horizontal ? plotW : plotH, gapPx = horizontal ? 200 : 75;
+  const axis = look.val.log ? null
+    : pct ? valueScale([0, 1], axisPx, gapPx, { zero: true, round: true, start: 0, end: 1 })
+      : valueScale([...mainVals, ...refConst], axisPx, gapPx, { zero: isBar, round: roomForLabels, start: look.val.start, end: look.val.end });
+  const fmt0 = (main[0] ? main[0][0] : series[0]).fmt;
+  const valFmt = pct ? stepFormat("0%", axis, []) : axisNumFmt(fmt0, axis, look.val, mainVals);
+  const labelVals = shown.flatMap((s) => s.values);
+  const lineLookOf = (s) => look.lines.series[normalizeField(s.name)] || look.lines;
+  const trendOn = !!look.trend && !pct && !stacked && (kind === "line" || (isBar && grouping === "clustered"));
+  const combineTrend = trendOn && look.trend.combine && shown.length > 1;
+
+  let groups = "";
+  if (isBar) {
+    // Bars fill the share of each category Power BI gives them (its inner padding: about a
+    // quarter of the category is gap); clustered bars share that room
+    const share = look.cat.padding === null || look.cat.padding === undefined ? 0.25 : Math.min(0.9, Math.max(0, look.cat.padding / 100 + 0.05));
+    const per = grouping === "clustered" ? Math.max(1, shown.length) : 1;
+    const gapWidth = Math.round(Math.min(500, share / (1 - share) * per * 100));
+    let sers = main.map(([s, i]) => chartSeriesXml("bar", {
+      ...s,
+      labelsXml: labelsOn && !s.hidden ? seriesLabelsXml("bar", grouping, s.color || (plan.pointColors || []).find(Boolean), labelNumFmt(s.fmt, labelVals, look.labels, 1), look.labels) : "",
+      trendXml: trendOn && !combineTrend && !s.hidden ? trendlineXml(look.trend) : "",
+    }, i, plan, refs.series[i])).join("");
+    // Total labels over each stack: an empty last segment labelled with the stack's total
+    if (stacked && look.totals.show && !spec.hideValueAxis) {
+      const totals = plan.categories.map((_, ci) => shown.reduce((a, s) => a + (typeof s.values[ci] === "number" ? s.values[ci] : 0), 0));
+      const unit = look.totals.units > 0 ? look.totals.units : autoUnit(maxAbsOf(totals));
+      const dec = look.totals.precision !== null && look.totals.precision !== undefined ? look.totals.precision : null;
+      const pts = totals.map((v, idx) => ({ idx, text: displayValue(v, fmt0, unit, dec), pos: "inBase" }));
+      const idx = nextIdx++;
+      hidden.push(idx);
+      sers += chartSeriesXml("bar", { name: "Total", values: totals.map(() => 0), fmt: "General", literal: true, hidden: true, labelsXml: textLabelsXml(pts, look.totals.text) }, idx, plan, null);
+    }
+    groups += `<c:barChart><c:barDir val="${horizontal ? "bar" : "col"}"/><c:grouping val="${grouping}"/><c:varyColors val="0"/>${sers}` +
+      `<c:gapWidth val="${gapWidth}"/>${grouping !== "clustered" ? '<c:overlap val="100"/>' : ""}<c:axId val="${A1}"/><c:axId val="${A2}"/></c:barChart>`;
+  } else if (kind === "area") {
+    // Power BI's area: a see-through fill under a solid line along its top
+    const tops = [];
+    let running = plan.categories.map(() => 0);
+    const totals = plan.categories.map((_, ci) => main.reduce((a, [s]) => a + Math.abs(typeof s.values[ci] === "number" ? s.values[ci] : 0), 0) || 1);
+    for (const [s] of main) {
+      running = running.map((r, ci) => r + (typeof s.values[ci] === "number" ? s.values[ci] : 0));
+      tops.push({ s, values: running.map((r, ci) => (s.values[ci] === null || s.values[ci] === undefined ? null : grouping === "standard" ? s.values[ci] : pct ? r / totals[ci] : r)) });
+    }
+    groups += `<c:areaChart><c:grouping val="${grouping}"/><c:varyColors val="0"/>` +
+      main.map(([s, i]) => chartSeriesXml("area", { ...s, alpha: look.areaOpacity,
+        labelsXml: labelsOn && grouping !== "standard" ? seriesLabelsXml("area", grouping, s.color, labelNumFmt(s.fmt, labelVals, look.labels, 1), look.labels) : "" }, i, plan, refs.series[i])).join("") +
+      `<c:axId val="${A1}"/><c:axId val="${A2}"/></c:areaChart>`;
+    for (const t of tops) {
+      overlays.push({ ...t.s, name: t.s.name, values: t.values, literal: true, noLegend: true, lineLook: lineLookOf(t.s),
+        labelsXml: labelsOn && grouping === "standard" ? seriesLabelsXml("line", grouping, t.s.color, labelNumFmt(t.s.fmt, labelVals, look.labels, 1), look.labels) : "" });
+    }
+  }
+  if (combineTrend) {
+    // One trend over the series together (Power BI's "combine series"): through their average
+    const mean = plan.categories.map((_, ci) => { const v = shown.map((s) => s.values[ci]).filter((x) => typeof x === "number"); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; });
+    overlays.push({ name: "Trend", values: mean, fmt: fmt0, literal: true, hidden: true, noLegend: true, trendXml: trendlineXml(look.trend) });
+  }
+  if (kind === "line") {
+    groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
+      main.map(([s, i]) => chartSeriesXml("line", {
+        ...s, lineLook: lineLookOf(s),
+        labelsXml: labelsOn ? seriesLabelsXml("line", "standard", s.color, labelNumFmt(s.fmt, labelVals, look.labels, 1), look.labels) : "",
+        trendXml: trendOn && !combineTrend ? trendlineXml(look.trend) : "",
+      }, i, plan, refs.series[i])).join("") +
+      overlays.map((s) => { const idx = nextIdx++; hidden.push(idx); return chartSeriesXml("line", s, idx, plan, null); }).join("") +
+      `<c:marker val="1"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:lineChart>`;
+  } else if (overlays.length) {
+    groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
+      overlays.map((s) => { const idx = nextIdx++; hidden.push(idx); return chartSeriesXml("line", s, idx, plan, null); }).join("") +
+      `<c:marker val="1"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:lineChart>`;
+  }
+
+  // Axes. A funnel hides its value axis and gridlines: the offsets would make the numbers misleading
+  const catXml = plan.dateAxis
+    ? dateAxXml(A1, A2, { hidden: !titles.catShow, title: titles.cat, look: look.cat, date: plan.dateAxis })
+    : catAxXml(A1, A2, horizontal ? "l" : "b", { reverse: horizontal, title: titles.cat, hidden: !titles.catShow, count: n, look: look.cat, multi: plan.multiLevel });
+  let axes = catXml + valAxXml(A2, A1, horizontal ? "b" : "l", valFmt, { crosses: horizontal ? "max" : "autoZero", grid: !spec.hideValueAxis,
+    hidden: !!spec.hideValueAxis || !titles.valShow, title: spec.hideValueAxis ? null : titles.val, axis,
+    zero: isBar && main.every(([s]) => s.values.every((v) => v === null || v >= 0)), look: look.val });
+  if (lines.length) {
+    // A combo's line values on the second axis, scaled like Power BI's
+    const lineVals = lines.flatMap(([s]) => s.values);
+    const secAxis = look.sec.log ? null : valueScale(lineVals, plotH, 75, { round: false, start: look.sec.start, end: look.sec.end });
+    groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
+      lines.map(([s, i]) => chartSeriesXml("line", { ...s, lineLook: lineLookOf(s),
+        labelsXml: labelsOn ? seriesLabelsXml("line", "standard", s.color, labelNumFmt(s.fmt, lineVals, look.labels, 1), look.labels) : "" }, i, plan, refs.series[i])).join("") +
+      `<c:marker val="1"/><c:axId val="${A3}"/><c:axId val="${A4}"/></c:lineChart>`;
+    axes += catAxXml(A3, A4, "b", { hidden: true }) +
+      valAxXml(A4, A3, "r", axisNumFmt(lines[0][0].fmt, secAxis, look.sec, lineVals), { crosses: "max", grid: false, hidden: !titles.secShow, title: titles.sec, axis: secAxis, look: look.sec });
+  }
+
+  // Constant and analytics lines (average, median…): straight lines across the plot, on hidden
+  // axes that share the value axis's range
+  const refSers = [];
+  if (axis && !spec.hideValueAxis) {
+    for (const l of look.refLines) {
+      if (!refUsable(l)) continue;
+      const of = (m) => shown.filter((s) => !m || normalizeField(s.name) === m || normalizeField(plan.valueName || "") === m);
+      const pool = of(l.measure).length ? of(l.measure) : shown;
+      const v = l.kind === "constant" ? l.value : analyticValue(l, pool.flatMap((s) => s.values));
+      if (v === null) continue;
+      const idx = nextIdx++;
+      hidden.push(idx);
+      refSers.push(refLineSeriesXml(idx, l, horizontal ? [[v, 0], [v, 1]] : [[0, v], [1, v]], fmt0, horizontal, v));
+    }
+  }
+  if (refSers.length) {
+    const unitAxis = { min: 0, max: 1 };
+    groups += `<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>${refSers.join("")}<c:axId val="${A7}"/><c:axId val="${A8}"/></c:scatterChart>`;
+    axes += hiddenValAxXml(A7, A8, "b", horizontal ? axis : unitAxis) + hiddenValAxXml(A8, A7, "l", horizontal ? unitAxis : axis);
+  }
+  return groups + axes;
 }
 
 /* An Excel treemap (chartEx "treemap"): the levels and sizes from the Data sheet, each group in
@@ -4439,9 +5060,12 @@ function treemapXml(plan, n) {
     idx += plan.nested ? 1 + g.tiles.length : 1;
     return g.color ? `<cx:dataPt idx="${at}"><cx:spPr>${fillXml(g.color)}</cx:spPr></cx:dataPt>` : "";
   }).join("");
-  const title = `<cx:title pos="t" align="ctr" overlay="0"><cx:tx><cx:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="1200" b="1"/></a:pPr>` +
-    `<a:r><a:rPr lang="en-US" sz="1200" b="1">${fillXml(C.INK)}</a:rPr><a:t>${xmlEsc(plan.title)}</a:t></a:r></a:p></cx:rich></cx:tx></cx:title>`;
-  const labels = `<cx:dataLabels pos="inEnd"><cx:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="900">${fillXml(C.WHITE)}</a:defRPr></a:pPr><a:endParaRPr lang="en-US"/></a:p></cx:txPr>` +
+  const look = plan.look || chartLook({ type: "treemap" }, null);
+  const T = look.title;
+  const align = T.align === "center" ? "ctr" : T.align === "right" ? "max" : "min";
+  const title = plan.showTitle === false ? "" : `<cx:title pos="t" align="${align}" overlay="0"><cx:tx><cx:rich><a:bodyPr/><a:lstStyle/>` +
+    `${paraA(plan.title, T, align === "ctr" ? "ctr" : align === "max" ? "r" : "l")}</cx:rich></cx:tx></cx:title>`;
+  const labels = `<cx:dataLabels pos="inEnd"><cx:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr>${runPrA({ ...look.labels.text, color: C.WHITE })}</a:pPr><a:endParaRPr lang="en-US"/></a:p></cx:txPr>` +
     `<cx:visibility seriesName="0" categoryName="1" value="0"/></cx:dataLabels>`;
   const id = `{${String(n).padStart(8, "0")}-0000-4000-8000-00000000AE02}`;
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
@@ -4664,8 +5288,19 @@ async function addChartsToFile(buffer, chartSheets) {
       }
       chartNo++;
       const chartPath = `xl/charts/chart${chartNo}.xml`;
-      zip.file(chartPath, chartXml(ch.plan));
+      const part = chartXml(ch.plan);
+      zip.file(chartPath, part.xml);
       addType(chartPath, "application/vnd.openxmlformats-officedocument.drawingml.chart+xml");
+      if (part.shapes) {
+        // Shapes over the chart (a legend's title, a donut's hole): the chart's own drawing
+        drawingNo++;
+        const shapesPath = `xl/drawings/drawing${drawingNo}.xml`;
+        zip.file(shapesPath, part.shapes);
+        addType(shapesPath, "application/vnd.openxmlformats-officedocument.drawingml.chartshapes+xml");
+        zip.file(`xl/charts/_rels/chart${chartNo}.xml.rels`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+          `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="${USER_SHAPES_RID}" ` +
+          `Type="${REL_TYPE}chartUserShapes" Target="../drawings/drawing${drawingNo}.xml"/></Relationships>`);
+      }
       const rel = addRel(drawingRels, "chart", `../charts/chart${chartNo}.xml`);
       drawingRels = rel.xml;
             // A funnel: Excel's own funnel chart too, with the bar funnel as its fallback

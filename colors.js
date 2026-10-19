@@ -500,15 +500,222 @@ async function readTheme(zip, themeCollection) {
   if (!dataColors.length) return null;
   const keywords = {};
   for (const k of Object.values(THEME_KEYWORDS)) if (/^#[0-9A-F]{6}$/i.test(merged[k] || "")) keywords[k] = merged[k];
+  // Text classes: each class's settings from the custom theme over the base theme's
+  const textClasses = {};
+  for (const t of [base, custom]) {
+    for (const [name, cls] of Object.entries((t && t.textClasses) || {})) textClasses[name] = { ...(textClasses[name] || {}), ...cls };
+  }
   return {
     name: (custom && custom.name) || (base && base.name) || "Report theme",
     dataColors,
     background: merged.background || FALLBACK_THEME.background,
     foreground: merged.foreground || FALLBACK_THEME.foreground,
     keywords,
+    textClasses,
     // Formatting defaults per visual type, base theme first, the custom theme over it
     visualStyles: [base && base.visualStyles, custom && custom.visualStyles].filter(Boolean),
   };
+}
+
+/* ── Format settings ──────────────────────────────────────────────────────
+ * A visual's format pane settings, resolved the way Power BI resolves them: the visual's
+ * own setting, else the custom theme's, else the base theme's (each for every visual, "*",
+ * then for this visual type), else Power BI's default. chartLook() turns a chart's settings
+ * into plain values for export.js; with no report file it gives Power BI's defaults.
+ */
+// Power BI's built-in font names → the font Excel has that looks the same
+const PBI_FONTS = { din: "Bahnschrift", "din light": "Bahnschrift Light", "wf_standard-font": "Segoe UI", "wf_standard-font_light": "Segoe UI Light",
+  heading: "Segoe UI Semibold", body: "Segoe UI", "segoe (bold)": "Segoe UI|b", "segoe (semibold)": "Segoe UI Semibold", "segoe (light)": "Segoe UI Light",
+  "segoe ui bold": "Segoe UI|b", "wf_segoe-ui_normal": "Segoe UI", "wf_segoe-ui_light": "Segoe UI Light", "wf_segoe-ui_semilight": "Segoe UI Semilight",
+  "wf_segoe-ui_semibold": "Segoe UI Semibold", "wf_segoe-ui_bold": "Segoe UI|b" };
+
+/* "'Segoe UI Bold', wf_segoe-ui_bold, helvetica…" → { face: "Segoe UI", bold: true } */
+function excelFont(family) {
+  if (!family) return null;
+  const first = String(family).split(",")[0].trim().replace(/^['"]+|['"]+$/g, "");
+  if (!first) return null;
+  const known = PBI_FONTS[first.toLowerCase()];
+  const [face, flag] = (known || first).split("|");
+  return { face, bold: flag === "b" };
+}
+
+/* A setting's value: true / false, a number, text, or a colour ("#RRGGBB"); undefined for
+   anything else (a measure, an fx rule). Report files hold Power BI literals ("12D",
+   "'Top'"); themes hold plain JSON. */
+function settingValue(v, theme) {
+  if (v === null || v === undefined) return undefined;
+  if (typeof v !== "object") return v;
+  if (v.solid) {
+    const c = v.solid.color;
+    if (typeof c === "string") return /^#[0-9A-F]{6}$/i.test(c) ? c.toUpperCase() : undefined;
+    return colorFromExpr(c && c.expr, theme || FALLBACK_THEME) || undefined;
+  }
+  const e = v.expr;
+  if (!e) return undefined;
+  if (e.ThemeDataColor) return colorFromExpr(e, theme || FALLBACK_THEME) || undefined;
+  if (!e.Literal) return undefined;
+  const text = String(e.Literal.Value);
+  if (text === "true" || text === "false") return text === "true";
+  const n = text.match(/^(-?\d+(?:\.\d+)?(?:E[+-]?\d+)?)[LDM]?$/i);
+  if (n) return Number(n[1]);
+  const q = text.match(/^'([\s\S]*)'$/);
+  return q ? q[1].replace(/''/g, "'") : text;
+}
+
+/* Reads one setting: get(object, prop) for the visual as a whole, get(object, prop, entry)
+   for one entry of a repeated object (an analytics line). */
+function formatReader(visual, theme) {
+  const own = { ...(visual.container || {}), ...(visual.objects || {}) };
+  const styles = (theme && theme.visualStyles) || [];
+  const whole = (e) => !e.selector || ((e.selector.data || []).length && e.selector.data.every((d) => d.dataViewWildcard) && !e.selector.metadata);
+  return (object, prop, entry) => {
+    const e = entry || (own[object] || []).find(whole);
+    if (e && e.properties && prop in e.properties) {
+      const v = settingValue(e.properties[prop], theme);
+      if (v !== undefined) return v;
+    }
+    let value;
+    for (const s of styles) {
+      for (const key of ["*", visual.type]) {
+        const t = ((((s || {})[key] || {})["*"] || {})[object] || [])[0];
+        if (t && prop in t) { const v = settingValue(t[prop], theme); if (v !== undefined) value = v; }
+      }
+    }
+    return value;
+  };
+}
+
+const settingNumber = (v, dflt = null) => (v === undefined || v === null || v === "" || isNaN(Number(v)) ? dflt : Number(v));
+const settingFlag = (v, dflt) => (typeof v === "boolean" ? v : dflt);
+const LABEL_GREY = "#605E5C";    // Power BI's axis labels, legend and data labels
+const GRID_GREY = "#C8C6C4";
+const ANALYTICS_KINDS = ["min", "max", "average", "median", "percentile"];
+
+/*
+ * A chart's look, Power BI's defaults filled in (sizes in points, widths in pixels):
+ *  title / subtitle: { show, text, face, size, color, bold, italic, align, background }
+ *  frame: { background, transparency, border: { color, width, radius } | null, shadow }
+ *  legend: { show, position, title, titleText, text }
+ *  cat / val / sec (axes): { show, title, titleText, titleFont, text, grid: { color, width, style } | null,
+ *    start, end, log, invert, units, precision, continuous, concatenate, padding }
+ *  labels: { show, text, units, precision, position, style, background }, totals: { show, text, units, precision }
+ *  lines: { width, style, markers: { shape, size } | null, smooth, series: { "<measure>": {…} } }
+ *  donutHole, refLines: [{ axis, kind, value, measure, percentile, color, style, width, label }], trend
+ * text: { face, size, color, bold, italic }.
+ */
+function chartLook(visual, theme) {
+  const get = formatReader(visual, theme);
+  const tc = (theme && theme.textClasses) || {};
+  const titleClass = { face: (excelFont(tc.title && tc.title.fontFace) || excelFont("DIN")).face, size: settingNumber(tc.title && tc.title.fontSize, 12),
+    color: (tc.title && tc.title.color) || "#252423" };
+  const labelFace = (excelFont(tc.label && tc.label.fontFace) || excelFont("Segoe UI")).face;
+  const text = (object, { size, face, color, sizeProp = "fontSize", faceProp = "fontFamily", colorProp, boldProp = "bold", italicProp = "italic" }) => {
+    const f = excelFont(get(object, faceProp));
+    return {
+      face: f ? f.face : face,
+      size: settingNumber(get(object, sizeProp), size),
+      color: (colorProp && get(object, colorProp)) || color,
+      bold: settingFlag(get(object, boldProp), false) || !!(f && f.bold),
+      italic: settingFlag(get(object, italicProp), false),
+    };
+  };
+  const labelText = (object, colorProp) => text(object, { size: 9, face: labelFace, color: LABEL_GREY, colorProp });
+  const shown = (object, dflt = true) => settingFlag(get(object, "show"), dflt);
+
+  const title = { show: shown("title"), text: get("title", "text") ?? null,
+    ...text("title", { ...titleClass, colorProp: "fontColor" }), align: String(get("title", "alignment") || "left").toLowerCase(),
+    background: get("title", "background") || null };
+  const subText = get("subTitle", "text");
+  const subtitle = shown("subTitle", false) && subText ? { text: String(subText), ...text("subTitle", { size: 10, face: labelFace, color: LABEL_GREY, colorProp: "fontColor" }) } : null;
+  const bgShow = shown("background", true);
+  const frame = {
+    background: bgShow ? get("background", "color") || (theme && theme.background) || "#FFFFFF" : null,
+    transparency: settingNumber(get("background", "transparency"), 0),
+    border: shown("border", false) ? { color: get("border", "color") || "#CCCCCC", width: settingNumber(get("border", "width"), 1), radius: settingNumber(get("border", "radius"), 0) } : null,
+    shadow: shown("dropShadow", false) ? { color: get("dropShadow", "color") || "#000000", transparency: settingNumber(get("dropShadow", "transparency"), 70) } : null,
+  };
+  const legendTitle = get("legend", "titleText");
+  const legend = { show: get("legend", "show"), position: String(get("legend", "position") || "Top"), title: settingFlag(get("legend", "showTitle"), true),
+    titleText: legendTitle === undefined ? null : String(legendTitle), text: labelText("legend", "labelColor") };
+  const grid = (object, prefix, dflt) => (settingFlag(get(object, prefix + "gridlineShow"), dflt)
+    ? { color: get(object, prefix + "gridlineColor") || GRID_GREY, width: settingNumber(get(object, prefix + "gridlineThickness"), 1),
+        style: String(get(object, prefix + "gridlineStyle") || "dotted") } : null);
+  const axis = (object, p = "") => {
+    const titleFont = excelFont(get(object, p ? p + "TitleFontFamily" : "titleFontFamily"));
+    return {
+      show: settingFlag(get(object, p ? p + "Show" : "show"), true),
+      title: get(object, p ? p + "ShowAxisTitle" : "showAxisTitle"),
+      titleText: get(object, p ? p + "TitleText" : "titleText") ?? null,
+      titleFont: { face: titleFont ? titleFont.face : titleClass.face, size: settingNumber(get(object, p ? p + "TitleFontSize" : "titleFontSize"), 10),
+        color: get(object, p ? p + "TitleColor" : "titleColor") || titleClass.color,
+        bold: settingFlag(get(object, p ? p + "TitleBold" : "titleBold"), false) || !!(titleFont && titleFont.bold), italic: settingFlag(get(object, p ? p + "TitleItalic" : "titleItalic"), false) },
+      text: p ? text(object, { size: 9, face: labelFace, color: LABEL_GREY, sizeProp: "secFontSize", faceProp: "secFontFamily", colorProp: "secLabelColor", boldProp: "secBold", italicProp: "secItalic" })
+        : labelText(object, "labelColor"),
+      start: settingNumber(get(object, p ? p + "Start" : "start")),
+      end: settingNumber(get(object, p ? p + "End" : "end")),
+      log: settingFlag(get(object, p ? p + "LogAxisScale" : "logAxisScale"), false) || String(get(object, p ? p + "AxisScale" : "axisScale") || "").toLowerCase() === "log",
+      invert: settingFlag(get(object, "invertAxis"), false),
+      units: settingNumber(get(object, p ? p + "LabelDisplayUnits" : "labelDisplayUnits"), 0),
+      precision: settingNumber(get(object, p ? p + "LabelPrecision" : "labelPrecision")),
+    };
+  };
+  const cat = { ...axis("categoryAxis"), grid: grid("categoryAxis", "", false),
+    continuous: String(get("categoryAxis", "axisType") || "Scalar") !== "Categorical",
+    concatenate: settingFlag(get("categoryAxis", "concatenateLabels"), false),
+    padding: settingNumber(get("categoryAxis", "innerPadding")) };
+  const val = { ...axis("valueAxis"), grid: grid("valueAxis", "", true) };
+  const sec = { ...axis("valueAxis", "sec"), grid: null };
+  const labelBack = settingFlag(get("labels", "enableBackground"), false)
+    ? { color: get("labels", "backgroundColor") || "#FFFFFF", transparency: settingNumber(get("labels", "backgroundTransparency"), 0) } : null;
+  const labels = { show: get("labels", "show"), text: labelText("labels", "color"), units: settingNumber(get("labels", "labelDisplayUnits"), 0),
+    precision: settingNumber(get("labels", "labelPrecision")), position: String(get("labels", "labelPosition") || "Auto"),
+    style: get("labels", "labelStyle") || null, percentPrecision: settingNumber(get("labels", "percentageLabelPrecision")), background: labelBack };
+  const totals = { show: settingFlag(get("totals", "show"), false), text: labelText("totals", "color"), units: settingNumber(get("totals", "labelDisplayUnits"), 0),
+    precision: settingNumber(get("totals", "labelPrecision")) };
+  const lineOf = (entry) => {
+    const g = (prop) => get("lineStyles", prop, entry);
+    const markers = settingFlag(g("showMarker"), false);
+    const kind = String(g("lineChartType") || "").toLowerCase();
+    return { width: settingNumber(g("strokeWidth"), 3), style: String(g("lineStyle") || "solid").toLowerCase(),
+      markers: markers ? { shape: String(g("markerShape") || "circle"), size: settingNumber(g("markerSize"), 5), color: g("markerColor") || null } : null,
+      smooth: kind === "smooth" };
+  };
+  const series = {};
+  for (const e of ((visual.objects || {}).lineStyles || [])) {
+    if (e.selector && e.selector.metadata) series[normalizeField(e.selector.metadata)] = lineOf(e);
+  }
+  const lines = { ...lineOf(null), series };
+  // Analytics lines: constant lines on either axis, then min / max / average / median / percentile lines of a measure
+  const refLines = [];
+  const lineStyle = (o, e, dflt) => ({ color: get(o, "lineColor", e) || dflt, style: String(get(o, "style", e) || "dashed").toLowerCase(),
+    transparency: settingNumber(get(o, "transparency", e), 0), width: settingNumber(get(o, "width", e), 2) });
+  const labelOf = (o, e, color) => (settingFlag(get(o, "dataLabelShow", e), false)
+    ? { show: true, text: String(get(o, "dataLabelText", e) || "Value"), color: get(o, "dataLabelColor", e) || color, name: get(o, "displayName", e) || null,
+        units: settingNumber(get(o, "dataLabelDisplayUnits", e), 0), precision: settingNumber(get(o, "dataLabelDecimalPoints", e)) } : null);
+  for (const [o, axisKey] of [["y1AxisReferenceLine", "y"], ["xAxisReferenceLine", "x"], ["y2AxisReferenceLine", "y2"]]) {
+    for (const e of ((visual.objects || {})[o] || [])) {
+      const value = settingNumber(get(o, "value", e));
+      if (!settingFlag(get(o, "show", e), true) || value === null) continue;
+      const st = lineStyle(o, e, LABEL_GREY);
+      refLines.push({ axis: axisKey, kind: "constant", value, ...st, label: labelOf(o, e, st.color) });
+    }
+  }
+  // Analytics lines (min, max, average, median, percentile) are "referenceLine" entries: their
+  // type, and the measure they summarise
+  for (const e of ((visual.objects || {}).referenceLine || [])) {
+    const kind = String(get("referenceLine", "type", e) || "").toLowerCase();
+    if (!ANALYTICS_KINDS.includes(kind) || !settingFlag(get("referenceLine", "show", e), true)) continue;
+    const st = lineStyle("referenceLine", e, LABEL_GREY);
+    const m = e.properties && e.properties.measure && fieldName(e.properties.measure.expr);
+    const pct = settingNumber(get("referenceLine", "percentile", e), 50);
+    refLines.push({ axis: "y", kind, measure: m ? normalizeField(m) : null, percentile: pct > 1 ? pct : pct * 100, ...st, label: labelOf("referenceLine", e, st.color) });
+  }
+  const trend = settingFlag(get("trend", "show"), false)
+    ? { color: get("trend", "lineColor") || "#252423", style: String(get("trend", "style") || "dashed").toLowerCase(), transparency: settingNumber(get("trend", "transparency"), 0),
+        combine: settingFlag(get("trend", "combineSeries"), true) } : null;
+  return { title, subtitle, frame, legend, cat, val, sec, labels, totals, lines, refLines, trend,
+    donutHole: settingNumber(get("slices", "innerRadiusRatio"), null), startAngle: settingNumber(get("slices", "startAngle"), 0),
+    categoryLabels: settingFlag(get("categoryLabels", "show"), false), areaOpacity: 0.4 };
 }
 
 /*
@@ -625,8 +832,8 @@ function legacyVisual(config) {
     }));
   }
   const o = sv.objects || {};
-  return { type: sv.visualType, roles, objects: o, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [], values: [...(o.value || []), ...(o.labels || [])],
-    titleShown: titleShown(sv.vcObjects), expansion: sv.expansionStates || null };
+  return { type: sv.visualType, roles, objects: o, container: sv.vcObjects || {}, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [],
+    values: [...(o.value || []), ...(o.labels || [])], titleShown: titleShown(sv.vcObjects), expansion: sv.expansionStates || null };
 }
 
 function pbirVisual(json) {
@@ -642,8 +849,8 @@ function pbirVisual(json) {
     }));
   }
   const o = v.objects || {};
-  return { type: v.visualType, roles, objects: o, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [], values: [...(o.value || []), ...(o.labels || [])],
-    titleShown: titleShown(v.visualContainerObjects), expansion: v.expansionStates || null };
+  return { type: v.visualType, roles, objects: o, container: v.visualContainerObjects || {}, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [],
+    values: [...(o.value || []), ...(o.labels || [])], titleShown: titleShown(v.visualContainerObjects), expansion: v.expansionStates || null };
 }
 
 /* Icon rules ("fx" icons): each case's lower bound (a threshold) and its icon */
@@ -903,6 +1110,7 @@ function visualColorInfo(visual, theme) {
     settings,
     titleHidden: visual.titleShown === false,
     axes: axisSettings(visual.objects, visual.type, theme),
+    look: chartLook(visual, theme),
     mainValue: (roles[(custom && custom.mainRole) || KPI_VALUE_ROLE[visual.type]] || [])[0] || null,
     builtin: builtInSettings(visual, theme),
     // A matrix's saved expand / collapse state: per role, each level's default and the groups toggled
