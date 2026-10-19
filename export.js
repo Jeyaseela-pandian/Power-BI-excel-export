@@ -3590,6 +3590,7 @@ const EXCEL_CHARTS = {
   funnel: { kind: "funnel" },
   treemap: { kind: "treemap" },   // an Excel treemap (Excel 2016 and later)
   RadarChart1446119667547: { kind: "radar" },   // the AppSource Radar Chart: Excel's own filled radar
+  Sunburst1445472000808: { kind: "sunburst" },   // the AppSource Sunburst: an Excel sunburst (Excel 2016 and later)
 };
 const CHART_SCALE = 1;          // Power BI page pixels → chart pixels
 const CHART_MIN_W = 360;        // smallest chart, in pixels
@@ -3620,7 +3621,7 @@ function chartPlan(item) {
   const spec = EXCEL_CHARTS[item.type];
   if (!spec || item.isKpi) return null;
   // Scatter, waterfall and funnel have their own builders; any problem keeps the visual as a table
-  if (spec.kind === "scatter" || spec.kind === "waterfall" || spec.kind === "funnel" || spec.kind === "treemap") {
+  if (spec.kind === "scatter" || spec.kind === "waterfall" || spec.kind === "funnel" || spec.kind === "treemap" || spec.kind === "sunburst") {
     try {
       return spec.kind === "scatter" ? scatterPlan(item) : spec.kind === "waterfall" ? waterfallPlan(item)
         : spec.kind === "funnel" ? funnelPlan(item) : treemapPlan(item, spec);
@@ -4046,7 +4047,8 @@ function treemapPlan(item, spec) {
   const inRole = (ci, ...names) => names.some((r) => (roles[r] || []).includes(entries[ci]));
   const groupCol = t.textCols.find((ci) => !info || inRole(ci, "Group", "Category")) ?? t.textCols[0];
   if (groupCol === undefined) return null;
-  const detailCol = t.textCols.find((ci) => ci !== groupCol && (!info || inRole(ci, "Details")));
+  // A treemap's tiles are its Details; a sunburst's outer ring is its second node level
+  const detailCol = t.textCols.find((ci) => ci !== groupCol && (!info || inRole(ci, "Details") || (spec.kind === "sunburst" && inRole(ci, "Category", "Group"))));
   const valueCol = t.measureCols.find((ci) => !info || inRole(ci, "Values", "Y", "Size")) ?? t.measureCols[0];
   if (valueCol === undefined) return null;
   const additive = !NON_ADDITIVE.test(t.header[valueCol]);
@@ -4065,7 +4067,9 @@ function treemapPlan(item, spec) {
   // Largest group first, its largest tile first (Power BI's order)
   const totals = {};
   shown.forEach((x) => { totals[x.group] = (totals[x.group] || 0) + x.value; });
-  shown.sort((a, b) => (totals[b.group] - totals[a.group]) || (a.group < b.group ? -1 : a.group > b.group ? 1 : 0) || (b.value - a.value));
+  // (a sunburst keeps the data's order, clockwise from the top, as the visual draws it)
+  if (spec.kind !== "sunburst") shown.sort((a, b) => (totals[b.group] - totals[a.group]) || (a.group < b.group ? -1 : a.group > b.group ? 1 : 0) || (b.value - a.value));
+  else { const first = [...new Set(shown.map((x) => x.group))]; shown.sort((a, b) => first.indexOf(a.group) - first.indexOf(b.group)); }
   const colors = item.colors || null;
   const byGroup = colors && colors.rowKey && colors.rowKey.col === groupCol ? colors.rowKey.colorOf : null;
   const one = colors && colors.series && colors.series[valueCol] || null;
@@ -5118,7 +5122,7 @@ function cartesianXml(plan, look, box, hidden) {
   return groups + axes;
 }
 
-/* An Excel treemap (chartEx "treemap"): the levels and sizes from the Data sheet, each group in
+/* An Excel treemap or sunburst (chartEx): the levels and sizes from the Data sheet, each group in
    its colour, tiles labelled with their names and group names over each group, no legend */
 function treemapXml(plan, n) {
   const s = plan.series[0], r = plan.refs;
@@ -5131,6 +5135,7 @@ function treemapXml(plan, n) {
     return g.color ? `<cx:dataPt idx="${at}"><cx:spPr>${fillXml(g.color)}</cx:spPr></cx:dataPt>` : "";
   }).join("");
   const look = plan.look || chartLook({ type: "treemap" }, null);
+  const layout = plan.spec.kind === "sunburst" ? "sunburst" : "treemap";
   const T = look.title;
   const align = T.align === "center" ? "ctr" : T.align === "right" ? "max" : "min";
   const title = plan.showTitle === false ? "" : `<cx:title pos="t" align="${align}" overlay="0"><cx:tx><cx:rich><a:bodyPr/><a:lstStyle/>` +
@@ -5142,13 +5147,13 @@ function treemapXml(plan, n) {
     `<cx:chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:cx="${CHARTEX_NS}">` +
     `<cx:chartData><cx:data id="0"><cx:strDim type="cat"><cx:f>${xmlEsc(r.catRef)}</cx:f></cx:strDim>` +
     `<cx:numDim type="size"><cx:f>${xmlEsc(r.series[0].valRef)}</cx:f></cx:numDim></cx:data></cx:chartData>` +
-    `<cx:chart>${title}<cx:plotArea><cx:plotAreaRegion><cx:series layoutId="treemap" uniqueId="${id}">` +
+    `<cx:chart>${title}<cx:plotArea><cx:plotAreaRegion><cx:series layoutId="${layout}" uniqueId="${id}">` +
     `<cx:tx><cx:txData><cx:f>${xmlEsc(r.series[0].nameRef)}</cx:f><cx:v>${xmlEsc(s.name)}</cx:v></cx:txData></cx:tx>${points}${labels}` +
-    `<cx:dataId val="0"/><cx:layoutPr><cx:parentLabelLayout val="overlapping"/></cx:layoutPr></cx:series></cx:plotAreaRegion></cx:plotArea>` +
+    `<cx:dataId val="0"/>${layout === "treemap" ? `<cx:layoutPr><cx:parentLabelLayout val="overlapping"/></cx:layoutPr>` : ""}</cx:series></cx:plotAreaRegion></cx:plotArea>` +
     `</cx:chart></cx:chartSpace>`;   // no legend: the tiles name their groups, as in Power BI
 }
 
-/* A chartEx chart's frame (a treemap): Excel 2016 and later show the chart, older Excel a note */
+/* A chartEx chart's frame (a treemap, a sunburst): Excel 2016 and later show the chart, older Excel a note */
 function chartExAnchorXml(ch, rid, id) {
   const cx = Math.round(ch.wPx * CHART_PX_TO_EMU), cy = Math.round(ch.hPx * CHART_PX_TO_EMU);
   return `<xdr:oneCellAnchor><xdr:from><xdr:col>${ch.col - 1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${ch.row - 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>` +
@@ -5160,7 +5165,7 @@ function chartExAnchorXml(ch, rid, id) {
     `</a:graphicData></a:graphic></xdr:graphicFrame></mc:Choice><mc:Fallback><xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="${id}" name="Chart ${id}"/>` +
     `<xdr:cNvSpPr><a:spLocks noTextEdit="1"/></xdr:cNvSpPr></xdr:nvSpPr><xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>` +
     `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="F4F6F5"/></a:solidFill></xdr:spPr><xdr:txBody><a:bodyPr vertOverflow="clip" horzOverflow="clip"/><a:lstStyle/>` +
-    `<a:p><a:r><a:rPr lang="en-US" sz="1100"/><a:t>${xmlEsc(ch.plan.title)}: a treemap, shown in Excel 2016 or later.</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback>` +
+    `<a:p><a:r><a:rPr lang="en-US" sz="1100"/><a:t>${xmlEsc(ch.plan.title)}: a ${ch.plan.spec.kind === "sunburst" ? "sunburst" : "treemap"}, shown in Excel 2016 or later.</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback>` +
     `</mc:AlternateContent><xdr:clientData/></xdr:oneCellAnchor>`;
 }
 
@@ -5185,7 +5190,7 @@ const CHARTEX_COLORS_XML = `<cs:colorStyle xmlns:cs="http://schemas.microsoft.co
  * versions without funnel charts, Excel on older Macs, LibreOffice and Google Sheets show the
  * bars instead, so every reader sees a funnel. NATIVE_FUNNEL = false keeps the bars only.
  */
-const NATIVE_FUNNEL = false;
+const NATIVE_FUNNEL = true;
 const CHARTEX_NS = "http://schemas.microsoft.com/office/drawing/2014/chartex";
 const CHARTEX_REL = "http://schemas.microsoft.com/office/2014/relationships/chartEx";
 const CHARTEX_TYPE = "application/vnd.ms-office.chartex+xml";
@@ -5201,23 +5206,27 @@ function funnelChartExXml(plan) {
   const font = (argb, sz, b) => `<a:defRPr sz="${sz}" b="${b ? 1 : 0}">${fillXml(argb)}<a:latin typeface="Calibri"/></a:defRPr>`;
   const txPr = (argb, sz, b) => `<cx:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr>${font(argb, sz, b)}</a:pPr><a:endParaRPr lang="en-US"/></a:p></cx:txPr>`;
   const dataPts = colors.map((c, i) => (c ? `<cx:dataPt idx="${i}"><cx:spPr>${fillXml(c)}</cx:spPr></cx:dataPt>` : "")).join("");
+  // The title as the report draws it, as on the other charts
+  const look = plan.look || chartLook({ type: "funnel" }, null);
+  const T = look.title;
+  const align = T.align === "center" ? "ctr" : T.align === "right" ? "max" : "min";
+  const title = plan.showTitle === false || !plan.title ? "" : `<cx:title pos="t" align="${align}" overlay="0"><cx:tx><cx:rich><a:bodyPr/><a:lstStyle/>` +
+    `${paraA(plan.title, T, align === "ctr" ? "ctr" : align === "max" ? "r" : "l")}</cx:rich></cx:tx></cx:title>`;
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
     `<cx:chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:cx="${CHARTEX_NS}">` +
     `<cx:chartData><cx:data id="0">` +
     `<cx:strDim type="cat"><cx:f>${xmlEsc(plan.refs.catRef)}</cx:f><cx:lvl ptCount="${cats.length}">${pts(cats)}</cx:lvl></cx:strDim>` +
     `<cx:numDim type="val"><cx:f>${xmlEsc(ref.valRef)}</cx:f><cx:lvl ptCount="${s.values.length}" formatCode="${xmlEsc(s.fmt || "General")}">${pts(s.values)}</cx:lvl></cx:numDim>` +
     `</cx:data></cx:chartData>` +
-    `<cx:chart>` +
-    (plan.title ? `<cx:title pos="t" align="ctr" overlay="0"><cx:tx><cx:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr>${font(C.INK, 1200, true)}</a:pPr>` +
-      `<a:r><a:rPr lang="en-US" sz="1200" b="1">${fillXml(C.INK)}<a:latin typeface="Calibri"/></a:rPr><a:t>${xmlEsc(plan.title)}</a:t></a:r></a:p></cx:rich></cx:tx></cx:title>` : "") +
+    `<cx:chart>${title}` +
     `<cx:plotArea><cx:plotAreaRegion>` +
     `<cx:series layoutId="funnel" uniqueId="{6F7B2C1A-3E4D-4B5A-9C8D-1A2B3C4D5E6F}">` +
     `<cx:tx><cx:txData><cx:f>${xmlEsc(ref.nameRef)}</cx:f><cx:v>${xmlEsc(s.name)}</cx:v></cx:txData></cx:tx>` +
     `<cx:spPr>${fillXml(main)}</cx:spPr>${dataPts}` +
-    `<cx:dataLabels pos="ctr"><cx:numFmt formatCode="${xmlEsc(s.fmt || "General")}" sourceLinked="0"/>${txPr(textOn(main), 900, true)}` +
+    `<cx:dataLabels pos="ctr"><cx:numFmt formatCode="${xmlEsc(labelNumFmt(s.fmt, s.values, look.labels) || "General")}" sourceLinked="0"/>${txPr(textOn(main), 900, true)}` +
     `<cx:visibility seriesName="0" categoryName="0" value="1"/></cx:dataLabels>` +
     `<cx:dataId val="0"/></cx:series>` +
-    `</cx:plotAreaRegion><cx:axis id="0"><cx:catScaling gapWidth="0.06"/><cx:tickLabels/>${txPr(C.SLATE, 900, false)}</cx:axis></cx:plotArea>` +
+    `</cx:plotAreaRegion><cx:axis id="0"><cx:catScaling gapWidth="0.06"/><cx:tickLabels/><cx:spPr><a:ln><a:noFill/></a:ln></cx:spPr>${txPr(C.SLATE, 900, false)}</cx:axis></cx:plotArea>` +
     `</cx:chart>` +
     `<cx:spPr>${fillXml(C.WHITE)}<a:ln w="9525">${fillXml(C.HAIR)}</a:ln></cx:spPr>` +
     `</cx:chartSpace>`;
@@ -5337,23 +5346,27 @@ async function addChartsToFile(buffer, chartSheets) {
     let drawingRels = zip.file(drawingRelsPath) ? await read(drawingRelsPath) : EMPTY_RELS;
 
     let anchors = "";
+    // A chartEx chart (treemap, sunburst, funnel): its part, with Excel's style and colour
+    // parts (Excel won't open the file without both); returns the drawing's link to it
+    const addChartEx = (xml) => {
+      const exPath = `xl/charts/chartEx${exNo}.xml`;
+      zip.file(exPath, xml);
+      zip.file(`xl/charts/style${exNo}.xml`, CHARTEX_STYLE_XML);
+      zip.file(`xl/charts/colors${exNo}.xml`, CHARTEX_COLORS_XML);
+      let exRels = addRel(EMPTY_RELS, "http://schemas.microsoft.com/office/2011/relationships/chartStyle", `style${exNo}.xml`).xml;
+      exRels = addRel(exRels, "http://schemas.microsoft.com/office/2011/relationships/chartColorStyle", `colors${exNo}.xml`).xml;
+      zip.file(`xl/charts/_rels/chartEx${exNo}.xml.rels`, exRels);
+      addType(exPath, CHARTEX_TYPE);
+      addType(`xl/charts/style${exNo}.xml`, "application/vnd.ms-office.chartstyle+xml");
+      addType(`xl/charts/colors${exNo}.xml`, "application/vnd.ms-office.chartcolorstyle+xml");
+      const rel = addRel(drawingRels, CHARTEX_REL, `../charts/chartEx${exNo}.xml`);
+      drawingRels = rel.xml;
+      return rel.id;
+    };
     for (const ch of charts) {
-      if (ch.plan.spec.kind === "treemap") {
-        // A chartEx chart: its part, with Excel's style and colour parts (it needs both)
+      if (ch.plan.spec.kind === "treemap" || ch.plan.spec.kind === "sunburst") {
         exNo++;
-        const exPath = `xl/charts/chartEx${exNo}.xml`;
-        zip.file(exPath, treemapXml(ch.plan, exNo));
-        zip.file(`xl/charts/style${exNo}.xml`, CHARTEX_STYLE_XML);
-        zip.file(`xl/charts/colors${exNo}.xml`, CHARTEX_COLORS_XML);
-        let exRels = addRel(EMPTY_RELS, "http://schemas.microsoft.com/office/2011/relationships/chartStyle", `style${exNo}.xml`).xml;
-        exRels = addRel(exRels, "http://schemas.microsoft.com/office/2011/relationships/chartColorStyle", `colors${exNo}.xml`).xml;
-        zip.file(`xl/charts/_rels/chartEx${exNo}.xml.rels`, exRels);
-        addType(exPath, CHARTEX_TYPE);
-        addType(`xl/charts/style${exNo}.xml`, "application/vnd.ms-office.chartstyle+xml");
-        addType(`xl/charts/colors${exNo}.xml`, "application/vnd.ms-office.chartcolorstyle+xml");
-        const rel = addRel(drawingRels, CHARTEX_REL, `../charts/chartEx${exNo}.xml`);
-        drawingRels = rel.xml;
-        anchors += chartExAnchorXml(ch, rel.id, 3000 + exNo);
+        anchors += chartExAnchorXml(ch, addChartEx(treemapXml(ch.plan, exNo)), 3000 + exNo);
         continue;
       }
       chartNo++;
@@ -5376,12 +5389,7 @@ async function addChartsToFile(buffer, chartSheets) {
             // A funnel: Excel's own funnel chart too, with the bar funnel as its fallback
       if (NATIVE_FUNNEL && ch.plan.funnel) {
         exNo++;
-        const exPath = `xl/charts/chartEx${exNo}.xml`;
-        zip.file(exPath, funnelChartExXml(ch.plan));
-        addType(exPath, CHARTEX_TYPE);
-        const exRel = addRel(drawingRels, CHARTEX_REL, `../charts/chartEx${exNo}.xml`);
-        drawingRels = exRel.xml;
-        anchors += chartAltAnchorXml(ch, exRel.id, rel.id, 1000 + chartNo);
+        anchors += chartAltAnchorXml(ch, addChartEx(funnelChartExXml(ch.plan)), rel.id, 1000 + chartNo);
       } else {
         anchors += chartAnchorXml(ch, rel.id, 1000 + chartNo);
       }
