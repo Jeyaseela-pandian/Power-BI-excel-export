@@ -21,6 +21,9 @@ const DEFAULT_OPTIONS = {
   matchColors: true,
   exhibitNumbers: false,   // "01  Title" numbering of visuals
   visualsAs: "tables",     // "tables" (data tables, as before) | "charts" (real Excel charts)
+  tableNumbers: "exact",   // "exact" (2,471,203) | "short" (2.47M; the cells keep exact values)
+  matrixLayout: "flat",    // "flat" (one row per combination) | "grid" (Power BI's stepped layout)
+  excelSlicers: false,     // the page's slicer fields as Excel slicers on the tables
 };
 const DEFAULT_BRANDING = {
   companyName: "",
@@ -153,10 +156,13 @@ async function openOptionsDrawer() {
   document.querySelectorAll('input[name="optPages"]').forEach((r) => { r.checked = r.value === exportOptions.pages; });
   document.querySelectorAll('input[name="optLayout"]').forEach((r) => { r.checked = r.value === exportOptions.layout; });
     document.querySelectorAll('input[name="optVisualsAs"]').forEach((r) => { r.checked = r.value === (exportOptions.visualsAs || "tables"); });
+  document.querySelectorAll('input[name="optTableNumbers"]').forEach((r) => { r.checked = r.value === (exportOptions.tableNumbers || "exact"); });
+  document.querySelectorAll('input[name="optMatrixLayout"]').forEach((r) => { r.checked = r.value === (exportOptions.matrixLayout || "flat"); });
   $("optCollapse").checked = exportOptions.collapse;
   $("optVisibleRows").value = exportOptions.visibleRows;
   $("optVisibleRows").disabled = !exportOptions.collapse;
   $("optFilters").checked = exportOptions.includeFilters;
+  $("optExcelSlicers").checked = !!exportOptions.excelSlicers;
   $("optNotes").checked = exportOptions.includeNotes;
   $("optMatchColors").checked = exportOptions.matchColors;
   $("optExhibitNumbers").checked = exportOptions.exhibitNumbers;
@@ -263,10 +269,13 @@ function readDrawerOptions() {
     collapse: $("optCollapse").checked,
     visibleRows: visibleRows > 0 ? Math.min(visibleRows, 1000) : DEFAULT_OPTIONS.visibleRows,
     includeFilters: $("optFilters").checked,
+    excelSlicers: $("optExcelSlicers").checked,
     includeNotes: $("optNotes").checked,
     matchColors: $("optMatchColors").checked,
     exhibitNumbers: $("optExhibitNumbers").checked,
     visualsAs: document.querySelector('input[name="optVisualsAs"]:checked')?.value || "tables",
+    tableNumbers: document.querySelector('input[name="optTableNumbers"]:checked')?.value || "exact",
+    matrixLayout: document.querySelector('input[name="optMatrixLayout"]:checked')?.value || "flat",
   };
   saveJson(OPTIONS_KEY, exportOptions);
 }

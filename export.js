@@ -63,7 +63,9 @@ const GUTTER_W = 3;
 const MIN_PAGE_W = 100;    // minimum content width (Excel width units)
 const SNAP_PX = 40;        // stacks starting within this many page pixels share a column
 const BAND_GAP = 2;        // blank rows between bands
-const MATRIX_AS_TABLE = true;   // matrices as normal Excel tables (false: Power BI's stepped layout with groups and subtotals)
+// Matrices: normal Excel tables by default; options.matrixLayout === "grid" gives Power BI's
+// stepped layout (groups and subtotals, a column per column-field value)
+const flatMatrix = (item) => item.type === "pivotTable" && !item.matrixGrid;
 const WIDTH_STEPS = [10, 11, 12, 13, 14, 16, 18, 20, 22, 24, 28, 32, 36, 40, 45, 50, 60];
 const EXECUTIVE = "Executive";
 const BUILT_IN_STYLES = ["TableStyleMedium2", "TableStyleMedium4", "TableStyleMedium7", "TableStyleMedium1", "TableStyleLight9"];
@@ -916,6 +918,36 @@ function readableFormats(header, data) {
   });
 }
 
+/* A table's number columns in display units, as Power BI's "Auto" units show them: one unit
+   per column from its largest value (thousands from 10,000), two decimals; percentages, years,
+   codes and small numbers unchanged. Formats already set for a column are kept. */
+function shortFormats(item) {
+  const own = item.cellFormats || [];
+  const { header, data, numeric, helper } = classifyColumns(item.rows);
+  const cells = data.map((row) => header.map((_, ci) => toCellValue(row[ci])));
+  const readable = readableFormats(header, cells);
+  const isCode = (n) => Number.isInteger(n) && n >= 190001 && n <= 210012;   // 202301: a year and month
+  return header.map((name, ci) => {
+    // A column already given a format keeps it, unless it is a plain number format
+    if (own[ci] && !/^("[^"]*"|[$€£¥₹])?#,##0(\.0+)?$/.test(own[ci])) return own[ci];
+    const nums = cells.map((r) => r[ci]).filter((c) => typeof c.value === "number");
+    if (!numeric[ci] || helper[ci] || !nums.length || /\b(year|month|code|zip|postal|phone)\b/i.test(name) || nums.every((c) => isCode(c.value))) return own[ci] || null;
+    const base = own[ci] || readable[ci] || (nums.find((c) => c.numFmt) || {}).numFmt || "#,##0";
+    if (base.includes("%") || /[dmyhs]/i.test(base.replace(/"[^"]*"/g, ""))) return own[ci] || null;   // percentages, dates
+    const top = maxAbsOf(nums.map((c) => c.value));
+    return top >= 1e4 ? unitFormat(base, autoUnit(top), 2) : own[ci] || null;
+  });
+}
+
+/* A total in short numbers: a larger unit when it outgrows its column's (1.16M under a column
+   of thousands); other formats unchanged */
+function unitForTotal(fmt, value) {
+  const m = String(fmt || "").match(/^(.*?)(,+)"(K|M|bn|T)"$/);
+  if (!m || typeof value !== "number") return fmt;
+  const unit = autoUnit(Math.abs(value));
+  return unit > Math.pow(1000, m[2].length) ? unitFormat(m[1], unit, fmtDecimals(m[1])) : fmt;
+}
+
 /* Roughly how Excel shows a value with a number format (used to size columns) */
 function displayText(value, fmt) {
   if (value instanceof Date) return dateText(value, /h/.test(fmt || ""));
@@ -1559,7 +1591,7 @@ function writeTotalsRow(ws, row, col, item, hr, n, lay, table) {
     const values = table.data.map((r) => r[ci].value);
     cell.value = { formula: `SUBTOTAL(${SUBTOTAL_FN[kind]},${colRange(ws, col + ci, hr + 1, hr + n)})`, result: subtotalOf(kind, values) };
     const fmt = table.formats[ci] || (table.data.find((r) => typeof r[ci].value === "number") || [])[ci]?.numFmt;
-    if (fmt) cell.numFmt = fmt;
+    if (fmt) cell.numFmt = unitForTotal(fmt, cell.value.result);
     cell.alignment = { vertical: "middle", horizontal: "right", indent: 2 };
   });
   if (!kinds[0]) {
@@ -1599,7 +1631,7 @@ function someExpanded(expansion, role) {
 function levelsShown(item, info, role) {
   const list = ((info && info.roles) || {})[role] || [];
   const shown = shownLevels(list);
-  if (item.type !== "pivotTable" || !MATRIX_AS_TABLE || (role !== "Rows" && role !== "Columns") || shown.length === list.length) return shown;
+  if (!flatMatrix(item) || (role !== "Rows" && role !== "Columns") || shown.length === list.length) return shown;
   if (!someExpanded(info.expansion, role)) return shown;
   const first = list.indexOf(shown[0]);
   return first < 0 ? list : list.slice(first);
@@ -1767,6 +1799,36 @@ async function captureLiveDrill(report) {
   }
 }
 
+/*
+ * Click selections in the report (a bar, a slice, a row clicked: Power BI cross-filters or
+ * cross-highlights the other visuals), per page, from the embed's "dataSelected" event: the
+ * visual clicked and the values picked, by field. Clicking empty space clears a page's.
+ */
+const liveSelections = {};
+function recordSelection(detail) {
+  const page = detail && detail.page && detail.page.name;
+  if (!page) return;
+  const byField = new Map();
+  for (const point of detail.dataPoints || []) {
+    for (const id of point.identity || []) {
+      const t = id.target || {};
+      const field = t.column || t.hierarchyLevel || t.hierarchy || t.measure;
+      if (!field || id.equals === undefined || id.equals === null) continue;
+      const value = id.equals instanceof Date ? id.equals.toLocaleDateString() : String(id.equals);
+      if (!byField.has(field)) byField.set(field, []);
+      if (!byField.get(field).includes(value)) byField.get(field).push(value);
+    }
+  }
+  if (!byField.size) { delete liveSelections[page]; return; }
+  liveSelections[page] = {
+    visual: (detail.visual && (detail.visual.title || detail.visual.name)) || "",
+    parts: [...byField].map(([field, values]) => ({ field, values: values.length > 6 ? [...values.slice(0, 6), `+${values.length - 6} more`] : values })),
+  };
+}
+function clearSelections() {
+  Object.keys(liveSelections).forEach((k) => delete liveSelections[k]);
+}
+
 /* A captured bookmark's state: JSON, or base64 of JSON or of gzipped JSON */
 async function decodeBookmarkState(state) {
   if (!state) return null;
@@ -1802,6 +1864,7 @@ function withLiveDrill(item, info) {
 async function loadDrillLevels(collected, options) {
   for (const { data } of collected) {
     for (const item of data.items) {
+      item.matrixGrid = options.matrixLayout === "grid";
       const info = withLiveDrill(item, visualInfo(options.reportColors, item.page, item.name));
       const note = await rollUpToDrillLevel(item, info, [...(data.queryFilters || []), ...(item.visualFilters || [])]);
       if (note) data.notes.push(note);
@@ -1865,7 +1928,7 @@ function matrixLayout(item, info) {
     const ci = vc[k];
     if (ci < 0) return null;
     const fmt = formats[ci] || (cells.find((r) => typeof r[ci].value === "number") || [])[ci]?.numFmt;
-    return { k, ci, name: header[ci], kind: totalKind(f.field, header[ci], fmt) };
+    return { k, ci, name: header[ci], fmt, kind: totalKind(f.field, header[ci], fmt) };
   }).filter(Boolean);
 
   // Column values in Power BI's order (a value missing from the first rows still lands in place)
@@ -1915,7 +1978,8 @@ function matrixLayout(item, info) {
   columns.forEach((c, i) => {
     if (c.total) item.rowTotals[i + 1] = { kind: c.m.kind, of: columns.map((x, j) => (!x.total && x.m === c.m ? j + 1 : -1)).filter((j) => j > 0) };
   });
-  item.cellFormats = [null, ...columns.map((c) => formats[c.m.ci] || null)];
+  // Each value column in its measure's format: a readable one, else the export's own ($, %)
+  item.cellFormats = [null, ...columns.map((c) => c.m.fmt || null)];
 
   if (rc.length === 1) {
     item.rows = [[labelHead, ...columns.map((c) => c.head)], ...leafList.map((l) => [l.labels[0], ...columns.map((c) => valueOf(l, c))])];
@@ -2596,6 +2660,7 @@ function writeSteppedMatrix(ws, r, col, item, widths, lay, number, closeRow) {
         cell.value = t ? { formula: rowFormula(ws, ROW_TOTAL_FN[t.kind], sr, t.of.map((c) => col + c)), result: typeof v === "number" ? v : 0 } : v;
       } else if (x.type === "total" && fnOf(ci)) {
         cell.value = { formula: `SUBTOTAL(${fnOf(ci)},${colRange(ws, col + ci, hr + 1 + x.from, hr + 1 + x.to)})`, result: resultOf(ci, x.from, x.to) };
+        if (formats[ci]) cell.numFmt = unitForTotal(formats[ci], cell.value.result);
       }
     });
   });
@@ -2613,7 +2678,10 @@ function writeSteppedMatrix(ws, r, col, item, widths, lay, number, closeRow) {
     if (ci === 0) { cell.value = "Total"; cell.alignment = { vertical: "middle", indent: 1 }; return; }
     cell.alignment = { vertical: "middle", horizontal: "right", indent: 2 };
     if (formats[ci]) cell.numFmt = formats[ci];
-    if (fnOf(ci) && n) cell.value = { formula: `SUBTOTAL(${fnOf(ci)},${colRange(ws, col + ci, hr + 1, hr + n)})`, result: resultOf(ci, 0, n - 1) };
+    if (fnOf(ci) && n) {
+      cell.value = { formula: `SUBTOTAL(${fnOf(ci)},${colRange(ws, col + ci, hr + 1, hr + n)})`, result: resultOf(ci, 0, n - 1) };
+      if (formats[ci]) cell.numFmt = unitForTotal(formats[ci], cell.value.result);
+    }
   });
 
   if (item.tableFormat) {
@@ -3017,6 +3085,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
   // A new card with several measures: one tile per measure
   items = items.flatMap((item) => splitCards(item, visualInfo(lay.reportColors, item.page, item.name)));
   for (const item of items) {
+    item.matrixGrid = options.matrixLayout === "grid";
     const info = atDrillLevel(item, withLiveDrill(item, visualInfo(lay.reportColors, item.page, item.name)));
     if (item.isKpi) mainValueFirst(item, info);
     if ((customVisual(item.type) || {}).rule === "nested") nestedBarsRows(item, info, colorNotes);
@@ -3024,7 +3093,9 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     if ((customVisual(item.type) || {}).layout === "bins") histogramRows(item, info);
     if ((customVisual(item.type) || {}).layout === "trend") dualKpiTrend(item, info, !!lay.palette);
     if (item.type === "kpi" && !item.isKpi) kpiTrend(item, info, !!lay.palette);
-    if (item.type === "pivotTable" && info && !MATRIX_AS_TABLE) matrixLayout(item, info);
+    if (item.type === "pivotTable" && info && item.matrixGrid) matrixLayout(item, info);
+    // Short numbers (2.47M): each number column in display units; the cells keep exact values
+    if (options.tableNumbers === "short" && !item.isKpi && !item.trend) item.cellFormats = shortFormats(item);
     if (item.sparklines && item.sparklines.length && !item.stepped) addSparklineColumns(item);
     if (TABLE_VISUAL_TYPES.includes(item.type) && !item.stepped) item.totals = totalsPlan(item, info);
     // A title turned off in the report isn't shown either (it is often an internal name such
@@ -3126,7 +3197,9 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
         if (item.stepped) {
           outline = Math.max(outline, writeSteppedMatrix(ws, r, col, item, widths, lay, number, closeRow));
         } else {
-          const table = writeDataTable(ws, r, col, item, nameTable(item.displayTitle), widths, lay, number);
+          const tableName = nameTable(item.displayTitle);
+          const table = writeDataTable(ws, r, col, item, tableName, widths, lay, number);
+          if (lay.slicerFields.length) tableSlicers(item, tableName, r + head - 1, lay);
           // The totals row is the closing row; a "rows grouped" note goes on the row below
           if (item.totals) writeTotalsRow(ws, closeRow, col, item, r + head - 1, n, lay, table);
         }
@@ -3185,6 +3258,29 @@ async function slicerFieldNames(visual, fallback) {
   return fallback;
 }
 
+/* A table's Excel slicers: one per page slicer field among its columns, with its item count */
+function tableSlicers(item, tableName, headerRow, lay) {
+  const header = uniqueHeaders(item.rows[0]);
+  const lower = header.map((h) => String(h ?? "").trim().toLowerCase());
+  for (const field of lay.slicerFields) {
+    const ci = lower.indexOf(String(field).trim().toLowerCase());
+    if (ci < 0) continue;
+    const count = new Set(item.rows.slice(1).map((r) => String(r[ci] ?? ""))).size;
+    (lay.slicers = lay.slicers || []).push({ tableName, column: header[ci], caption: header[ci], title: item.displayTitle, row: headerRow, count });
+  }
+}
+
+/* A slicer's fields, named as the visuals' exports name them (a hierarchy slicer: each level) */
+async function slicerColumns(visual) {
+  try {
+    const result = await visual.exportData(models.ExportDataType.Summarized, 1);
+    const header = parseCsv(result.data)[0] || [];
+    return (customVisual(visual.type) ? header.slice(0, 1) : header).map((h) => String(h).trim()).filter(Boolean);
+  } catch (e) {
+    return [];
+  }
+}
+
 function isHiddenVisual(v) {
   return !!(v.layout && v.layout.displayState && v.layout.displayState.mode === models.VisualContainerDisplayMode.Hidden);
 }
@@ -3240,10 +3336,13 @@ async function collectPage(page, options, onProgress, isCancelled) {
   const queryFilters = [...await filtersOf(embeddedReport), ...await filtersOf(page)];
   if (options.includeFilters) {
     filterParts(queryFilters).forEach((p) => filterChips.push({ all: false, ...p }));
+    // What the user clicked in the report (a bar, a slice): it cross-filters the page as exported
+    if (options.selection) options.selection.parts.forEach((p) => filterChips.push({ all: false, field: `${p.field} (selected)`, value: p.values.join(", ") }));
   }
 
   const items = [];
   const notes = [];
+  const slicerFields = [];   // "Excel slicers": the fields the page's slicers filter
   for (let i = 0; i < visuals.length; i++) {
     if (isCancelled()) throw { cancelled: true };
     const v = visuals[i];
@@ -3253,6 +3352,7 @@ async function collectPage(page, options, onProgress, isCancelled) {
     // Slicers become filter chips: "Field  selection", or "Field  All". A hidden slicer still
     // filters the page (bookmarks often hide them), so it gets a chip too.
     if (isSlicerType(v.type)) {
+      if (options.excelSlicers && !isHiddenVisual(v)) slicerFields.push(...await slicerColumns(v));
       if (!options.includeFilters) {
         try { queryFilters.push(...((await v.getSlicerState()).filters || [])); } catch (e) { /* not readable */ }
         continue;
@@ -3315,7 +3415,7 @@ async function collectPage(page, options, onProgress, isCancelled) {
       log(`Export failed for "${title}": ${errorText(e)}`);
     }
   }
-  return { filterChips, items, notes, queryFilters };
+  return { filterChips, items, notes, queryFilters, slicerFields: [...new Set(slicerFields)] };
 }
 
 /* Visuals whose data Power BI doesn't export, by type: what to call them in a note */
@@ -3369,6 +3469,7 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
     tableStyle: branding.tableStyle || EXECUTIVE,
     palette: options.matchColors ? options.palette : null,
     reportColors: options.matchColors ? options.reportColors || null : null,
+    slicerFields: options.excelSlicers ? data.slicerFields || [] : [],
   };
   const ws = wb.addWorksheet(sheetName, {
     views: [{ showGridLines: false, zoomScale: 100 }],
@@ -3555,6 +3656,7 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
     tables: layout.tableCount,
     kpis: data.items.filter((it) => it.isKpi).length,
     charts: lay.charts || [],   // charts mode: charts to add to this sheet (Step 9)
+    slicers: (lay.slicers || []).map((x) => ({ ...x, col: bandEnd + 2 })),   // Excel slicers, right of the page (addSlicersToFile)
     sparklines: lay.sparklines || [],   // trend cards' sparklines, added by addSparklinesToFile
     trendSheet: lay.trendSheet && lay.trendSheet.blocks.length ? lay.trendSheet : null,
   };
@@ -3591,7 +3693,14 @@ const EXCEL_CHARTS = {
   treemap: { kind: "treemap" },   // an Excel treemap (Excel 2016 and later)
   RadarChart1446119667547: { kind: "radar" },   // the AppSource Radar Chart: Excel's own filled radar
   Sunburst1445472000808: { kind: "sunburst" },   // the AppSource Sunburst: an Excel sunburst (Excel 2016 and later)
+  Histogram1445664487616: { kind: "bar", dir: "col", grouping: "clustered", gap: 0 },   // the AppSource Histogram: its own bins, as touching columns
+  TornadoChart1452517688218: { kind: "bar", dir: "bar", grouping: "clustered", mirror: true },   // the AppSource Tornado: two sides back to back
 };
+// AppSource box & whisker visuals (several makers): Excel's own box & whisker chart (Excel 2016 and later)
+const BOX_WHISKER_TYPE = /box.?(and.?)?whisker|boxplot/i;
+function chartSpecOf(type) {
+  return EXCEL_CHARTS[type] || (BOX_WHISKER_TYPE.test(String(type || "")) ? { kind: "boxWhisker" } : null);
+}
 const CHART_SCALE = 1;          // Power BI page pixels → chart pixels
 const CHART_MIN_W = 360;        // smallest chart, in pixels
 const CHART_MIN_H = 220;
@@ -3618,13 +3727,18 @@ function chartBlockSize(item) {
  * is on. Returns null when the visual can't be an Excel chart (it then stays a table).
  */
 function chartPlan(item) {
-  const spec = EXCEL_CHARTS[item.type];
+  const spec = chartSpecOf(item.type);
   if (!spec || item.isKpi) return null;
+  // A tornado is a bar chart of its two sides, the first drawn to the left
+  if (spec.mirror) {
+    const plan = chartPlan({ ...item, type: "clusteredBarChart" });
+    return plan && mirrorPlan(plan, spec);
+  }
   // Scatter, waterfall and funnel have their own builders; any problem keeps the visual as a table
-  if (spec.kind === "scatter" || spec.kind === "waterfall" || spec.kind === "funnel" || spec.kind === "treemap" || spec.kind === "sunburst") {
+  if (["scatter", "waterfall", "funnel", "treemap", "sunburst", "boxWhisker"].includes(spec.kind)) {
     try {
       return spec.kind === "scatter" ? scatterPlan(item) : spec.kind === "waterfall" ? waterfallPlan(item)
-        : spec.kind === "funnel" ? funnelPlan(item) : treemapPlan(item, spec);
+        : spec.kind === "funnel" ? funnelPlan(item) : spec.kind === "boxWhisker" ? boxPlan(item) : treemapPlan(item, spec);
     } catch (e) {
       log(`Chart for "${item.title}" not drawn, kept as a table: ${errorText(e)}`);
       return null;
@@ -3781,6 +3895,53 @@ function chartPlan(item) {
     else if (colors.tabColors) pointColors = categories.map((c) => colors.tabColors[firstRowOf(c)] || null);
   }
   return { ...base, series, pointColors };
+}
+
+/* A number format without a minus sign: a tornado's left side reads as positive */
+function unsignedNumFmt(fmt) {
+  const first = String(fmt || "General").split(";")[0];
+  return `${first};${first}`;
+}
+
+/* Tornado: its first two sides (legend values or measures), the first drawn to the left as
+   negative bars, both labelled without a minus. One side only: a plain bar chart. */
+function mirrorPlan(plan, spec) {
+  const sides = plan.series.filter((s) => !s.line);
+  if (sides.length < 2) return plan;
+  const [left, right] = sides;
+  return {
+    ...plan, spec,
+    series: [
+      { ...left, values: left.values.map((v) => (typeof v === "number" ? -v : v)), fmt: unsignedNumFmt(left.fmt) },
+      { ...right, fmt: unsignedNumFmt(right.fmt) },
+    ],
+  };
+}
+
+/* Box & whisker: every row's value with its category; Excel's chart works out each category's
+   quartiles, whiskers and outliers itself (one box when there is no category) */
+function boxPlan(item) {
+  const t = chartColumns(item);
+  const info = item.colorInfo || null;
+  const roles = (info && info.roles) || {};
+  const entries = info ? fieldsByColumn(t.header, Object.values(roles).flat()) : t.header.map(() => null);
+  const inRole = (ci, ...names) => names.some((r) => (roles[r] || []).includes(entries[ci]));
+  const valueCol = t.measureCols.find((ci) => inRole(ci, "Values", "Value", "Y", "Measure")) ?? t.measureCols[t.measureCols.length - 1];
+  if (valueCol === undefined) return null;
+  const catCol = t.textCols.find((ci) => inRole(ci, "Category", "Axis", "Group")) ?? t.textCols[0] ?? -1;
+  const rows = t.data.filter((r) => t.num(r[valueCol]) !== null);
+  if (rows.length < 2) return null;
+  const color = (item.colors && item.colors.series && item.colors.series[valueCol]) || null;
+  return {
+    spec: { kind: "boxWhisker" },
+    title: item.displayTitle || item.title,
+    catName: catCol >= 0 ? t.header[catCol] : "Category",
+    valueName: t.header[valueCol],
+    axes: (info && info.axes) || null,
+    categories: rows.map((r) => (catCol >= 0 ? t.key(r, catCol) || "(Blank)" : t.header[valueCol])),
+    series: [{ name: t.header[valueCol], values: rows.map((r) => t.num(r[valueCol])), fmt: t.formatOf(valueCol), color }],
+    pointColors: null,
+  };
 }
 
 /*
@@ -3995,6 +4156,7 @@ function waterfallPlan(item) {
       { name: "Decrease", values: dec, fmt: negFmt, color: down },
       { name: "Total", values: tot, fmt: running < 0 ? negFmt : fmt, color: total },
       { name: t.header[valueCol], values: [...ends, running], fmt, hidden: true, noLegend: true },   // carries the labels
+      { name: t.header[valueCol], values: [...steps.map((s) => s.value), running], fmt, hidden: true, noLegend: true, dataOnly: true },   // Excel's own waterfall
     ],
     steps: [...steps.map((s) => s.value), running],
     axis, fmt,
@@ -4878,7 +5040,7 @@ function chartXml(plan) {
   }
 
   let body = "";
-  let hidden = series.map((s, i) => (s.noLegend ? i : -1)).filter((i) => i >= 0);
+  let hidden = series.map((s, i) => (s.noLegend && !s.dataOnly ? i : -1)).filter((i) => i >= 0);
   let plotLayout = "<c:layout/>";
   if (scatter) {
     body = scatterXml(plan);
@@ -4997,6 +5159,8 @@ function cartesianXml(plan, look, box, hidden) {
   // The value axis like Power BI's: room for its labels, a tick every ~55 px up or ~100 px across
   const titles = axisTitles(plan, main, lines);
   const mainVals = stacked ? stackExtents(main.map(([s]) => s), n) : main.flatMap(([s]) => s.values);
+  // A tornado's axis runs as far left as right
+  if (spec.mirror) { const m = maxAbsOf(mainVals); mainVals.push(m, -m); }
   const refUsable = (l) => l.kind !== "constant" || l.axis === (horizontal ? "x" : "y");
   const refConst = look.refLines.filter((l) => l.kind === "constant" && refUsable(l)).map((l) => l.value);
   const legendBand = box.legendOn ? (box.side === "t" || box.side === "b" ? box.legendH + 6 : 0) : 0;
@@ -5011,8 +5175,9 @@ function cartesianXml(plan, look, box, hidden) {
   const axis = look.val.log ? null
     : pct ? valueScale([0, 1], axisPx, gapPx, { zero: true, round: true, start: 0, end: 1 })
       : valueScale([...mainVals, ...refConst], axisPx, gapPx, { zero: isBar, round: roomForLabels, start: look.val.start, end: look.val.end });
+  if (spec.mirror && axis) { axis.max = Math.max(axis.max, -axis.min); axis.min = -axis.max; }
   const fmt0 = (main[0] ? main[0][0] : series[0]).fmt;
-  const valFmt = pct ? stepFormat("0%", axis, []) : axisNumFmt(fmt0, axis, look.val, mainVals);
+  const valFmt = pct ? stepFormat("0%", axis, []) : spec.mirror ? unsignedNumFmt(axisNumFmt(fmt0, axis, look.val, mainVals)) : axisNumFmt(fmt0, axis, look.val, mainVals);
   const labelVals = shown.flatMap((s) => s.values);
   const lineLookOf = (s) => look.lines.series[normalizeField(s.name)] || look.lines;
   const trendOn = !!look.trend && !pct && !stacked && (kind === "line" || (isBar && grouping === "clustered"));
@@ -5024,10 +5189,11 @@ function cartesianXml(plan, look, box, hidden) {
     // quarter of the category is gap); clustered bars share that room
     const share = look.cat.padding === null || look.cat.padding === undefined ? 0.25 : Math.min(0.9, Math.max(0, look.cat.padding / 100 + 0.05));
     const per = grouping === "clustered" ? Math.max(1, shown.length) : 1;
-    const gapWidth = Math.round(Math.min(500, share / (1 - share) * per * 100));
+    const gapWidth = spec.gap !== undefined ? spec.gap : Math.round(Math.min(500, share / (1 - share) * per * 100));
     let sers = main.map(([s, i]) => chartSeriesXml("bar", {
       ...s,
-      labelsXml: labelsOn && !s.hidden ? seriesLabelsXml("bar", grouping, s.color || (plan.pointColors || []).find(Boolean), labelNumFmt(s.fmt, labelVals, look.labels, 1), look.labels) : "",
+      labelsXml: labelsOn && !s.hidden ? seriesLabelsXml("bar", grouping, s.color || (plan.pointColors || []).find(Boolean),
+        spec.mirror ? unsignedNumFmt(labelNumFmt(s.fmt, labelVals, look.labels, 1)) : labelNumFmt(s.fmt, labelVals, look.labels, 1), look.labels) : "",
       trendXml: trendOn && !combineTrend && !s.hidden ? trendlineXml(look.trend) : "",
     }, i, plan, refs.series[i])).join("");
     // Total labels over each stack: an empty last segment labelled with the stack's total
@@ -5041,7 +5207,7 @@ function cartesianXml(plan, look, box, hidden) {
       sers += chartSeriesXml("bar", { name: "Total", values: totals.map(() => 0), fmt: "General", literal: true, hidden: true, labelsXml: textLabelsXml(pts, look.totals.text) }, idx, plan, null);
     }
     groups += `<c:barChart><c:barDir val="${horizontal ? "bar" : "col"}"/><c:grouping val="${grouping}"/><c:varyColors val="0"/>${sers}` +
-      `<c:gapWidth val="${gapWidth}"/>${grouping !== "clustered" ? '<c:overlap val="100"/>' : ""}<c:axId val="${A1}"/><c:axId val="${A2}"/></c:barChart>`;
+      `<c:gapWidth val="${gapWidth}"/>${grouping !== "clustered" || spec.mirror ? '<c:overlap val="100"/>' : ""}<c:axId val="${A1}"/><c:axId val="${A2}"/></c:barChart>`;
   } else if (kind === "area") {
     // Power BI's area: a see-through fill under a solid line along its top
     const tops = [];
@@ -5159,13 +5325,13 @@ function chartExAnchorXml(ch, rid, id) {
   return `<xdr:oneCellAnchor><xdr:from><xdr:col>${ch.col - 1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${ch.row - 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>` +
     `<xdr:ext cx="${cx}" cy="${cy}"/><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">` +
     `<mc:Choice xmlns:cx1="http://schemas.microsoft.com/office/drawing/2015/9/8/chartex" Requires="cx1"><xdr:graphicFrame macro="">` +
-    `<xdr:nvGraphicFramePr><xdr:cNvPr id="${id}" name="Chart ${id}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
+    `<xdr:nvGraphicFramePr><xdr:cNvPr id="${id}" name="Chart ${id}"${altAttr(ch.plan)}/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
     `<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="${CHARTEX_NS}">` +
     `<cx:chart xmlns:cx="${CHARTEX_NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="${rid}"/>` +
-    `</a:graphicData></a:graphic></xdr:graphicFrame></mc:Choice><mc:Fallback><xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="${id}" name="Chart ${id}"/>` +
+    `</a:graphicData></a:graphic></xdr:graphicFrame></mc:Choice><mc:Fallback><xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="${id}" name="Chart ${id}"${altAttr(ch.plan)}/>` +
     `<xdr:cNvSpPr><a:spLocks noTextEdit="1"/></xdr:cNvSpPr></xdr:nvSpPr><xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>` +
     `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="F4F6F5"/></a:solidFill></xdr:spPr><xdr:txBody><a:bodyPr vertOverflow="clip" horzOverflow="clip"/><a:lstStyle/>` +
-    `<a:p><a:r><a:rPr lang="en-US" sz="1100"/><a:t>${xmlEsc(ch.plan.title)}: a ${ch.plan.spec.kind === "sunburst" ? "sunburst" : "treemap"}, shown in Excel 2016 or later.</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback>` +
+    `<a:p><a:r><a:rPr lang="en-US" sz="1100"/><a:t>${xmlEsc(ch.plan.title)}: a ${chartKindName(ch.plan.spec)}, shown in Excel 2016 or later.</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback>` +
     `</mc:AlternateContent><xdr:clientData/></xdr:oneCellAnchor>`;
 }
 
@@ -5173,7 +5339,7 @@ function chartExAnchorXml(ch, rid, id) {
 function chartAnchorXml(ch, rid, id) {
   const cx = Math.round(ch.wPx * CHART_PX_TO_EMU), cy = Math.round(ch.hPx * CHART_PX_TO_EMU);
   return `<xdr:oneCellAnchor><xdr:from><xdr:col>${ch.col - 1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${ch.row - 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>` +
-    `<xdr:ext cx="${cx}" cy="${cy}"/><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="${id}" name="Chart ${id}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
+    `<xdr:ext cx="${cx}" cy="${cy}"/><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="${id}" name="Chart ${id}"${altAttr(ch.plan)}/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
     `<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">` +
     `<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="${rid}"/>` +
     `</a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:oneCellAnchor>`;
@@ -5181,6 +5347,10 @@ function chartAnchorXml(ch, rid, id) {
 
 /* Excel's standard chart style and colour parts: a chartEx chart (a treemap) won't load without them */
 const CHARTEX_STYLE_XML = `<cs:chartStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" id="410"><cs:axisTitle><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="bg1"><a:lumMod val="65000"/></a:schemeClr></a:solidFill><a:ln w="19050"><a:solidFill><a:schemeClr val="bg1"/></a:solidFill></a:ln></cs:spPr><cs:defRPr sz="900"/></cs:axisTitle><cs:categoryAxis><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr><cs:defRPr sz="900"/></cs:categoryAxis><cs:chartArea mods="allowNoFillOverride allowNoLineOverride"><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="bg1"/></a:solidFill><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr><cs:defRPr sz="1000"/></cs:chartArea><cs:dataLabel><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="lt1"/></cs:fontRef><cs:defRPr sz="900"/></cs:dataLabel><cs:dataLabelCallout><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="dk1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="lt1"/></a:solidFill><a:ln><a:solidFill><a:schemeClr val="dk1"><a:lumMod val="25000"/><a:lumOff val="75000"/></a:schemeClr></a:solidFill></a:ln></cs:spPr><cs:defRPr sz="900"/><cs:bodyPr rot="0" spcFirstLastPara="1" vertOverflow="clip" horzOverflow="clip" vert="horz" wrap="square" lIns="36576" tIns="18288" rIns="36576" bIns="18288" anchor="ctr" anchorCtr="1"><a:spAutoFit/></cs:bodyPr></cs:dataLabelCallout><cs:dataPoint><cs:lnRef idx="0"/><cs:fillRef idx="0"><cs:styleClr val="auto"/></cs:fillRef><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:ln w="19050"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></cs:spPr></cs:dataPoint><cs:dataPoint3D><cs:lnRef idx="0"/><cs:fillRef idx="0"><cs:styleClr val="auto"/></cs:fillRef><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></cs:spPr></cs:dataPoint3D><cs:dataPointLine><cs:lnRef idx="0"><cs:styleClr val="auto"/></cs:lnRef><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="28575" cap="rnd"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:round/></a:ln></cs:spPr></cs:dataPointLine><cs:dataPointMarker><cs:lnRef idx="0"/><cs:fillRef idx="0"><cs:styleClr val="auto"/></cs:fillRef><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:ln w="9525"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></cs:spPr></cs:dataPointMarker><cs:dataPointMarkerLayout symbol="circle" size="5"/><cs:dataPointWireframe><cs:lnRef idx="0"><cs:styleClr val="auto"/></cs:lnRef><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="28575" cap="rnd"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:round/></a:ln></cs:spPr></cs:dataPointWireframe><cs:dataTable><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:spPr><a:ln w="9525"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:schemeClr></a:solidFill></a:ln></cs:spPr><cs:defRPr sz="900"/></cs:dataTable><cs:downBar><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="dk1"/></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="dk1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></a:solidFill><a:ln w="9525"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></a:solidFill></a:ln></cs:spPr></cs:downBar><cs:dropLine><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="35000"/><a:lumOff val="65000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr></cs:dropLine><cs:errorBar><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr></cs:errorBar><cs:floor><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef></cs:floor><cs:gridlineMajor><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr></cs:gridlineMajor><cs:gridlineMinor><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr></cs:gridlineMinor><cs:hiLoLine><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="75000"/><a:lumOff val="25000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr></cs:hiLoLine><cs:leaderLine><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="35000"/><a:lumOff val="65000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr></cs:leaderLine><cs:legend><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:defRPr sz="900"/></cs:legend><cs:plotArea mods="allowNoFillOverride allowNoLineOverride"><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef></cs:plotArea><cs:plotArea3D mods="allowNoFillOverride allowNoLineOverride"><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef></cs:plotArea3D><cs:seriesAxis><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:schemeClr></a:solidFill><a:round/></a:ln></cs:spPr><cs:defRPr sz="900"/></cs:seriesAxis><cs:seriesLine><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="9525" cap="flat"><a:solidFill><a:srgbClr val="D9D9D9"/></a:solidFill><a:round/></a:ln></cs:spPr></cs:seriesLine><cs:title><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:defRPr sz="1400"/></cs:title><cs:trendline><cs:lnRef idx="0"><cs:styleClr val="auto"/></cs:lnRef><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef><cs:spPr><a:ln w="19050" cap="rnd"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:prstDash val="sysDash"/></a:ln></cs:spPr></cs:trendline><cs:trendlineLabel><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:defRPr sz="900"/></cs:trendlineLabel><cs:upBar><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="dk1"/></cs:fontRef><cs:spPr><a:solidFill><a:schemeClr val="lt1"/></a:solidFill><a:ln w="9525"><a:solidFill><a:schemeClr val="tx1"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:schemeClr></a:solidFill></a:ln></cs:spPr></cs:upBar><cs:valueAxis><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr></cs:fontRef><cs:defRPr sz="900"/></cs:valueAxis><cs:wall><cs:lnRef idx="0"/><cs:fillRef idx="0"/><cs:effectRef idx="0"/><cs:fontRef idx="minor"><a:schemeClr val="tx1"/></cs:fontRef></cs:wall></cs:chartStyle>`;
+// The same style with data labels in dark grey, as Excel styles a waterfall's (a treemap's are
+// white, on its tiles); Excel draws chartEx labels in the style's colour
+const CHARTEX_STYLE_DARK_LABELS = CHARTEX_STYLE_XML.replace(/(<cs:dataLabel>(?:(?!<\/cs:dataLabel>).)*?<cs:fontRef idx="minor">)<a:schemeClr val="lt1"\/>/,
+  '$1<a:schemeClr val="tx1"><a:lumMod val="65000"/><a:lumOff val="35000"/></a:schemeClr>');
 const CHARTEX_COLORS_XML = `<cs:colorStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" meth="cycle" id="10"><a:schemeClr val="accent1"/><a:schemeClr val="accent2"/><a:schemeClr val="accent3"/><a:schemeClr val="accent4"/><a:schemeClr val="accent5"/><a:schemeClr val="accent6"/><cs:variation/><cs:variation><a:lumMod val="60000"/></cs:variation><cs:variation><a:lumMod val="80000"/><a:lumOff val="20000"/></cs:variation><cs:variation><a:lumMod val="80000"/></cs:variation><cs:variation><a:lumMod val="60000"/><a:lumOff val="40000"/></cs:variation><cs:variation><a:lumMod val="50000"/></cs:variation><cs:variation><a:lumMod val="70000"/><a:lumOff val="30000"/></cs:variation><cs:variation><a:lumMod val="70000"/></cs:variation><cs:variation><a:lumMod val="50000"/><a:lumOff val="50000"/></cs:variation></cs:colorStyle>`;
 
 /* ── Adding the charts to the finished .xlsx ── */
@@ -5208,10 +5378,7 @@ function funnelChartExXml(plan) {
   const dataPts = colors.map((c, i) => (c ? `<cx:dataPt idx="${i}"><cx:spPr>${fillXml(c)}</cx:spPr></cx:dataPt>` : "")).join("");
   // The title as the report draws it, as on the other charts
   const look = plan.look || chartLook({ type: "funnel" }, null);
-  const T = look.title;
-  const align = T.align === "center" ? "ctr" : T.align === "right" ? "max" : "min";
-  const title = plan.showTitle === false || !plan.title ? "" : `<cx:title pos="t" align="${align}" overlay="0"><cx:tx><cx:rich><a:bodyPr/><a:lstStyle/>` +
-    `${paraA(plan.title, T, align === "ctr" ? "ctr" : align === "max" ? "r" : "l")}</cx:rich></cx:tx></cx:title>`;
+  const title = chartExTitleXml(plan, look);
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
     `<cx:chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:cx="${CHARTEX_NS}">` +
     `<cx:chartData><cx:data id="0">` +
@@ -5232,15 +5399,147 @@ function funnelChartExXml(plan) {
     `</cx:chartSpace>`;
 }
 
-/* A chart frame that shows Excel's own funnel where Excel has it, else the bar funnel */
-function chartAltAnchorXml(ch, exRid, rid, id) {
+/* A chartEx chart's title, as the report draws it */
+function chartExTitleXml(plan, look) {
+  const T = look.title;
+  const align = T.align === "center" ? "ctr" : T.align === "right" ? "max" : "min";
+  return plan.showTitle === false || !plan.title ? "" : `<cx:title pos="t" align="${align}" overlay="0"><cx:tx><cx:rich><a:bodyPr/><a:lstStyle/>` +
+    `${paraA(plan.title, T, align === "ctr" ? "ctr" : align === "max" ? "r" : "l")}</cx:rich></cx:tx></cx:title>`;
+}
+/* A chartEx text block in the report's font */
+function chartExTxPr(t) {
+  return `<cx:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr>${runPrA(t)}</a:pPr><a:endParaRPr lang="en-US"/></a:p></cx:txPr>`;
+}
+/* A chartEx axis title */
+function chartExAxisTitle(text, t) {
+  return text ? `<cx:title><cx:tx><cx:rich><a:bodyPr/><a:lstStyle/>${paraA(text, t, "ctr")}</cx:rich></cx:tx><cx:spPr><a:noFill/><a:ln><a:noFill/></a:ln></cx:spPr></cx:title>` : "";
+}
+/* A chartEx value axis like Power BI's: its range and steps, units, gridlines, labels */
+function chartExValueAxis(id, axis, fmt, look, title, show) {
+  const scale = axis ? `<cx:valScaling max="${axis.max}" min="${axis.min}"${axis.step ? ` majorUnit="${axis.step}"` : ""}/>` : "<cx:valScaling/>";
+  return `<cx:axis id="${id}"${show ? "" : ' hidden="1"'}>${scale}${chartExAxisTitle(title, look.val.titleFont || look.val.text)}` +
+    `<cx:majorGridlines><cx:spPr>${lineA({ color: GRID_GREY, width: 1 })}</cx:spPr></cx:majorGridlines><cx:tickLabels/>` +
+    `<cx:numFmt formatCode="${xmlEsc(fmt)}" sourceLinked="0"/><cx:spPr><a:ln><a:noFill/></a:ln></cx:spPr>${chartExTxPr(look.val.text)}</cx:axis>`;
+}
+const CHARTEX_SPACE = `<cx:chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:cx="${CHARTEX_NS}">`;
+const CHARTEX_FRAME = `<cx:spPr>${fillXml(C.WHITE)}<a:ln w="9525">${fillXml(C.HAIR)}</a:ln></cx:spPr>`;
+/* A chartEx part's colours: its own, in order (a waterfall's increase, decrease and total) */
+function chartExColorsXml(colors) {
+  return `<cs:colorStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" meth="cycle" id="10">` +
+    colors.map((c) => `<a:srgbClr val="${hexOf(c)}"/>`).join("") + `<cs:variation/></cs:colorStyle>`;
+}
+
+/*
+ * Excel's own waterfall (Excel 2016 and later): the signed steps, the last bar the total, each
+ * bar in the report's increase, decrease or total colour, no connector lines (Power BI draws
+ * none). Older Excel and other spreadsheet apps show the stacked-column waterfall instead.
+ */
+const NATIVE_WATERFALL = true;
+function waterfallChartExXml(plan) {
+  const s = plan.series[5], ref = plan.refs.series[5];
+  const look = plan.look || chartLook({ type: "waterfallChart" }, null);
+  const cats = plan.categories.map(axisLabel);
+  const pts = (list) => list.map((v, i) => (v === null || v === undefined || v === "" ? "" : `<cx:pt idx="${i}">${xmlEsc(v)}</cx:pt>`)).join("");
+  const last = s.values.length - 1;
+  const colorOf = (i) => (i === last ? plan.series[3].color : s.values[i] < 0 ? plan.series[2].color : plan.series[1].color);
+  const dataPts = s.values.map((_, i) => `<cx:dataPt idx="${i}"><cx:spPr>${fillXml(colorOf(i))}</cx:spPr></cx:dataPt>`).join("");
+  // Labels as the stacked waterfall writes them: display units from 10,000 up (2.47M), else the
+  // measure's own format; Excel places each outside its bar and sizes the axis to fit them
+  const precision = plan.labelPrecision ?? look.labels.precision ?? null;
+  const labelFmt = maxAbsOf(plan.steps) >= 1e4 || look.labels.units > 0 ? labelNumFmt(plan.fmt, plan.steps, look.labels, precision === null ? 2 : 0) : precision !== null ? unitFormat(plan.fmt, 1, precision) : plan.fmt;
+  const labels = plan.showLabels
+    ? `<cx:dataLabels><cx:numFmt formatCode="${xmlEsc(labelFmt || "General")}" sourceLinked="0"/>` +
+      `${chartExTxPr(look.labels.text)}<cx:visibility seriesName="0" categoryName="0" value="1"/></cx:dataLabels>` : "";
+  const titles = axisTitles(plan, [], []);
+  const [side, align] = LEGEND_SPOTS[String(look.legend.position).toLowerCase()] || ["t", "start"];
+  const legend = look.legend.show === false ? ""
+    : `<cx:legend pos="${side}" align="${align === "center" ? "ctr" : align === "end" ? "max" : "min"}" overlay="0">${chartExTxPr(look.legend.text)}</cx:legend>`;
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>${CHARTEX_SPACE}` +
+    `<cx:chartData><cx:data id="0">` +
+    `<cx:strDim type="cat"><cx:f>${xmlEsc(plan.refs.catRef)}</cx:f><cx:lvl ptCount="${cats.length}">${pts(cats)}</cx:lvl></cx:strDim>` +
+    `<cx:numDim type="val"><cx:f>${xmlEsc(ref.valRef)}</cx:f><cx:lvl ptCount="${s.values.length}" formatCode="${xmlEsc(s.fmt || "General")}">${pts(s.values)}</cx:lvl></cx:numDim>` +
+    `</cx:data></cx:chartData>` +
+    `<cx:chart>${chartExTitleXml(plan, look)}<cx:plotArea><cx:plotAreaRegion>` +
+    `<cx:series layoutId="waterfall" uniqueId="{2B5D8E41-7A3C-4F19-9E62-0C4B1D7A3E58}">` +
+    `<cx:tx><cx:txData><cx:f>${xmlEsc(ref.nameRef)}</cx:f><cx:v>${xmlEsc(s.name)}</cx:v></cx:txData></cx:tx>${dataPts}${labels}` +
+    `<cx:dataId val="0"/><cx:layoutPr><cx:visibility connectorLines="0"/><cx:subtotals><cx:idx val="${last}"/></cx:subtotals></cx:layoutPr></cx:series>` +
+    `</cx:plotAreaRegion>` +
+    `<cx:axis id="0"${titles.catShow ? "" : ' hidden="1"'}><cx:catScaling gapWidth="0.6"/>${chartExAxisTitle(titles.cat, look.cat.titleFont || look.cat.text)}<cx:tickLabels/>` +
+    `<cx:spPr><a:ln><a:noFill/></a:ln></cx:spPr>${chartExTxPr(look.cat.text)}</cx:axis>` +
+    chartExValueAxis(1, plan.showLabels ? null : plan.axis, axisNumFmt(plan.fmt, plan.axis, look.val), look, titles.val, titles.valShow) +
+    `</cx:plotArea>${legend}</cx:chart>${CHARTEX_FRAME}</cx:chartSpace>`;
+}
+
+/* Excel's own box & whisker chart: a box per category, with its mean marker and outliers */
+function boxWhiskerXml(plan) {
+  const s = plan.series[0], r = plan.refs;
+  const look = plan.look || chartLook({ type: "boxWhisker" }, null);
+  const cats = plan.categories.map(axisLabel);
+  const pts = (list) => list.map((v, i) => (v === null || v === undefined || v === "" ? "" : `<cx:pt idx="${i}">${xmlEsc(v)}</cx:pt>`)).join("");
+  const color = s.color || toArgb(DEFAULT_THEME_COLORS[0]);
+  const vals = s.values.filter((v) => typeof v === "number");
+  const axis = valueScale(vals, ((plan.sizePx && plan.sizePx.h) || 300) - 100, 75, { round: false });
+  const titles = axisTitles(plan, [[s]], []);
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>${CHARTEX_SPACE}` +
+    `<cx:chartData><cx:data id="0">` +
+    `<cx:strDim type="cat"><cx:f>${xmlEsc(r.catRef)}</cx:f><cx:lvl ptCount="${cats.length}">${pts(cats)}</cx:lvl></cx:strDim>` +
+    `<cx:numDim type="val"><cx:f>${xmlEsc(r.series[0].valRef)}</cx:f><cx:lvl ptCount="${s.values.length}" formatCode="${xmlEsc(s.fmt || "General")}">${pts(s.values)}</cx:lvl></cx:numDim>` +
+    `</cx:data></cx:chartData>` +
+    `<cx:chart>${chartExTitleXml(plan, look)}<cx:plotArea><cx:plotAreaRegion>` +
+    `<cx:series layoutId="boxWhisker" uniqueId="{7C1E4A92-3B6D-4E85-A0F7-5D2C8B9E1F36}">` +
+    `<cx:tx><cx:txData><cx:f>${xmlEsc(r.series[0].nameRef)}</cx:f><cx:v>${xmlEsc(s.name)}</cx:v></cx:txData></cx:tx>` +
+    `<cx:spPr>${fillA(color, 0.85)}<a:ln w="9525">${fillXml(color)}</a:ln></cx:spPr>` +
+    `<cx:dataId val="0"/><cx:layoutPr><cx:visibility meanLine="0" meanMarker="1" nonoutliers="0" outliers="1"/><cx:statistics quartileMethod="exclusive"/></cx:layoutPr></cx:series>` +
+    `</cx:plotAreaRegion>` +
+    `<cx:axis id="0"${titles.catShow ? "" : ' hidden="1"'}><cx:catScaling gapWidth="1"/>${chartExAxisTitle(titles.cat, look.cat.titleFont || look.cat.text)}<cx:tickLabels/>` +
+    `<cx:spPr><a:ln><a:noFill/></a:ln></cx:spPr>${chartExTxPr(look.cat.text)}</cx:axis>` +
+    chartExValueAxis(1, axis, axisNumFmt(s.fmt, axis, look.val, vals), look, titles.val, titles.valShow) +
+    `</cx:plotArea></cx:chart>${CHARTEX_FRAME}</cx:chartSpace>`;
+}
+
+/* A chart's alt text, for screen readers and Excel's Alt Text pane: what it shows, and its
+   largest value when it draws one measure */
+const CHART_KIND_NAMES = { line: "line chart", area: "area chart", combo: "column and line chart", pie: "pie chart", doughnut: "donut chart",
+  scatter: "scatter chart", bubble: "bubble chart", waterfall: "waterfall chart", funnel: "funnel chart", treemap: "treemap",
+  sunburst: "sunburst chart", radar: "radar chart", boxWhisker: "box and whisker chart" };
+function chartKindName(spec) {
+  if (spec.mirror) return "tornado chart";
+  if (spec.gap === 0) return "histogram";
+  if (spec.kind === "bar") return spec.dir === "bar" ? "bar chart" : "column chart";
+  return CHART_KIND_NAMES[spec.kind] || "chart";
+}
+function chartAltText(plan) {
+  const kind = chartKindName(plan.spec);
+  const shown = (plan.series || []).filter((s) => !s.noLegend && !s.hidden);
+  const names = plan.spec.kind === "waterfall" ? [plan.valueName] : plan.legendName && plan.valueName ? [plan.valueName] : [...new Set(shown.map((s) => s.name))];
+  const list = names.filter(Boolean).slice(0, 4);
+  const what = list.length ? ` of ${list.length > 1 ? `${list.slice(0, -1).join(", ")} and ${list[list.length - 1]}` : list[0]}` : "";
+  const by = plan.legendName && plan.valueName ? ` by ${plan.catName} and ${plan.legendName}` : plan.catName ? ` by ${plan.catName}` : "";
+  let text = `${plan.title ? plan.title + ": " : ""}${/^[aeiou]/i.test(kind) ? "an" : "a"} ${kind}${what}${by}.`;
+  const one = shown.length === 1 && !["scatter", "boxWhisker", "waterfall"].includes(plan.spec.kind) ? shown[0] : null;
+  if (one && plan.categories && plan.categories.length > 1) {
+    let best = -1;
+    one.values.forEach((v, i) => { if (typeof v === "number" && (best < 0 || v > one.values[best])) best = i; });
+    if (best >= 0) {
+      const unit = autoUnit(maxAbsOf(one.values));
+      text += ` Highest: ${axisLabel(plan.categories[best])}, ${displayValue(one.values[best], one.fmt, unit, unit > 1 ? 1 : null)}.`;
+    }
+  }
+  return text;
+}
+const altAttr = (plan) => ` descr="${xmlEsc(chartAltText(plan))}"`;
+
+/* A chart frame that shows Excel's own chart (a funnel: cx2; a waterfall: cx1) where Excel has
+   it, else the classic chart drawn the same way */
+const CHARTEX_REQUIRES = { cx1: "http://schemas.microsoft.com/office/drawing/2015/9/8/chartex", cx2: "http://schemas.microsoft.com/office/drawing/2015/10/21/chartex" };
+function chartAltAnchorXml(ch, exRid, rid, id, requires = "cx2") {
   const cx = Math.round(ch.wPx * CHART_PX_TO_EMU), cy = Math.round(ch.hPx * CHART_PX_TO_EMU);
-  const frame = (uri, inner) => `<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="${id}" name="Chart ${id}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
+  const frame = (uri, inner) => `<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="${id}" name="Chart ${id}"${altAttr(ch.plan)}/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
     `<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="${uri}">${inner}</a:graphicData></a:graphic></xdr:graphicFrame>`;
   return `<xdr:oneCellAnchor><xdr:from><xdr:col>${ch.col - 1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${ch.row - 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>` +
     `<xdr:ext cx="${cx}" cy="${cy}"/>` +
     `<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">` +
-    `<mc:Choice xmlns:cx2="http://schemas.microsoft.com/office/drawing/2015/10/21/chartex" Requires="cx2">` +
+    `<mc:Choice xmlns:${requires}="${CHARTEX_REQUIRES[requires]}" Requires="${requires}">` +
     frame(CHARTEX_NS, `<cx:chart xmlns:cx="${CHARTEX_NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="${exRid}"/>`) +
     `</mc:Choice><mc:Fallback>` +
     frame("http://schemas.openxmlformats.org/drawingml/2006/chart", `<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="${rid}"/>`) +
@@ -5305,6 +5604,151 @@ async function sheetFileMap(zip) {
   return files;
 }
 
+/*
+ * Excel slicers ("Include: Excel slicers"): each of the page's slicer fields becomes an Excel
+ * slicer on every exported table with that column, to the right of the page (outside the print
+ * area). A slicer filters one table; the totals rows use SUBTOTAL, so they follow it. The parts,
+ * as Excel writes them: a slicer cache per slicer (workbook level, with a #N/A defined name),
+ * the sheet's slicers part, and a frame in the sheet's drawing.
+ * slicerSheets: [{ sheetName, slicers: [{ tableName, column, caption, title, row, col, count }] }]
+ */
+const SLICER_NS = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main";
+const SLICER_W_PX = 190, SLICER_ROW_PX = 26;
+async function addSlicersToFile(buffer, slicerSheets) {
+  const zip = await JSZip.loadAsync(buffer);
+  const read = (p) => zip.file(p).async("string");
+  let types = await read("[Content_Types].xml");
+  const addType = (part, type) => {
+    if (!types.includes(`PartName="/${part}"`)) types = types.replace("</Types>", `<Override PartName="/${part}" ContentType="${type}"/></Types>`);
+  };
+  let workbookXml = await read("xl/workbook.xml");
+  let workbookRels = await read("xl/_rels/workbook.xml.rels");
+  // The tables ExcelJS wrote: name → id and column names
+  const tables = {};
+  for (const path of Object.keys(zip.files).filter((n) => /^xl\/tables\/table\d+\.xml$/.test(n))) {
+    const xml = await read(path);
+    const tag = (xml.match(/<table\b[^>]*>/) || [""])[0];
+    const name = unescapeXml((tag.match(/\bname="([^"]*)"/) || [])[1] || "");
+    const id = (tag.match(/\bid="(\d+)"/) || [])[1];
+    if (name && id) tables[name] = { id, cols: [...xml.matchAll(/<tableColumn\b[^>]*\bname="([^"]*)"/g)].map((m) => unescapeXml(m[1])) };
+  }
+  const sheetFiles = await sheetFileMap(zip);
+  let drawingNo = Object.keys(zip.files).filter((n) => /^xl\/drawings\/drawing\d+\.xml$/.test(n)).length;
+  let cacheNo = 0, partNo = 0, frameId = 5000;
+  const cacheNames = new Set([...workbookXml.matchAll(/<definedName\b[^>]*\bname="([^"]*)"/g)].map((m) => m[1].toLowerCase()));
+  const slicerNames = new Set();
+  const unique = (base, used) => {
+    let name = base, k = 1;
+    while (used.has(name.toLowerCase())) name = `${base}${++k}`;
+    used.add(name.toLowerCase());
+    return name;
+  };
+  const cacheRids = [], names = [];
+  for (const { sheetName, slicers } of slicerSheets) {
+    const sheetPath = sheetFiles[sheetName];
+    const list = slicers.filter((x) => tables[x.tableName] && tables[x.tableName].cols.includes(x.column));
+    if (!sheetPath || !list.length) continue;
+    const sheetRelsPath = sheetPath.replace(/([^/]+)$/, "_rels/$1.rels");
+    let sheetXml = await read(sheetPath);
+    let sheetRels = zip.file(sheetRelsPath) ? await read(sheetRelsPath) : EMPTY_RELS;
+    // The sheet's drawing (the logo's, the charts'), or a new one
+    let drawingPath, drawingXml;
+    const existing = sheetXml.match(/<drawing r:id="([^"]+)"\s*\/>/);
+    const existingTarget = existing && relTarget(sheetRels, existing[1]);
+    if (existingTarget) {
+      drawingPath = "xl/drawings/" + existingTarget.split("/").pop();
+      drawingXml = await read(drawingPath);
+    } else {
+      drawingNo++;
+      drawingPath = `xl/drawings/drawing${drawingNo}.xml`;
+      drawingXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+        `<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"></xdr:wsDr>`;
+      const rel = addRel(sheetRels, "drawing", `../drawings/drawing${drawingNo}.xml`);
+      sheetRels = rel.xml;
+      sheetXml = insertDrawing(sheetXml, rel.id);
+      addType(drawingPath, "application/vnd.openxmlformats-officedocument.drawing+xml");
+    }
+
+    // Stacked down the right of the page, each level with its table where there is room
+    let anchors = "", entries = "", nextRow = 0;
+    for (const x of list) {
+      const t = tables[x.tableName];
+      cacheNo++;
+      const cacheName = unique(`Slicer_${x.column.replace(/[^A-Za-z0-9_]/g, "_").replace(/^(\d)/, "_$1")}`, cacheNames);
+      const slicerName = unique(x.column, slicerNames);
+      const cachePath = `xl/slicerCaches/slicerCache${cacheNo}.xml`;
+      zip.file(cachePath, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+        `<slicerCacheDefinition xmlns="${SLICER_NS}" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="x" ` +
+        `xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="${xmlEsc(cacheName)}" sourceName="${xmlEsc(x.column)}">` +
+        `<extLst><x:ext uri="{2F2917AC-EB37-4324-AD4E-5DD8C200BD13}" xmlns:x15="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main">` +
+        `<x15:tableSlicerCache tableId="${t.id}" column="${t.cols.indexOf(x.column) + 1}"/></x:ext></extLst></slicerCacheDefinition>`);
+      addType(cachePath, "application/vnd.ms-excel.slicerCache+xml");
+      const wRel = addRel(workbookRels, "http://schemas.microsoft.com/office/2007/relationships/slicerCache", `slicerCaches/slicerCache${cacheNo}.xml`);
+      workbookRels = wRel.xml;
+      cacheRids.push(wRel.id);
+      names.push(cacheName);
+      // Captioned by its field (it sits beside its own table), in Excel's neutral grey style
+      entries += `<slicer name="${xmlEsc(slicerName)}" cache="${xmlEsc(cacheName)}" caption="${xmlEsc(x.caption)}" style="SlicerStyleOther1" rowHeight="${SLICER_ROW_PX * CHART_PX_TO_EMU}"/>`;
+      // Its frame: as tall as its items (up to 8; more scroll), beside its table
+      const hPx = 34 + Math.min(8, Math.max(1, x.count)) * (SLICER_ROW_PX + 3) + 8;
+      const row = Math.max(x.row - 1, nextRow);
+      nextRow = row + Math.ceil(hPx / ROW_PX) + 1;
+      frameId++;
+      anchors += `<xdr:oneCellAnchor><xdr:from><xdr:col>${x.col - 1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>` +
+        `<xdr:ext cx="${SLICER_W_PX * CHART_PX_TO_EMU}" cy="${Math.round(hPx * CHART_PX_TO_EMU)}"/>` +
+        `<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice xmlns:sle15="http://schemas.microsoft.com/office/drawing/2012/slicer" Requires="sle15">` +
+        `<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="${frameId}" name="${xmlEsc(slicerName)}" descr="${xmlEsc(`Slicer for ${x.column} on ${x.title || x.tableName}`)}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
+        `<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/drawing/2010/slicer">` +
+        `<sle:slicer xmlns:sle="http://schemas.microsoft.com/office/drawing/2010/slicer" name="${xmlEsc(slicerName)}"/></a:graphicData></a:graphic></xdr:graphicFrame></mc:Choice>` +
+        `<mc:Fallback><xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="${frameId}" name="${xmlEsc(slicerName)}"/><xdr:cNvSpPr><a:spLocks noTextEdit="1"/></xdr:cNvSpPr></xdr:nvSpPr>` +
+        `<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${SLICER_W_PX * CHART_PX_TO_EMU}" cy="${Math.round(hPx * CHART_PX_TO_EMU)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>` +
+        `<a:solidFill><a:srgbClr val="F4F6F5"/></a:solidFill></xdr:spPr><xdr:txBody><a:bodyPr vertOverflow="clip" horzOverflow="clip"/><a:lstStyle/>` +
+        `<a:p><a:r><a:rPr lang="en-US" sz="1100"/><a:t>${xmlEsc(`Slicer for ${x.column}: shown in Excel 2013 or later.`)}</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback>` +
+        `</mc:AlternateContent><xdr:clientData/></xdr:oneCellAnchor>`;
+    }
+    // The sheet's slicers part, listed in its extLst (always the worksheet's last element)
+    partNo++;
+    const partPath = `xl/slicers/slicer${partNo}.xml`;
+    zip.file(partPath, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><slicers xmlns="${SLICER_NS}" ` +
+      `xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="x" xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main">${entries}</slicers>`);
+    addType(partPath, "application/vnd.ms-excel.slicer+xml");
+    const sRel = addRel(sheetRels, "http://schemas.microsoft.com/office/2007/relationships/slicer", `../slicers/slicer${partNo}.xml`);
+    sheetRels = sRel.xml;
+    if (!/<worksheet[^>]*xmlns:r=/.test(sheetXml)) {
+      sheetXml = sheetXml.replace("<worksheet", '<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"');
+    }
+    const ext = `<ext uri="{3A4CF648-6AED-40f4-86FF-DC5316D8AED3}" xmlns:x15="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main">` +
+      `<x14:slicerList xmlns:x14="${SLICER_NS}"><x14:slicer r:id="${sRel.id}"/></x14:slicerList></ext>`;
+    sheetXml = /<\/extLst>\s*<\/worksheet>\s*$/.test(sheetXml)
+      ? sheetXml.replace(/<\/extLst>\s*<\/worksheet>\s*$/, `${ext}</extLst></worksheet>`)
+      : sheetXml.replace(/<\/worksheet>\s*$/, `<extLst>${ext}</extLst></worksheet>`);
+    drawingXml = drawingXml.includes("</xdr:wsDr>")
+      ? drawingXml.replace("</xdr:wsDr>", anchors + "</xdr:wsDr>")
+      : drawingXml.replace(/<xdr:wsDr([^>]*)\/>/, `<xdr:wsDr$1>${anchors}</xdr:wsDr>`);
+    zip.file(sheetPath, sheetXml);
+    zip.file(sheetRelsPath, sheetRels);
+    zip.file(drawingPath, drawingXml);
+  }
+  if (!cacheRids.length) return buffer;
+  // The workbook: a #N/A name per slicer cache, and the caches listed in its extLst
+  const defined = names.map((n) => `<definedName name="${xmlEsc(n)}">#N/A</definedName>`).join("");
+  workbookXml = workbookXml.includes("</definedNames>")
+    ? workbookXml.replace("</definedNames>", `${defined}</definedNames>`)
+    : workbookXml.replace(/(<\/sheets>)/, `$1<definedNames>${defined}</definedNames>`);
+  if (!/<workbook[^>]*xmlns:r=/.test(workbookXml)) {
+    workbookXml = workbookXml.replace("<workbook", '<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"');
+  }
+  const wbExt = `<ext uri="{46BE6895-7355-4a93-B00E-2C351335B9C9}" xmlns:x15="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main">` +
+    `<x15:slicerCaches xmlns:x14="${SLICER_NS}">${cacheRids.map((id) => `<x14:slicerCache r:id="${id}"/>`).join("")}</x15:slicerCaches></ext>`;
+  workbookXml = workbookXml.includes("</extLst>")
+    ? workbookXml.replace(/<\/extLst>\s*<\/workbook>\s*$/, `${wbExt}</extLst></workbook>`)
+    : workbookXml.replace(/<\/workbook>\s*$/, `<extLst>${wbExt}</extLst></workbook>`);
+  zip.file("xl/workbook.xml", workbookXml);
+  zip.file("xl/_rels/workbook.xml.rels", workbookRels);
+  zip.file("[Content_Types].xml", types);
+  return zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
+}
+
 /* chartSheets: [{ sheetName, charts: [{ plan, col, row, wPx, hPx }] }]. Returns the new file. */
 async function addChartsToFile(buffer, chartSheets) {
   const zip = await JSZip.loadAsync(buffer);
@@ -5348,11 +5792,11 @@ async function addChartsToFile(buffer, chartSheets) {
     let anchors = "";
     // A chartEx chart (treemap, sunburst, funnel): its part, with Excel's style and colour
     // parts (Excel won't open the file without both); returns the drawing's link to it
-    const addChartEx = (xml) => {
+    const addChartEx = (xml, colorsXml = CHARTEX_COLORS_XML, styleXml = CHARTEX_STYLE_XML) => {
       const exPath = `xl/charts/chartEx${exNo}.xml`;
       zip.file(exPath, xml);
-      zip.file(`xl/charts/style${exNo}.xml`, CHARTEX_STYLE_XML);
-      zip.file(`xl/charts/colors${exNo}.xml`, CHARTEX_COLORS_XML);
+      zip.file(`xl/charts/style${exNo}.xml`, styleXml);
+      zip.file(`xl/charts/colors${exNo}.xml`, colorsXml);
       let exRels = addRel(EMPTY_RELS, "http://schemas.microsoft.com/office/2011/relationships/chartStyle", `style${exNo}.xml`).xml;
       exRels = addRel(exRels, "http://schemas.microsoft.com/office/2011/relationships/chartColorStyle", `colors${exNo}.xml`).xml;
       zip.file(`xl/charts/_rels/chartEx${exNo}.xml.rels`, exRels);
@@ -5367,6 +5811,11 @@ async function addChartsToFile(buffer, chartSheets) {
       if (ch.plan.spec.kind === "treemap" || ch.plan.spec.kind === "sunburst") {
         exNo++;
         anchors += chartExAnchorXml(ch, addChartEx(treemapXml(ch.plan, exNo)), 3000 + exNo);
+        continue;
+      }
+      if (ch.plan.spec.kind === "boxWhisker") {
+        exNo++;
+        anchors += chartExAnchorXml(ch, addChartEx(boxWhiskerXml(ch.plan), CHARTEX_COLORS_XML, CHARTEX_STYLE_DARK_LABELS), 3000 + exNo);
         continue;
       }
       chartNo++;
@@ -5390,6 +5839,11 @@ async function addChartsToFile(buffer, chartSheets) {
       if (NATIVE_FUNNEL && ch.plan.funnel) {
         exNo++;
         anchors += chartAltAnchorXml(ch, addChartEx(funnelChartExXml(ch.plan)), rel.id, 1000 + chartNo);
+      } else if (NATIVE_WATERFALL && ch.plan.spec.kind === "waterfall" && ch.plan.series[5]) {
+        // A waterfall: Excel's own, in the report's increase, decrease and total colours
+        exNo++;
+        const p = ch.plan;
+        anchors += chartAltAnchorXml(ch, addChartEx(waterfallChartExXml(p), chartExColorsXml([p.series[1].color, p.series[2].color, p.series[3].color]), CHARTEX_STYLE_DARK_LABELS), rel.id, 1000 + chartNo, "cx1");
       } else {
         anchors += chartAnchorXml(ch, rel.id, 1000 + chartNo);
       }
@@ -5672,16 +6126,20 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
   }
   // The drill levels as they are in the app now, before the export switches pages
   const liveDrill = options.matchColors ? await captureLiveDrill(embeddedReport) : null;
+  // The page on screen is read first, while what the user clicked on it still holds (changing
+  // page can clear it); the sheets keep the report's order
+  const order = pages.map((_, i) => i).sort((a, b) => (pages[b].name === original.name) - (pages[a].name === original.name));
   try {
-    for (let p = 0; p < pages.length; p++) {
-      const page = pages[p];
-      onProgress({ pageIndex: p + 1, pageCount: pages.length, pageName: page.displayName, visualIndex: 0, visualCount: 0, visualTitle: "Opening page…" });
+    for (let k = 0; k < order.length; k++) {
+      const page = pages[order[k]];
+      onProgress({ pageIndex: k + 1, pageCount: pages.length, pageName: page.displayName, visualIndex: 0, visualCount: 0, visualTitle: "Opening page…" });
       await activatePage(page);
-      const data = await collectPage(page, options,
-        (i, n, title) => onProgress({ pageIndex: p + 1, pageCount: pages.length, pageName: page.displayName, visualIndex: i, visualCount: n, visualTitle: title }),
+      const selection = page.name === original.name ? liveSelections[page.name] || null : null;
+      const data = await collectPage(page, { ...options, selection },
+        (i, n, title) => onProgress({ pageIndex: k + 1, pageCount: pages.length, pageName: page.displayName, visualIndex: i, visualCount: n, visualTitle: title }),
         isCancelled);
       if (liveDrill && liveDrill[page.name]) data.items.forEach((item) => { item.liveDrill = liveDrill[page.name][item.name] || null; });
-      collected.push({ page, data });
+      collected[order[k]] = { page, data };
     }
   } finally {
     // Put the user back on the page they were looking at
@@ -5759,6 +6217,7 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
   const totals = { tables: 0, kpis: 0, notes: [] };
   const chartSheets = [];   // charts mode: { sheetName, charts } for addChartsToFile
   const sparkSheets = [];   // trend cards: { sheetName, sparklines } for addSparklinesToFile
+  const slicerSheets = [];  // Excel slicers: { sheetName, slicers } for addSlicersToFile
   // With several pages, one with nothing to show (a cover or info page of images and text)
   // isn't given an empty sheet; the first sheet's notes name it
   const filled = collected.filter(({ data }) => data.items.length || data.notes.length);
@@ -5778,6 +6237,7 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
     }
     if (counts.trendSheet) writeTrendSheet(wb, counts.trendSheet);
     if (counts.sparklines.length) sparkSheets.push({ sheetName, sparklines: counts.sparklines });
+    if (counts.slicers.length) slicerSheets.push({ sheetName, slicers: counts.slicers });
     totals.tables += counts.tables;
     totals.kpis += counts.kpis;
     data.notes.forEach((n) => totals.notes.push(sheets.length > 1 ? `${page.displayName}: ${n}` : n));
@@ -5787,6 +6247,7 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
   // Charts mode: add the real Excel charts to the finished file
   if (chartSheets.length) buffer = await addChartsToFile(buffer, chartSheets);
   if (sparkSheets.length) buffer = await addSparklinesToFile(buffer, sparkSheets);
+  if (slicerSheets.length) buffer = await addSlicersToFile(buffer, slicerSheets);
   const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
   const baseName = sheets.length === 1 ? `${currentReportName} - ${sheets[0].page.displayName}` : currentReportName;
   const fileName = (baseName.replace(/[\\/:*?"<>|]/g, "").trim() || "Power BI export") + ".xlsx";

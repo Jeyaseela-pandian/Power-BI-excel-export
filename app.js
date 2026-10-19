@@ -240,6 +240,9 @@ async function openReport(report, pageName) {
   if (pageName) config.pageName = pageName;
 
   embeddedReport = powerbi.embed(container, config);
+  clearSelections();
+  // What the user clicks in the report: recorded so the export's filter bar can show it
+  embeddedReport.on("dataSelected", (e) => recordSelection(e.detail));
   embeddedReport.on("loaded", async () => {
     log(`Report "${report.name}" loaded`);
     setExportEnabled(true);
