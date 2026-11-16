@@ -2105,6 +2105,87 @@ function matrixLayout(item, info) {
  * the visual's place, each with its reference labels as sub-rows (the visual's title goes on
  * the first). Without the report file, every number column is a card.
  */
+/*
+ * A key influencers visual as Power BI shows it: what makes the analysed field (Status) take
+ * its value (Won). Power BI exports only the rows behind it, so each influencer is worked out
+ * from the rows counted per value (loadKeyInfluencers) the way Power BI states it: the share
+ * with that value where the field has this value, over the share among all other rows
+ * ("1.4x more likely").
+ * Influencers whose difference could be chance (a two-proportion test) or that rest on few
+ * rows are left out. Returns the insight table where the visual sits; or nothing (with a note)
+ * when it can't be worked out.
+ */
+const KI_MIN_ROWS = 10;      // rows a value needs on each side of the comparison
+const KI_Z = 1.96;           // 95% confidence
+const KI_TOP = 10;           // influencers listed
+function keyInfluencerItems(item, info, notes) {
+  if (item.type !== "keyDriversVisual") return [item];
+  const name = item.title && !isGenericTitle(item.title, item.type) ? item.title : friendlyType(item.type);
+  const skip = (why) => { notes.push(`Not included: "${name}" – ${why || ON_SCREEN_ONLY.keyDriversVisual}`); return []; };
+  const kd = info && info.keyDrivers;
+  if (!kd || !kd.target || kd.targetValue === null || kd.analysis !== "keyInfluencers") return skip();
+  // Rows counted per value by a query (loadKeyInfluencers): the exported rows are merged ones
+  if (!item.kiCounts) return skip(item.kiError ? `${item.kiError}. View it in the report.` : null);
+  const header = item.rows[0] || [];
+  const nameOf = (f) => {
+    const ci = header.findIndex((h) => (f.label && String(h).trim().toLowerCase() === f.label) || normalizeField(h) === f.ref);
+    return ci >= 0 ? header[ci] : (f.field && f.field.prop) || f.ref;
+  };
+  const goal = String(kd.targetValue).trim().toLowerCase();
+  const isGoal = (t) => String(t ?? "").trim().toLowerCase() === goal;
+  const targetName = nameOf(kd.target);
+  let targetValue = kd.targetValue;
+  const found = [];
+  for (const fc of item.kiCounts.fields) {
+    const groups = new Map();
+    let N = 0, T = 0;
+    for (const [value, target, rows] of fc.counts) {
+      const n = Number(rows) || 0;
+      if (!n) continue;
+      N += n;
+      if (isGoal(target)) { T += n; targetValue = String(target).trim(); }
+      const v = String(value ?? "").trim();
+      if (!v) continue;   // blank values count in the totals, not as an influencer
+      const g = groups.get(v) || { n: 0, t: 0 };
+      g.n += n; if (isGoal(target)) g.t += n;
+      groups.set(v, g);
+    }
+    if (!T || T === N) continue;
+    const field = nameOf(fc);
+    const p = T / N;
+    for (const [value, g] of groups) {
+      const nr = N - g.n, tr = T - g.t;
+      if (g.n < KI_MIN_ROWS || nr < KI_MIN_ROWS || !tr) continue;
+      const pv = g.t / g.n, pr = tr / nr;
+      const se = Math.sqrt(p * (1 - p) * (1 / g.n + 1 / nr));
+      if (pv <= pr || !se || (pv - pr) / se < KI_Z) continue;
+      found.push({ field, value, pv, pr, ratio: pv / pr });
+    }
+  }
+  const numberFields = kd.explainBy.filter((f) => !f.field || f.field.kind !== "column").map(nameOf);
+  if (!found.length) return skip(`none of its influencers could be confirmed from the rows behind it. View it in the report.`);
+  found.sort((a, b) => b.ratio - a.ratio);
+  const top = found.slice(0, KI_TOP);
+  const pct = (x) => `${(x * 100).toFixed(1)}%`;
+  const shareHead = `${targetName} is ${targetValue}`;
+  // The list alone, where the visual sits (its detail chart depends on the influencer picked on
+  // screen). Only the shares, which are exact counts: Power BI's "x more likely" comes from its
+  // own model of all the fields together, which no count reproduces
+  const table = {
+    ...item,
+    name: `${item.name}~influencers`,
+    title: `What influences ${targetName} to be ${targetValue}?`,
+    type: "keyInfluencers",   // a plain table: no totals row (times more likely don't add up)
+    captionText: `Exact shares from the report's data · strongest influence first`,
+    rows: [["When", "Is", shareHead, `${shareHead} (others)`],
+      ...top.map((f) => [f.field, f.value, pct(f.pv), pct(f.pr)])],
+    gridFormat: { measures: [], tableFormats: [shareHead, `${shareHead} (others)`].map((h, i) => ({ target: "m:" + normalizeField(h), kind: "bar",
+      bar: { color: i ? "#C8C6C4" : DEFAULT_THEME_COLORS[0], negative: null, axis: null, reverse: false, showValue: true, share: true } })) },
+  };
+  if (numberFields.length) notes.push(`"${name}": ${numberFields.join(", ")} (number fields) are explained in the report only.`);
+  return [table];
+}
+
 function splitCards(item, info) {
   if (item.type !== "cardVisual" || item.rows.length !== 2 || item.rows[0].length < 2) return [item];
   const [header, values] = item.rows;
@@ -2393,6 +2474,7 @@ function axisLabel(text) {
 
 /* Caption runs: a legend of the chart's colours, or "Table · 24 rows" */
 function captionRuns(item, colors, header, fonts, units) {
+  if (item.captionText) return [[item.captionText, fonts.caption]];   // an exhibit's own note (key influencers)
   const n = item.rows.length - 1;
   const plain = [[`${friendlyType(item.type)}  ·  ${n} row${n === 1 ? "" : "s"}`, fonts.caption]];
   if (!colors) return plain;
@@ -2907,7 +2989,8 @@ function applyTableFormats(ws, hr, col, item, header, data, lay, rowsOf) {
         });
       } else if (f.kind === "bar") {
         const bar = { type: "dataBar", gradient: false, border: false, showValue: f.bar.showValue, minLength: 0, maxLength: 100,
-          cfvo: [{ type: "min" }, { type: "max" }], color: { argb: toArgb(f.bar.color) } };
+          // a share (0–100%) on one fixed scale, so columns compare; else the column's own range
+          cfvo: f.bar.share ? [{ type: "num", value: 0 }, { type: "num", value: 1 }] : [{ type: "min" }, { type: "max" }], color: { argb: toArgb(f.bar.color) } };
         if (f.bar.negative) { bar.negativeBarColorSameAsPositive = false; bar.negativeFillColor = { argb: toArgb(f.bar.negative) }; }
         if (f.bar.axis) bar.axisColor = { argb: toArgb(f.bar.axis) };
         if (f.bar.reverse) bar.direction = "rightToLeft";
@@ -3207,6 +3290,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
   const colorNotes = [];
   // A new card with several measures: one tile per measure
   items = items.flatMap((item) => splitCards(item, visualInfo(lay.reportColors, item.page, item.name)));
+  items = items.flatMap((item) => keyInfluencerItems(item, visualInfo(lay.reportColors, item.page, item.name), colorNotes));
   for (const item of items) {
     item.matrixGrid = options.matrixLayout === "grid";
     const info = atDrillLevel(item, withLiveDrill(item, visualInfo(lay.reportColors, item.page, item.name)));
@@ -3238,7 +3322,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     }
     item.displayTitle = title;
     // A trend visual's colours are on its cards; its table stays plain
-    item.colors = lay.palette && !item.isKpi && !item.trend ? columnColors(item, lay.palette, info) : null;
+    item.colors = lay.palette && !item.isKpi && !item.trend && !item.captionText ? columnColors(item, lay.palette, info) : null;
     item.tableFormat = item.gridFormat || (info && info.tableFormats && info.tableFormats.length ? info : null);
     item.colorInfo = info;
     item.themePalette = lay.palette && lay.palette.length ? lay.palette : null;   // colours for charts without their own settings
@@ -3525,7 +3609,8 @@ async function collectPage(page, options, onProgress, isCancelled) {
     if (options.excludedVisuals && options.excludedVisuals.has(v.name)) continue;
     if ((customVisual(v.type) || {}).rule === "none") continue;   // an AppSource visual with no data (a button)
     // Visuals whose content Power BI works out on screen: their export would only be raw rows, or nothing
-    if (ON_SCREEN_ONLY[v.type]) {
+    // (key influencers are exported: their rows become an insight table, see keyInfluencerItems)
+    if (ON_SCREEN_ONLY[v.type] && v.type !== "keyDriversVisual") {
       notes.push(`Not included: "${v.title || friendlyType(v.type)}" – ${ON_SCREEN_ONLY[v.type]}`);
       continue;
     }
@@ -6629,6 +6714,62 @@ async function loadSparklines(collected, options) {
   }
 }
 
+/*
+ * Key influencers count what they analyse row by row (each opportunity), which the exported
+ * rows can't give (Power BI merges identical rows). So the rows behind each explaining field
+ * are counted with a query, per value and per value of the analysed field, under the same
+ * report, page and visual filters: through the semantic model (Build permission), else Power
+ * BI's own query service (Viewers). item.kiCounts: { fields: [{ ref, counts: [[value,
+ * target, rows]] }] }, or item.kiError.
+ */
+async function loadKeyInfluencers(collected, options) {
+  for (const { data } of collected) {
+    for (const item of data.items) {
+      if (item.type !== "keyDriversVisual") continue;
+      const info = visualInfo(options.reportColors, item.page, item.name);
+      const kd = info && info.keyDrivers;
+      const target = kd && kd.target && kd.target.field;
+      if (!target || target.kind !== "column" || !target.entity) { item.kiError = "its fields couldn't be read"; continue; }
+      const filters = [...(data.queryFilters || []), ...(item.visualFilters || [])];
+      const fields = [];
+      for (const f of kd.explainBy) {
+        if (!f.field || f.field.kind !== "column" || !f.field.entity) continue;   // number fields: explained in the report only
+        const res = await keyInfluencerCounts(f.field, target, filters);
+        if (res.error) { item.kiError = res.error; break; }
+        fields.push({ ref: f.ref, label: f.label, prop: f.field.prop, counts: res.rows });
+      }
+      if (!item.kiError) item.kiCounts = { fields };
+      log(`Key influencers "${item.title}": ${item.kiError ? item.kiError : `${fields.length} field(s) counted`}`);
+    }
+  }
+}
+
+/* Rows per value of one field and of the analysed field: { rows: [[value, target, count]] } or { error } */
+async function keyInfluencerCounts(field, target, filters) {
+  let daxError = null;
+  try {
+    const filterTables = filters.map(daxFilter).filter(Boolean);
+    const query = `EVALUATE SUMMARIZECOLUMNS(${[daxColumn(field.entity, field.prop), daxColumn(target.entity, target.prop), ...filterTables,
+      `"n", COUNTROWS('${String(target.entity).replace(/'/g, "''")}')`].join(", ")})`;
+    const res = await executeDaxQuery(query);
+    if (!res.error) {
+      const v = `${field.entity}[${field.prop}]`, t = `${target.entity}[${target.prop}]`;
+      return { rows: res.rows.map((r) => [r[v], r[t], r["[n]"]]) };
+    }
+    daxError = res.error;
+  } catch (e) {
+    daxError = errorText(e);
+  }
+  try {
+    if (typeof websiteQuery !== "function") throw new Error("not available");
+    // Count (5): the analysed column's rows, grouped by it and the field
+    const rows = await websiteQuery([field, target, { kind: "agg", entity: target.entity, prop: target.prop, agg: 5 }], filters);
+    return { rows };
+  } catch (e) {
+    return { error: `the rows behind it couldn't be counted (${daxError}; ${errorText(e)})` };
+  }
+}
+
 /* ── Orchestrator ─────────────────────────────────────────────────────── */
 /*
  * pages: Power BI Page objects to export, in order.
@@ -6706,6 +6847,7 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
     await loadDrillLevels(collected, options);
     onProgress({ pageIndex: pages.length, pageCount: pages.length, pageName: pages[pages.length - 1].displayName, visualIndex: 0, visualCount: 0, visualTitle: "Reading sparklines…" });
     await loadSparklines(collected, options);
+    await loadKeyInfluencers(collected, options);
   }
 
   // "Match the report" accent: the report theme's main colour, else a neutral navy

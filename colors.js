@@ -1354,6 +1354,24 @@ function visualColorInfo(visual, theme) {
     builtin: builtInSettings(visual, theme),
     // A matrix's saved expand / collapse state: per role, each level's default and the groups toggled
     expansion: visual.expansion || null,
+    keyDrivers: visual.type === "keyDriversVisual" ? keyDriversSettings(visual) : null,
+  };
+}
+
+/* A key influencers visual's analysis: the field analysed (Target), the value it explains
+   ("Won"), and the fields that explain it */
+function keyDriversSettings(visual) {
+  const props = ((((visual.objects || {}).keyDrivers || [])[0]) || {}).properties || {};
+  const lit = props.targetValue && props.targetValue.expr && props.targetValue.expr.Literal;
+  // A literal of a literal: '''Won''' is the text 'Won', whose value is Won
+  const unquote = (s) => (/^'.*'$/s.test(s) ? s.slice(1, -1).replace(/''/g, "'") : s);
+  const targetValue = lit && lit.Value !== undefined ? unquote(unquote(String(lit.Value))) : null;
+  return {
+    target: ((visual.roles || {}).Target || [])[0] || null,
+    targetValue,
+    explainBy: (visual.roles || {}).ExplainBy || [],
+    analysis: props.selectedAnalysis && props.selectedAnalysis.expr && props.selectedAnalysis.expr.Literal
+      ? unquote(String(props.selectedAnalysis.expr.Literal.Value)) : "keyInfluencers",
   };
 }
 
