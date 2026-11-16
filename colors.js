@@ -1357,7 +1357,38 @@ function visualColorInfo(visual, theme) {
     keyDrivers: visual.type === "keyDriversVisual" ? keyDriversSettings(visual) : null,
     // A decomposition tree's bars per level (its levels and open branches are in expansion)
     barsPerLevel: visual.type === "decompositionTreeVisual" ? treeBarsPerLevel(visual) : null,
+    // Number settings shown as the report shows them ("Numbers: As in the report")
+    valueUnits: valueUnitsOf(visual, theme),
+    columnUnits: ["tableEx", "pivotTable"].includes(visual.type) ? columnUnitsOf(visual) : null,
   };
+}
+
+/* A card's value display units and decimals: { units (0 = Auto), precision (null = Auto) }, from
+   the visual's own setting, else its themes; null for a visual with none */
+const VALUE_UNIT_SETTINGS = {
+  card: ["labels", "labelDisplayUnits", "labelPrecision"],
+  cardVisual: ["value", "labelDisplayUnits", "labelPrecision"],
+  kpi: ["indicator", "indicatorDisplayUnits", "indicatorPrecision"],
+  gauge: ["calloutValue", "labelDisplayUnits", "labelPrecision"],
+};
+function valueUnitsOf(visual, theme) {
+  const set = VALUE_UNIT_SETTINGS[visual.type];
+  if (!set) return null;
+  const get = formatReader(visual, theme);
+  return { units: settingNumber(get(set[0], set[1]), 0), precision: settingNumber(get(set[0], set[2])) };
+}
+
+/* A table's or matrix's per-column display units and decimals: { "m:sales": { units, precision } } */
+function columnUnitsOf(visual) {
+  const out = {};
+  for (const d of ((visual.objects || {}).columnFormatting || [])) {
+    const key = selectorKey(d.selector);
+    const props = d.properties || {};
+    const lit = (p) => (props[p] && props[p].expr && props[p].expr.Literal ? String(props[p].expr.Literal.Value).replace(/[DL]$/, "") : undefined);
+    const units = settingNumber(lit("labelDisplayUnits"), 0), precision = settingNumber(lit("labelPrecision"));
+    if (key && (units > 0 || precision !== null)) out[key] = { units, precision };
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 /* A decomposition tree's bars per level ("8L"), or null when it keeps Power BI's default */

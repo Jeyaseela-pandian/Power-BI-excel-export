@@ -986,6 +986,29 @@ function readableFormats(header, data) {
 /* A table's number columns in display units, as Power BI's "Auto" units show them: one unit
    per column from its largest value (thousands from 10,000), two decimals; percentages, years,
    codes and small numbers unchanged. Formats already set for a column are kept. */
+/* "Numbers: As in the report": each column the report gives display units or decimals, in them
+   (the cells keep their exact values); null when the report sets none */
+function reportFormats(item, info) {
+  const set = info && info.columnUnits;
+  if (!set) return null;
+  const own = item.cellFormats || [];
+  const { header, data } = classifyColumns(item.rows);
+  const cells = data.map((row) => header.map((_, ci) => toCellValue(row[ci])));
+  const readable = readableFormats(header, cells);
+  let changed = false;
+  const out = header.map((name, ci) => {
+    const s = set["m:" + normalizeField(name)];
+    const nums = cells.map((r) => r[ci].value).filter((v) => typeof v === "number");
+    if (!s || !nums.length) return own[ci] || null;
+    const base = own[ci] || readable[ci] || (cells.map((r) => r[ci]).find((c) => c.numFmt) || {}).numFmt || "#,##0";
+    if (/[dmyhs]/i.test(base.replace(/"[^"]*"/g, ""))) return own[ci] || null;   // dates
+    changed = true;
+    // a table's "Auto" units show the full number, as Power BI's tables do
+    return labelNumFmt(base, nums, { units: s.units > 0 ? s.units : 1, precision: s.precision });
+  });
+  return changed ? out : null;
+}
+
 function shortFormats(item) {
   const own = item.cellFormats || [];
   const { header, data, numeric, helper } = classifyColumns(item.rows);
@@ -1101,6 +1124,17 @@ function cellUnits(text, font, indent = 0) {
 }
 
 /* The text a compact KPI format (2.52M) shows */
+/* "Numbers: As in the report": a card's value in the report's display units (Auto: as Power BI
+   picks them) and decimals (two when shortened, as Power BI's cards show 3.94M); null when it
+   shows as exported */
+function reportValueFormat(item, info, value, fmt) {
+  if (typeof value !== "number") return null;
+  const set = (info && info.valueUnits) || (VALUE_UNIT_SETTINGS[item.type] ? { units: 0, precision: null } : null);
+  if (!set) return null;
+  const f = labelNumFmt(fmt || "#,##0", [value], set, 2);
+  return f && f !== (fmt || "#,##0") ? f : null;
+}
+
 function compactText(value, fmt) {
   const prefix = ((fmt || "").match(/^"([^"]*)"/) || [])[1] || "";
   const a = Math.abs(value);
@@ -2436,7 +2470,7 @@ function blockSize(item, options) {
     const [header, values = []] = item.rows;
     const hero = toCellValue(values[0]);
     const fmt = readableFormats([header[0]], [[hero]])[0] || hero.numFmt;
-    const compact = !!compactFormat(hero.value, fmt);
+    const compact = options.tableNumbers !== "report" && !!compactFormat(hero.value, fmt);
     const height = (kpiHasTitle(item) ? 1 : 0) + 3 + (compact ? 1 : 0) + (header.length - 1);
     return { width: 2, height, note: false };
   }
@@ -2508,8 +2542,9 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
   label.alignment = { horizontal: "left", vertical: "bottom", indent: 1 };
 
   const hero = cells[0];
-  const heroFmt = fmtOf(0);
-  const compact = compactFormat(hero.value, heroFmt);
+  const report = lay.reportNumbers && reportValueFormat(item, info, hero.value, fmtOf(0));
+  const heroFmt = report || fmtOf(0);
+  const compact = report ? null : compactFormat(hero.value, heroFmt);
   ws.mergeCellsWithoutStyle(top + 1, col, top + 2, col + 1);
   const v = ws.getCell(top + 1, col);
   const heroNone = hero.value === null || hero.value === undefined || hero.value === "";
@@ -3391,6 +3426,7 @@ function alignNoteRows(plan, maxExtend) {
  */
 function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
   const stacked = options.layout === "stacked";
+  lay.reportNumbers = options.tableNumbers === "report";   // cards in the report's display units
   const threshold = options.collapse ? options.visibleRows : Infinity;
   const maxExtend = Math.max(12, options.visibleRows);
   const tables = [];
@@ -3419,6 +3455,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     if (item.type === "pivotTable" && info && item.matrixGrid) matrixLayout(item, info);
     // Short numbers (2.47M): each number column in display units; the cells keep exact values
     if (options.tableNumbers === "short" && !item.isKpi && !item.trend) item.cellFormats = shortFormats(item);
+    if (options.tableNumbers === "report" && !item.isKpi && !item.trend) item.cellFormats = reportFormats(item, info) || item.cellFormats;
     if (item.sparklines && item.sparklines.length && !item.stepped) addSparklineColumns(item);
     if (TABLE_VISUAL_TYPES.includes(item.type) && !item.stepped) item.totals = totalsPlan(item, info);
     // A title turned off in the report isn't shown either (it is often an internal name such

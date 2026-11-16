@@ -164,19 +164,22 @@
       </fieldset>
       
       <fieldset>
+        <legend>Number format</legend>
+        <label class="choice"><input type="radio" name="optTableNumbers" value="exact">
+          <span>Full precision<small>2,471,203</small></span></label>
+        <label class="choice"><input type="radio" name="optTableNumbers" value="short">
+          <span>Abbreviated<small>2.47M</small></span></label>
+        <label class="choice"><input type="radio" name="optTableNumbers" value="report">
+          <span>Match report<small>The display units and decimal places set in Power BI, e.g. $3.94M</small></span></label>
+        <p class="field-note">Cells always retain their exact values for calculations.</p>
+      </fieldset>
+
+      <fieldset>
         <legend>Chart background</legend>
         <label class="choice"><input type="radio" name="optChartBackground" value="white">
           <span>White<small>Clean and printable. Text and gridlines made for a dark report turn dark so they stay readable; data colours stay as in the report.</small></span></label>
         <label class="choice"><input type="radio" name="optChartBackground" value="report">
           <span>As in the report<small>Each chart keeps its visual's own background, dark or light.</small></span></label>
-      </fieldset>
-
-      <fieldset>
-        <legend>Numbers in tables</legend>
-        <label class="choice"><input type="radio" name="optTableNumbers" value="exact">
-          <span>Exact<small>2,471,203</small></span></label>
-        <label class="choice"><input type="radio" name="optTableNumbers" value="short">
-          <span>Short, like the report's charts<small>2.47M. Each cell still holds the exact value, for sums and formulas.</small></span></label>
       </fieldset>
 
       <fieldset>
