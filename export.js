@@ -196,6 +196,7 @@ const FRIENDLY_TYPES = {
   ribbonChart: "Ribbon chart", waterfallChart: "Waterfall chart", funnel: "Funnel", scatterChart: "Scatter chart",
   pieChart: "Pie chart", donutChart: "Donut chart", treemap: "Treemap", map: "Map", filledMap: "Map",
   shapeMap: "Map", azureMap: "Map", decompositionTreeVisual: "Decomposition tree",
+  keyDriversVisual: "Key influencers", aiNarratives: "Smart narrative", qnaVisual: "Q&A",
 };
 
 function friendlyType(type) {
@@ -3249,6 +3250,12 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
       if (chartTitle) item.chart.title = chartTitle;
       Object.assign(item.chart, { look, sizePx: item.chart.sizePx || chartSizePx(item), showTitle: !(info && info.titleHidden) && look.title.show !== false });
       item.chart = withDateAxis(withNumberOrder(item.chart));
+      // A chart Excel's part can't be written for stays a table, so the rest of the file is still made
+      const broken = chartBuildError(item.chart);
+      if (broken) {
+        log(`Chart for "${item.title}" not drawn, kept as a table: ${errorText(broken)}`);
+        item.chart = null;
+      }
     }
     if (item.chart && item.chart.note) colorNotes.push(item.chart.note);
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
@@ -3517,6 +3524,11 @@ async function collectPage(page, options, onProgress, isCancelled) {
     }
     if (options.excludedVisuals && options.excludedVisuals.has(v.name)) continue;
     if ((customVisual(v.type) || {}).rule === "none") continue;   // an AppSource visual with no data (a button)
+    // Visuals whose content Power BI works out on screen: their export would only be raw rows, or nothing
+    if (ON_SCREEN_ONLY[v.type]) {
+      notes.push(`Not included: "${v.title || friendlyType(v.type)}" – ${ON_SCREEN_ONLY[v.type]}`);
+      continue;
+    }
 
     // Every other visual: try to export. Decorative ones (text box, shape, button…)
     // usually have no data; they are included only if Power BI returns some.
@@ -3553,6 +3565,11 @@ async function collectPage(page, options, onProgress, isCancelled) {
 }
 
 /* Visuals whose data Power BI doesn't export, by type: what to call them in a note */
+const ON_SCREEN_ONLY = {
+  keyDriversVisual: "a key influencers visual is an AI analysis Power BI works out on screen; its export would only be the raw rows behind it. View it in the report.",
+  aiNarratives: "a smart narrative's text is written by Power BI on screen and isn't exported. View it in the report.",
+  qnaVisual: "a Q&A visual answers questions on screen and has no data to export.",
+};
 const NOT_EXPORTABLE = {
   keyDriversVisual: "key influencers visuals", qnaVisual: "Q&A visuals", scriptVisual: "R visuals", pythonVisual: "Python visuals",
   rdlVisual: "paginated report visuals", powerApps: "Power Apps visuals", PowerApps_PowerBI_Visual: "Power Apps visuals",
@@ -4066,7 +4083,8 @@ function chartPlan(item) {
     const byRule = !byKey && colors && colors.dot && colors.dot.keyCol === legendCol ? colors.dot.colorOf : null;
     // No legend colours worked out (colors): each value's colour set by hand, else the theme's in order
     const fallback = byKey || liveLegend ? null : themeColorsOf(item, legends);
-    return {
+    // A legend with no values at all (every legend cell blank): drawn as if it had no legend
+    if (legends.length) return {
       ...base,
       valueName: header[vc],
       legendName: header[legendCol],
@@ -4096,7 +4114,9 @@ function chartPlan(item) {
     // An empty measure has no colour worked out (it has no values): its own, else the theme's for its place
     color: (colors && colors.series && colors.series[ci]) ||
       (empty(ci) && (overrides["m:" + normalizeField(header[ci])] || palette.length) ? toArgb(overrides["m:" + normalizeField(header[ci])] || palette[i % palette.length]) : null),
-    line: spec.kind === "combo" && (lineCols ? lineCols.includes(ci) : valueCols.length > 1 && i === valueCols.length - 1),
+    // A line chart's secondary y-axis values (Y2) go on the second axis too, as in Power BI
+    line: spec.kind === "combo" ? (lineCols ? lineCols.includes(ci) : valueCols.length > 1 && i === valueCols.length - 1)
+      : spec.kind === "line" && !!lineCols && lineCols.includes(ci) && lineCols.length < valueCols.length,
   }));
   // A combo showing only line values is a line chart
   if (series.every((s) => s.line)) {
@@ -4229,6 +4249,22 @@ function withNumberOrder(plan) {
   const pick = (list) => (Array.isArray(list) ? order.map((i) => list[i]) : list);
   return { ...plan, categories: pick(plan.categories), catText: pick(plan.catText), pointColors: pick(plan.pointColors),
     series: plan.series.map((s) => ({ ...s, values: pick(s.values) })) };
+}
+
+/* Builds a chart's part once with stand-in data references (the real ones come with the Data
+   sheet): the error when it can't be built, else null */
+function chartBuildError(plan) {
+  const ref = "'Data'!$A$1:$A$2";
+  const test = { ...plan, refs: { catRef: ref, series: (plan.series || []).map(() => ({ nameRef: "'Data'!$A$1", valRef: ref })), range: () => ref } };
+  try {
+    const kind = plan.spec.kind;
+    if (kind === "treemap" || kind === "sunburst") treemapXml(test, 1);
+    else if (kind === "boxWhisker") boxWhiskerXml(test);
+    else chartXml(test);
+    return null;
+  } catch (e) {
+    return e;
+  }
 }
 
 /* Shared helpers for the chart builders below */

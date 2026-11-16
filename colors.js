@@ -602,10 +602,25 @@ async function fetchWebsiteThemeFiles(report, layout, themeCollection, signal) {
 
 /* The themes a newer-format layout names in its content: { baseTheme, customTheme } or null */
 function contentThemeCollection(layout) {
-  const ec = parsedJson(layout.explorationContent) || layout.explorationContent;
-  const report = ec && ec.explorationDocument && ec.explorationDocument.report;
-  const content = report && (parsedJson(report.content) || report.content);
-  return (content && typeof content === "object" && content.themeCollection) || null;
+  // The first themeCollection in the content that names a theme, wherever the format keeps it
+  const seen = new Set();
+  const find = (node, depth) => {
+    node = parsedJson(node) || node;
+    if (!node || typeof node !== "object" || depth > 8 || seen.has(node)) return null;
+    seen.add(node);
+    if (namesTheme(node.themeCollection)) return node.themeCollection;
+    for (const v of Object.values(node)) {
+      if (typeof v === "string" && !/^\s*[{[]/.test(v)) continue;
+      const hit = find(v, depth + 1);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  return find(layout.explorationContent, 0);
+}
+/* A themeCollection that names a base or custom theme (not an empty {}) */
+function namesTheme(tc) {
+  return !!(tc && ((tc.baseTheme && tc.baseTheme.name) || (tc.customTheme && tc.customTheme.name)));
 }
 
 /* The website theme with the theme files' format settings: the files' own theme when the
@@ -633,13 +648,12 @@ async function websiteTheme(themeCollection, embedTheme) {
   return namedThemeFallback(themeCollection, embedTheme);
 }
 
-/* Power BI's base themes before Fluent 2 (CY24SU10) turn every visual's axis titles on. Their
+/* Power BI's base themes (CY24SU02, CY26SU05 …) turn every visual's axis titles on. Their
    JSON is only in the report file, so when it can't be read the export applies that setting
-   by the base theme's name, under every other layer (a later or unknown base theme adds none) */
+   by the base theme's name, under every other layer (an unknown base theme adds none) */
 function baseThemeAxisStyles(themeCollection) {
   const name = String(((themeCollection || {}).baseTheme || {}).name || "");
-  const m = /^CY(\d{2})SU(\d{2})/i.exec(name);
-  if (!m || Number(m[1]) * 100 + Number(m[2]) >= 2410) return null;
+  if (!/^CY\d{2}SU\d{2}/i.test(name)) return null;
   return { "*": { "*": { categoryAxis: [{ showAxisTitle: true }], valueAxis: [{ showAxisTitle: true }] } } };
 }
 function withBaseThemeAxes(theme, themeCollection) {
@@ -664,15 +678,16 @@ async function readWebsiteDesign(report, embedTheme, signal) {
   const { layout, route } = await fetchWebsiteLayout(report, signal);
   let config = {};
   try { config = JSON.parse(layout.config || "{}"); } catch (e) { /* no theme */ }
-  let theme = await websiteTheme(config.themeCollection, embedTheme);
-  // The theme files themselves (axis titles and other settings a custom theme sets), when readable;
-  // the newer format names the themes in its content rather than the config
-  const themes = config.themeCollection || contentThemeCollection(layout);
+  // The newer format names the themes in its content rather than the config
+  const themes = (namesTheme(config.themeCollection) && config.themeCollection) || contentThemeCollection(layout) || config.themeCollection || null;
+  let theme = await websiteTheme(themes, embedTheme);
+  // The theme files themselves (axis titles and other settings a custom theme sets), when readable
   try {
     theme = withThemeFiles(theme, await fetchWebsiteThemeFiles(report, layout, themes, signal), themes);
   } catch (e) {
     if (e && e.name === "AbortError") throw e;
     log(`Website layout: the theme files couldn't be read (${errorText(e)})`);
+    theme = withBaseThemeAxes(theme, themes);   // the axis titles the base theme turns on, by its name
   }
   let visuals = classicVisuals(layout, theme);
   // Some reports' pages list only placeholders; their visuals are in the exploration content
@@ -952,8 +967,8 @@ function chartLook(visual, theme) {
  * (its title), true / false. Power BI resolves each setting in layers, and so does the export:
  * the visual's own default (axes shown, titles off), then the report's base theme, then its
  * custom theme (each for every visual, "*", then for this visual type), then the visual's own
- * setting. So a report on an older base theme shows axis titles unless a visual turns them off,
- * one on Fluent 2 or with no base theme doesn't unless a visual turns them on.
+ * setting. So a report on a Power BI base theme shows axis titles unless a visual turns them off,
+ * one with no base theme doesn't unless a visual turns them on.
  */
 const AXIS_DEFAULTS = { categoryAxis: { show: true, showAxisTitle: false }, valueAxis: { show: true, showAxisTitle: false, secShow: true } };
 function axisSettings(objects, type, theme) {
