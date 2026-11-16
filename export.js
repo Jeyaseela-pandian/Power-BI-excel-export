@@ -3463,6 +3463,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
         item.chart = null;
       }
       if (item.chart && item.panels) item.chart.panels = panelPlans(item, info, look, lay.palette);
+      if (item.chart && !item.chart.panels) item.chart = growForLegend(item.chart);
     }
     if (item.chart && item.chart.note) colorNotes.push(item.chart.note);
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
@@ -3528,7 +3529,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
       lastCol = Math.max(lastCol, col + size.width - 1);
       if (item.chart) {
         // Charts mode: reserve the chart's place; the chart itself is added to the file at the end
-        const { w, h } = chartSizePx(item);
+        const { w, h } = item.chart.sizePx || chartSizePx(item);
         widths.span(col, col + size.width - 1, Math.ceil(w / UNIT_PX));
         (lay.charts = lay.charts || []).push({ plan: item.chart, col, row: r, wPx: w, hPx: h });
         for (let i = 0; i < size.height; i++) mark(r + i, "other");
@@ -4133,7 +4134,7 @@ function chartSizePx(item) {
 
 /* Rows and columns a chart covers on the page sheet */
 function chartBlockSize(item) {
-  const { w, h } = chartSizePx(item);
+  const { w, h } = (item.chart && item.chart.sizePx) || chartSizePx(item);
   return { width: Math.max(2, Math.round(w / 90)), height: Math.ceil(h / ROW_PX) + 1, note: false };
 }
 
@@ -4480,6 +4481,28 @@ function panelPlans(item, info, look, palette) {
     plans.push(plan);
   }
   return { plans, cols, rows, w, h, head, title: head ? item.chart.title : null, look };
+}
+
+/*
+ * A chart whose legend can't show every entry in its size (a pie of 37 products) is made taller
+ * by the rows its legend needs, so every entry shows and the chart itself keeps its room; at
+ * most three times its height, beyond which the legend shows the first entries that fit.
+ */
+const LEGEND_GROWTH_MAX = 3;
+function growForLegend(plan) {
+  const ref = "'Data'!$A$1:$A$2";
+  const need = (p) => {
+    try {
+      return chartXml({ ...p, refs: { catRef: ref, series: (p.series || []).map(() => ({ nameRef: "'Data'!$A$1", valRef: ref })), range: () => ref } }).legendNeed;
+    } catch (e) {
+      return null;
+    }
+  };
+  const n = need(plan);
+  if (!n || !n.cut || !plan.sizePx) return plan;
+  const h = Math.ceil(plan.sizePx.h + n.extraRows * n.rowH + 8);
+  if (h > plan.sizePx.h * LEGEND_GROWTH_MAX) return plan;
+  return { ...plan, fullLegend: true, sizePx: { ...plan.sizePx, h } };
 }
 
 /* Builds a chart's part once with stand-in data references (the real ones come with the Data
@@ -5054,6 +5077,34 @@ function pieLabelPoints(plan, look) {
   }).filter(Boolean);
 }
 
+/*
+ * A pie's labels that fit: each sits outside its slice's middle, on the slice's side (right or
+ * left), at that height; one that would overlap a label already placed on its side is left out.
+ * Largest slices are placed first, so the small ones give way, as in Power BI. Every label fits
+ * when there's room, so pies with few slices are unchanged.
+ */
+function fitPieLabels(points, values, startAngle, radius, lineH) {
+  if (points.length < 2) return points;
+  const v = values.map((x) => (typeof x === "number" && x > 0 ? x : 0));
+  const total = v.reduce((a, b) => a + b, 0);
+  if (!total) return points;
+  const mid = [];
+  let at = startAngle;
+  v.forEach((x, i) => { const sweep = (x / total) * 360; mid[i] = at + sweep / 2; at += sweep; });
+  const placed = { left: [], right: [] };
+  const keep = new Set();
+  for (const p of [...points].sort((a, b) => v[b.idx] - v[a.idx])) {
+    const rad = (mid[p.idx] * Math.PI) / 180;
+    const side = Math.sin(rad) >= 0 ? "right" : "left";
+    const y = -Math.cos(rad) * (radius + lineH);
+    const h = String(p.text).split("\n").length * lineH;
+    if (placed[side].some((q) => Math.abs(q.y - y) < (q.h + h) / 2 + 2)) continue;
+    placed[side].push({ y, h });
+    keep.add(p.idx);
+  }
+  return points.filter((p) => keep.has(p.idx));
+}
+
 /* Which columns are X, Y and Size: the report file's field wells when it could be read, else
    Power BI's automatic title, which lists them in order ("X, Y and Size by Details"), else column order */
 function scatterFields(t, item, info, nums) {
@@ -5622,11 +5673,20 @@ function chartXml(plan) {
   const room = Math.max(40, W - 16 - titleW);
   const colW = Math.max(20, ...entryW);
   const perRow = Math.max(1, Math.min(legendNames.length, Math.floor(room / colW)));
-  const legendRows = Math.max(1, Math.ceil(legendNames.length / perRow));
   // A box a little too small makes Excel leave entries out, so it gets room to spare
   const rowH = lineH + 5;
-  const legendW = across ? Math.min(room, perRow * colW + 12) : Math.min(W * 0.4, Math.max(titleW, ...entryW, 20) + 12);
-  const legendH = across ? rowH * legendRows + 6 : rowH * legendNames.length + 6 + (legendTitle ? lineH : 0);
+  // More entries than fit (a slice per product): the first ones, as Power BI's legend shows its
+  // first entries and scrolls to the rest, so the legend never squeezes or covers the chart.
+  // A top or bottom legend takes at most 30% of the height, a side legend the height there is.
+  // (a chart made taller for its legend, plan.fullLegend, shows every entry)
+  const maxRows = plan.fullLegend ? Infinity : across ? Math.max(1, Math.floor((H - titleH) * 0.3 / rowH))
+    : Math.max(1, Math.floor((H - titleH - 12 - (legendTitle ? lineH : 0)) / rowH));
+  const legendIdx = scatter ? null : round ? legendNames.map((_, i) => i) : series.map((s, i) => (s.noLegend ? -1 : i)).filter((i) => i >= 0);
+  const shownCount = legendIdx ? Math.min(legendNames.length, across ? perRow * maxRows : maxRows) : legendNames.length;
+  const legendCut = legendIdx ? legendIdx.slice(shownCount) : [];
+  const legendRows = Math.max(1, Math.ceil(shownCount / perRow));
+  const legendW = across ? Math.min(room, perRow * colW + 12) : Math.min(W * 0.4, Math.max(titleW, ...entryW.slice(0, shownCount), 20) + 12);
+  const legendH = across ? rowH * legendRows + 6 : rowH * shownCount + 6 + (legendTitle ? lineH : 0);
   let legendBox = null;
   if (legendOn) {
     let x, y;
@@ -5657,9 +5717,8 @@ function chartXml(plan) {
     // Pie and donut: slices from 12 o'clock, labels outside with leader lines. A donut is a pie
     // with its hole drawn over the centre, so its labels can sit outside as Power BI's do;
     // the pie is placed by hand in the room the title, legend and labels leave.
-    const pts = look.labels.show === false ? [] : pieLabelPoints(plan, look);
-    const ser = chartSeriesXml("pie", { ...series[0], labelsXml: pts.length ? textLabelsXml(pts, look.labels.text) : "" }, 0, plan, refs.series[0]);
-    body = `<c:pieChart><c:varyColors val="1"/>${ser}<c:firstSliceAng val="${Math.round(((look.startAngle || 0) % 360 + 360) % 360)}"/></c:pieChart>`;
+    let pts = look.labels.show === false ? [] : pieLabelPoints(plan, look);
+    const startAngle = Math.round(((look.startAngle || 0) % 360 + 360) % 360);
     let x0 = 0, x1 = W, y0 = titleH, y1 = H;
     if (legendOn) {
       if (side === "l") x0 += legendW + 14; else if (side === "r") x1 -= legendW + 14;
@@ -5670,6 +5729,10 @@ function chartXml(plan) {
     const d = Math.max(40, Math.min(x1 - x0 - 2 * mx, y1 - y0 - 2 * my));
     const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
     plotLayout = manualLayoutA((cx - d / 2) / W, (cy - d / 2) / H, d / W, d / H, true);
+    // Only the labels that fit beside their slice, as Power BI shows them (the rest on hover)
+    pts = fitPieLabels(pts, series[0].values, startAngle, d / 2, lineHeightPx(look.labels.text));
+    const ser = chartSeriesXml("pie", { ...series[0], labelsXml: pts.length ? textLabelsXml(pts, look.labels.text) : "" }, 0, plan, refs.series[0]);
+    body = `<c:pieChart><c:varyColors val="1"/>${ser}<c:firstSliceAng val="${startAngle}"/></c:pieChart>`;
     if (kind === "doughnut") {
       const ratio = look.donutHole !== null && look.donutHole !== undefined ? Math.min(0.95, Math.max(0.05, look.donutHole / 100 * 0.6 + 0.37)) : DONUT_HOLE;
       const hd = d * ratio;
@@ -5693,7 +5756,7 @@ function chartXml(plan) {
     body = cartesianXml(plan, look, { titleH, legendOn, side, legendW, legendH, catLabel }, hidden);
   }
 
-  const hiddenEntries = [...new Set(hidden)].sort((a, b) => a - b).map((i) => `<c:legendEntry><c:idx val="${i}"/><c:delete val="1"/></c:legendEntry>`).join("");
+  const hiddenEntries = [...new Set([...hidden, ...legendCut])].sort((a, b) => a - b).map((i) => `<c:legendEntry><c:idx val="${i}"/><c:delete val="1"/></c:legendEntry>`).join("");
   const legend = legendOn
     ? `<c:legend><c:legendPos val="${side}"/>${hiddenEntries}${manualLayoutA(legendBox.x / W, legendBox.y / H, legendBox.w / W, legendBox.h / H)}<c:overlay val="0"/>${txPrA(LT)}</c:legend>` : "";
   const F = look.frame;
@@ -5706,7 +5769,9 @@ function chartXml(plan) {
     `<c:roundedCorners val="${F.border && F.border.radius > 0 ? 1 : 0}"/><c:chart>${title}<c:plotArea>${plotLayout}${body}${NO_BOX}</c:plotArea>${legend}` +
     `<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart>${frame}${txPrA(LT)}` +
     (shapes.length ? `<c:userShapes r:id="${USER_SHAPES_RID}"/>` : "") + `</c:chartSpace>`;
-  return { xml, shapes: shapes.length ? userShapesXml(shapes) : null };
+  // What the legend left out, and the rows it would need to show everything (legendRoom)
+  const legendNeed = { cut: legendCut.length, rowH, extraRows: legendCut.length ? Math.ceil(legendNames.length / (across ? perRow : 1)) - (across ? legendRows : shownCount) : 0 };
+  return { xml, shapes: shapes.length ? userShapesXml(shapes) : null, legendNeed };
 }
 
 /*

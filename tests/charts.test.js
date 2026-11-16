@@ -118,6 +118,70 @@ test("a one-series stacked bar chart is drawn as plain bars, with labels past th
   assert.strictEqual(two.grouping, "stacked");
 });
 
+/* A pie or donut's XML: { legendShown, labels } — the legend entries left visible and the slices labelled */
+function roundChart(type, rows, legendPosition = "Top") {
+  ctx.T = { type, title: "t", rows };
+  ctx.P = PALETTE;
+  run(`T.colors = columnColors(T, P, null); T.themePalette = P; var r = chartPlan(T); var rl = chartLook({ type: T.type }, null);
+    rl.labels.show = true; rl.legend.show = true; rl.legend.position = "${legendPosition}";
+    Object.assign(r, { look: rl, sizePx: { w: 420, h: 320 }, title: "t", showTitle: true });
+    r.refs = { catRef: "D!A1:A2", series: r.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B3" })), range: () => "D!B2" };`);
+  const xml = run("chartXml(r).xml");
+  const legend = (xml.match(/<c:legend>[\s\S]*?<\/c:legend>/) || [""])[0];
+  const hidden = (legend.match(/<c:delete val="1"\/>/g) || []).length;
+  const ser = (xml.match(/<c:ser>[\s\S]*?<\/c:ser>/) || [""])[0];
+  return { legendShown: rows.length - 1 - hidden, labels: (ser.match(/<c:dLbl>/g) || []).length };
+}
+const subcategories = (n) => [["Subcategory", "Sales"], ...Array.from({ length: n }, (_, i) => [`Sub ${i + 1}`, String(Math.round(4000 / (i + 1)))])];
+
+test("a pie or donut with many slices: a legend that fits and labels that don't overlap", () => {
+  const many = roundChart("donutChart", subcategories(37));
+  assert.ok(many.legendShown >= 1 && many.legendShown < 37, `legend shows the first entries that fit (${many.legendShown} of 37)`);
+  assert.ok(many.labels >= 1 && many.labels < 37, `labels only where they fit (${many.labels} of 37)`);
+  // few slices: every legend entry and every label, as before
+  const few = roundChart("pieChart", subcategories(4));
+  assert.deepStrictEqual(few, { legendShown: 4, labels: 4 });
+});
+
+test("a chart whose legend can't show every entry is made taller, so all of them show", () => {
+  roundChart("donutChart", subcategories(37));
+  const grown = json("(() => { const g = growForLegend(r); return { before: r.sizePx.h, after: g.sizePx.h, full: !!g.fullLegend }; })()");
+  assert.ok(grown.full && grown.after > grown.before, `taller: ${grown.before} → ${grown.after}px`);
+  run(`var g = growForLegend(r); g.refs = r.refs;`);
+  assert.strictEqual(run("chartXml(g).legendNeed.cut"), 0, "every legend entry shows");
+  // legends that fit: same size, unchanged
+  roundChart("pieChart", subcategories(4));
+  assert.strictEqual(run("growForLegend(r) === r"), true);
+});
+
+test("on the sheet, a taller chart reserves its extra rows, so nothing below overlaps it", () => {
+  const rowsUsed = json(`(() => {
+    const cell = () => ({ font: {}, alignment: {}, border: {} });
+    const ws = { getCell: cell, getRow: () => ({ getCell: cell }), getColumn: () => ({ width: 10, letter: "A" }), mergeCells() {}, mergeCellsWithoutStyle() {},
+      addTable() {}, addConditionalFormatting() {}, addImage() {}, properties: {}, views: [], pageSetup: {}, headerFooter: {} };
+    const subs = (n) => Array.from({ length: n }, (_, i) => ["Sub " + (i + 1), String(Math.round(4000 / (i + 1)))]);
+    const page = (n) => {
+      const lay = { fonts: makeFonts(), accent: { tab: "FF000000", cap: "FF000000" }, sheetName: "P", palette: ["#118DFF"], reportColors: null, slicerFields: [], tableStyle: "TableStyleMedium2" };
+      const items = [{ type: "donutChart", title: "t", name: "d", page: "p", rows: [["Subcategory", "Sales"], ...subs(n)], layout: { x: 0, y: 0, width: 420, height: 320 } }];
+      const res = writePageLayout(ws, items, 10, makeWidthTracker(), { visualsAs: "charts", layout: "report", collapse: true, visibleRows: 15, chartBackground: "white" }, lay, (t) => t);
+      return { rows: res.nextRow - 10, h: lay.charts[0].hPx };
+    };
+    return { few: page(4), many: page(37) };
+  })()`);
+  assert.ok(rowsUsed.many.h > rowsUsed.few.h, "the chart is taller");
+  assert.ok(rowsUsed.many.rows > rowsUsed.few.rows, "and the sheet gives it more rows");
+});
+
+test("a chart legend with a few entries shows them all", () => {
+  ctx.T = { type: "lineChart", title: "t", rows: [["Month", "A", "B", "C"], ["Jan", "1", "2", "3"], ["Feb", "2", "3", "4"]] };
+  run(`T.colors = columnColors(T, P, null); T.themePalette = P; var lc = chartPlan(T); var ll = chartLook({ type: T.type }, null); ll.legend.show = true;
+    Object.assign(lc, { look: ll, sizePx: { w: 400, h: 300 }, title: "t", showTitle: true });
+    lc.refs = { catRef: "D!A1:A2", series: lc.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B3" })), range: () => "D!B2" };`);
+  const legend = (run("chartXml(lc).xml").match(/<c:legend>[\s\S]*?<\/c:legend>/) || [""])[0];
+  assert.ok(legend, "a legend is drawn");
+  assert.strictEqual((legend.match(/<c:delete val="1"\/>/g) || []).length, 0);
+});
+
 test("ribbon charts stay tables", () => {
   assert.strictEqual(run(`chartSpecOf("ribbonChart")`), null);
   assert.ok(run(`chartSpecOf("columnChart")`));
