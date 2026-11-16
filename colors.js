@@ -1355,7 +1355,15 @@ function visualColorInfo(visual, theme) {
     // A matrix's saved expand / collapse state: per role, each level's default and the groups toggled
     expansion: visual.expansion || null,
     keyDrivers: visual.type === "keyDriversVisual" ? keyDriversSettings(visual) : null,
+    // A decomposition tree's bars per level (its levels and open branches are in expansion)
+    barsPerLevel: visual.type === "decompositionTreeVisual" ? treeBarsPerLevel(visual) : null,
   };
+}
+
+/* A decomposition tree's bars per level ("8L"), or null when it keeps Power BI's default */
+function treeBarsPerLevel(visual) {
+  const v = (((((((visual.objects || {}).tree || [])[0] || {}).properties || {}).barsPerLevel || {}).expr || {}).Literal || {}).Value;
+  return settingNumber(v === undefined ? null : String(v).replace(/L$/, ""), null);
 }
 
 /* A key influencers visual's analysis: the field analysed (Target), the value it explains

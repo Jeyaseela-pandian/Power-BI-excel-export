@@ -2186,6 +2186,114 @@ function keyInfluencerItems(item, info, notes) {
   return [table];
 }
 
+/*
+ * A decomposition tree as the report shows it: the total, then each level the report has open
+ * (Product category, then Product, then Region), with only the branches opened in the report
+ * expanded (Software, then Design app), largest first and up to its bars per level (the rest
+ * added up in one row). Power BI exports every combination of the fields, so each value is
+ * added up from those rows: only for a sum or a count, which add up exactly. Otherwise, or
+ * without the report's layout, the visual stays the table it was.
+ */
+const TREE_INDENT = "  ";   // two em spaces per level
+const joinNames = (n) => (n.length <= 1 ? n.join("") : `${n.slice(0, -1).join(", ")} and ${n[n.length - 1]}`);
+function decompositionTreeItem(item, info) {
+  if (item.type !== "decompositionTreeVisual" || !info || !info.roles) return item;
+  const [header, ...data] = item.rows;
+  const colOf = (f) => (f ? header.findIndex((h) => (f.label && String(h).trim().toLowerCase() === f.label) || normalizeField(h) === f.ref) : -1);
+  const measure = (info.roles.Analyze || [])[0];
+  const mc = colOf(measure);
+  const additive = measure && measure.field && measure.field.kind === "agg" && [0, 5].includes(measure.field.agg);   // Sum, Count
+  if (mc < 0 || !additive) return item;
+  // The open levels, in order, and the opened branch at each (the report's expansion state)
+  const state = ((info.expansion || []).find((s) => (s.roles || []).includes("ExplainBy"))) || null;
+  const explain = info.roles.ExplainBy || [];
+  const byQuery = (q) => explain.find((f) => f.queryRef === q);
+  const levels = state ? (state.levels || []).filter((l) => l.isPinned).map((l) => colOf(byQuery((l.queryRefs || [])[0]))) : [];
+  if (!levels.length || levels.some((ci) => ci < 0)) return item;
+  const literal = (v) => { const s = String(((v || {}).Literal || {}).Value ?? ""); return /^'.*'$/s.test(s) ? s.slice(1, -1).replace(/''/g, "'") : s; };
+  const text = (r, ci) => String(r[ci] ?? "").trim();
+  const num = (r) => { const v = toCellValue(text(r, mc)).value; return typeof v === "number" ? v : 0; };
+  // The measure as exported ("$1,234.5"): sums keep its currency sign and decimals
+  const sample = text(data.find((r) => text(r, mc)) || [], mc);
+  const currency = (sample.match(/^-?\s*([$€£₹¥])/) || [])[1] || "";
+  const decimals = ((sample.replace(/[^\d.]/g, "").split(".")[1]) || "").length;
+  const show = (n) => `${n < 0 ? "-" : ""}${currency}${Math.abs(n).toFixed(Math.min(decimals, 4))}`;
+  const pct = (x) => `${(x * 100).toFixed(1)}%`;
+  const limit = Math.max(1, info.barsPerLevel || 10);
+  const out = [];
+  const total = data.reduce((s, r) => s + num(r), 0);
+  out.push(["Total", "", show(total), "100.0%"]);
+  // One level under a branch: its values largest first, the opened one expanded beneath it
+  const walk = (rows, depth, node, parentTotal) => {
+    const ci = levels[depth];
+    const groups = new Map();
+    for (const r of rows) { const k = text(r, ci) || "(Blank)"; groups.set(k, (groups.get(k) || 0) + num(r)); }
+    const sorted = [...groups].sort((a, b) => b[1] - a[1]);
+    const open = new Set(((node && node.children) || []).filter((c) => c.isToggled).map((c) => literal((c.identityValues || [])[0])));
+    sorted.slice(0, limit).forEach(([name, value]) => {
+      out.push([TREE_INDENT.repeat(depth) + header[ci], name, show(value), pct(parentTotal ? value / parentTotal : 0)]);
+      if (open.has(name) && depth + 1 < levels.length) {
+        const child = node.children.find((c) => c.isToggled && literal((c.identityValues || [])[0]) === name);
+        walk(rows.filter((r) => (text(r, ci) || "(Blank)") === name), depth + 1, child, value);
+      }
+    });
+    const rest = sorted.slice(limit);
+    if (rest.length) {
+      const value = rest.reduce((s, [, v]) => s + v, 0);
+      out.push([TREE_INDENT.repeat(depth) + header[ci], `${rest.length} more`, show(value), pct(parentTotal ? value / parentTotal : 0)]);
+    }
+  };
+  walk(data, 0, state.root, total);
+  const path = [];
+  for (let node = state.root; node; ) {
+    const next = (node.children || []).find((c) => c.isToggled);
+    if (next) path.push(literal((next.identityValues || [])[0]));
+    node = next;
+  }
+  const shareHead = "Share of parent";
+  return {
+    ...item,
+    type: "decompositionTree",   // a plain table: its own Total row, no totals row added
+    title: isGenericTitle(item.title, item.type) ? `${header[mc]} by ${joinNames(levels.map((ci) => header[ci]))}` : item.title,
+    captionText: `As opened in the report${path.length ? `: ${path.join(" › ")}` : ""} · values added up from the report's data`,
+    rows: [["Level", "Name", header[mc], shareHead], ...out],
+    gridFormat: { measures: [], tableFormats: [{ target: "m:" + normalizeField(shareHead), kind: "bar",
+      bar: { color: DEFAULT_THEME_COLORS[0], negative: null, axis: null, reverse: false, showValue: true, share: true } }] },
+  };
+}
+
+/*
+ * A chart with small multiples (a field in Power BI's "Small multiples" well, stored as Rows):
+ * one small chart per value of that field, laid out in a grid under the visual's title as
+ * Power BI lays them out, with the visual's look and one value axis shared by all, joined into
+ * one Excel object (addChartsToFile). Charts mode only; the data table keeps every row. Without
+ * the report's layout, with one value, or with more panels than fit, the chart stays as it was.
+ */
+const SMALL_MULTIPLES_MAX = 12;
+function smallMultipleItems(item, info) {
+  const spec = chartSpecOf(item.type);
+  if (!spec || item.isKpi || !info || !info.roles || !(info.roles.Rows || []).length) return [item];
+  if (!["bar", "line", "area", "combo"].includes(spec.kind)) return [item];
+  const [header, ...data] = item.rows;
+  const f = info.roles.Rows[0];
+  const rc = header.findIndex((h) => (f.label && String(h).trim().toLowerCase() === f.label) || normalizeField(h) === f.ref);
+  if (rc < 0) return [item];
+  const key = (r) => String(r[rc] ?? "").trim() || "(Blank)";
+  const values = [...new Set(data.map(key))];
+  if (values.length < 2 || values.length > SMALL_MULTIPLES_MAX) return [item];
+  const drop = (r) => r.filter((_, ci) => ci !== rc);
+  // One value axis for all panels, as Power BI shares it (bars from zero, no negatives)
+  const nums = data.flatMap((r) => drop(r).map((x) => toCellValue(String(x ?? "")).value)).filter((v) => typeof v === "number");
+  const sharedMax = nums.length && nums.every((v) => v >= 0) ? Math.max(...nums) : null;
+  const cols = Math.ceil(Math.sqrt(values.length));
+  return [{
+    ...item,
+    panels: values.map((v) => ({ value: v, rows: [drop(header), ...data.filter((r) => key(r) === v).map(drop)] })),
+    panelGrid: { cols, rows: Math.ceil(values.length / cols) },
+    sharedMax,
+  }];
+}
+
 function splitCards(item, info) {
   if (item.type !== "cardVisual" || item.rows.length !== 2 || item.rows[0].length < 2) return [item];
   const [header, values] = item.rows;
@@ -3291,6 +3399,8 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
   // A new card with several measures: one tile per measure
   items = items.flatMap((item) => splitCards(item, visualInfo(lay.reportColors, item.page, item.name)));
   items = items.flatMap((item) => keyInfluencerItems(item, visualInfo(lay.reportColors, item.page, item.name), colorNotes));
+  items = items.map((item) => decompositionTreeItem(item, visualInfo(lay.reportColors, item.page, item.name)));
+  if (options.visualsAs === "charts") items = items.flatMap((item) => smallMultipleItems(item, visualInfo(lay.reportColors, item.page, item.name)));
   for (const item of items) {
     item.matrixGrid = options.matrixLayout === "grid";
     const info = atDrillLevel(item, withLiveDrill(item, visualInfo(lay.reportColors, item.page, item.name)));
@@ -3330,7 +3440,13 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     if (item.chart) {
       // The visual's format settings (Power BI's defaults without the report file)
       const reportLook = (info && info.look) || chartLook({ type: item.type }, null);
-      const look = options.chartBackground === "report" ? reportLook : lookOnWhite(reportLook);   // white unless asked otherwise
+      let look = options.chartBackground === "report" ? reportLook : lookOnWhite(reportLook);   // white unless asked otherwise
+      // Small multiples share one value axis, rounded as the chart's own would be
+      if (item.sharedMax !== null && item.sharedMax !== undefined && look.val && look.val.end == null) {
+        const shared = valueScale([item.sharedMax], 200, 75, { zero: true });
+        const end = shared && shared.step ? Number((Math.ceil(item.sharedMax / shared.step - 1e-9) * shared.step).toFixed(12)) : shared && shared.max;
+        if (end > 0) look = { ...look, val: { ...look.val, start: look.val.start ?? 0, end } };
+      }
       if (chartTitle) item.chart.title = chartTitle;
       Object.assign(item.chart, { look, sizePx: item.chart.sizePx || chartSizePx(item), showTitle: !(info && info.titleHidden) && look.title.show !== false });
       item.chart = withDateAxis(withNumberOrder(item.chart));
@@ -3340,6 +3456,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
         log(`Chart for "${item.title}" not drawn, kept as a table: ${errorText(broken)}`);
         item.chart = null;
       }
+      if (item.chart && item.panels) item.chart.panels = panelPlans(item, info, look, lay.palette);
     }
     if (item.chart && item.chart.note) colorNotes.push(item.chart.note);
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
@@ -4336,6 +4453,29 @@ function withNumberOrder(plan) {
     series: plan.series.map((s) => ({ ...s, values: pick(s.values) })) };
 }
 
+/* Small multiples: each panel's chart (its own colours, the visual's look, centred value as its
+   title, no frame) sized to its cell of the grid under the title; null when any can't be drawn */
+const PANEL_TITLE_PX = 30;
+function panelPlans(item, info, look, palette) {
+  const { cols, rows } = item.panelGrid;
+  const total = item.chart.sizePx || chartSizePx(item);
+  const head = item.chart.showTitle && item.chart.title ? PANEL_TITLE_PX : 0;
+  const w = Math.floor(total.w / cols), h = Math.floor((total.h - head) / rows);
+  const panelLook = { ...look, title: { ...look.title, align: "center", show: true, background: null }, frame: { ...look.frame, border: null, shadow: null } };
+  const plans = [];
+  for (const pn of item.panels) {
+    const part = { ...item, rows: pn.rows, panels: null };
+    part.colors = palette ? columnColors(part, palette, info) : null;
+    let plan = chartPlan(part);
+    if (!plan) return null;
+    Object.assign(plan, { title: pn.value, look: panelLook, sizePx: { w, h }, showTitle: true });
+    plan = withDateAxis(withNumberOrder(plan));
+    if (chartBuildError(plan)) return null;
+    plans.push(plan);
+  }
+  return { plans, cols, rows, w, h, head, title: head ? item.chart.title : null, look };
+}
+
 /* Builds a chart's part once with stand-in data references (the real ones come with the Data
    sheet): the error when it can't be built, else null */
 function chartBuildError(plan) {
@@ -5020,8 +5160,7 @@ function writeChartDataSheet(wb, name, charts) {
   const sheetRef = `'${name.replace(/'/g, "''")}'`;
   const abs = (r, c) => `$${ws.getColumn(c).letter}$${r}`;
   let row = 2, widest = 1;
-  for (const ch of charts) {
-    const p = ch.plan;
+  for (const p of charts.flatMap((ch) => (ch.plan.panels ? ch.plan.panels.plans : [ch.plan]))) {
     const t = ws.getCell(row, 2);
     t.value = p.title;
     t.font = { name: "Calibri", size: 12, bold: true, color: { argb: C.INK } };
@@ -5797,6 +5936,31 @@ function chartExAnchorXml(ch, rid, id) {
     `</mc:AlternateContent><xdr:clientData/></xdr:oneCellAnchor>`;
 }
 
+/* Small multiples on the page sheet: one group (moved and sized as one) holding the visual's
+   title and a chart per panel in its grid */
+function panelGroupXml(ch, rids, id) {
+  const E = CHART_PX_TO_EMU, g = ch.plan.panels;
+  const W = Math.round(ch.wPx * E), H = Math.round(ch.hPx * E);
+  const frame = (k) => {
+    const x = (k % g.cols) * g.w * E, y = (g.head + Math.floor(k / g.cols) * g.h) * E;
+    return `<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="${id + 1 + k}" name="Chart ${id + 1 + k}"${altAttr(g.plans[k])}/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
+      `<xdr:xfrm><a:off x="${Math.round(x)}" y="${Math.round(y)}"/><a:ext cx="${Math.round(g.w * E)}" cy="${Math.round(g.h * E)}"/></xdr:xfrm>` +
+      `<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">` +
+      `<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="${rids[k]}"/>` +
+      `</a:graphicData></a:graphic></xdr:graphicFrame>`;
+  };
+  const T = g.look.title;
+  const title = g.title
+    ? `<xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="${id}" name="Title ${id}"/><xdr:cNvSpPr txBox="1"/></xdr:nvSpPr>` +
+      `<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${W}" cy="${Math.round(g.head * E)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></xdr:spPr>` +
+      `<xdr:txBody><a:bodyPr wrap="none" lIns="76200" tIns="0" rIns="76200" bIns="0" anchor="ctr"/><a:lstStyle/>${paraA(g.title, T, T.align === "center" ? "ctr" : T.align === "right" ? "r" : "l")}</xdr:txBody></xdr:sp>`
+    : "";
+  return `<xdr:oneCellAnchor><xdr:from><xdr:col>${ch.col - 1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${ch.row - 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>` +
+    `<xdr:ext cx="${W}" cy="${H}"/><xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="${id + 100}" name="Small multiples ${id}"/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>` +
+    `<xdr:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${W}" cy="${H}"/><a:chOff x="0" y="0"/><a:chExt cx="${W}" cy="${H}"/></a:xfrm></xdr:grpSpPr>` +
+    `${title}${g.plans.map((_, k) => frame(k)).join("")}</xdr:grpSp><xdr:clientData/></xdr:oneCellAnchor>`;
+}
+
 /* A chart's frame on the page sheet: its top-left cell and its size */
 function chartAnchorXml(ch, rid, id) {
   const cx = Math.round(ch.wPx * CHART_PX_TO_EMU), cy = Math.round(ch.hPx * CHART_PX_TO_EMU);
@@ -6284,6 +6448,20 @@ async function addChartsToFile(buffer, chartSheets) {
       return rel.id;
     };
     for (const ch of charts) {
+      if (ch.plan.panels) {
+        // Small multiples: each panel a chart part, the panels and their title one grouped object
+        const rids = ch.plan.panels.plans.map((p) => {
+          chartNo++;
+          const chartPath = `xl/charts/chart${chartNo}.xml`;
+          zip.file(chartPath, chartXml(p).xml);
+          addType(chartPath, "application/vnd.openxmlformats-officedocument.drawingml.chart+xml");
+          const rel = addRel(drawingRels, "chart", `../charts/chart${chartNo}.xml`);
+          drawingRels = rel.xml;
+          return rel.id;
+        });
+        anchors += panelGroupXml(ch, rids, 1000 + chartNo);
+        continue;
+      }
       if (ch.plan.spec.kind === "treemap" || ch.plan.spec.kind === "sunburst") {
         exNo++;
         anchors += chartExAnchorXml(ch, addChartEx(treemapXml(ch.plan, exNo)), 3000 + exNo);
