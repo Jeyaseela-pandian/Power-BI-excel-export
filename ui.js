@@ -19,6 +19,7 @@ const DEFAULT_OPTIONS = {
   includeFilters: true,
   includeNotes: true,
   matchColors: true,
+  chartBackground: "white", // "white" (readable text on white) | "report" (each visual's own background)
   exhibitNumbers: false,   // "01  Title" numbering of visuals
   visualsAs: "tables",     // "tables" (data tables, as before) | "charts" (real Excel charts)
   tableNumbers: "exact",   // "exact" (2,471,203) | "short" (2.47M; the cells keep exact values)
@@ -159,6 +160,7 @@ async function openOptionsDrawer() {
   document.querySelectorAll('input[name="optLayout"]').forEach((r) => { r.checked = r.value === exportOptions.layout; });
     document.querySelectorAll('input[name="optVisualsAs"]').forEach((r) => { r.checked = r.value === (exportOptions.visualsAs || "tables"); });
   document.querySelectorAll('input[name="optTableNumbers"]').forEach((r) => { r.checked = r.value === (exportOptions.tableNumbers || "exact"); });
+  document.querySelectorAll('input[name="optChartBackground"]').forEach((r) => { r.checked = r.value === (exportOptions.chartBackground || "white"); });
   $("optCollapse").checked = exportOptions.collapse;
   $("optVisibleRows").value = exportOptions.visibleRows;
   $("optVisibleRows").disabled = !exportOptions.collapse;
@@ -174,12 +176,16 @@ async function openOptionsDrawer() {
   $("drawerExport").focus();
 }
 
-/* "Allow exact colours" shows only while Dataset.Read.All hasn't been granted */
+/* "Allow exact colours" shows only while Dataset.Read.All hasn't been granted and the
+   colours can't be read another way (the website layout, which Viewers can read too) */
 async function showExactColorsHint() {
   const hint = $("exactColorsHint");
   hint.hidden = true;
-  if (!$("optMatchColors").checked) return;
-  hint.hidden = !!(await getDesignToken({ quiet: true }));
+  if (!$("optMatchColors").checked || !currentReport || await getDesignToken({ quiet: true })) return;
+  // The same call the export makes, so the export reuses what this reads
+  const theme = await readThemeColors();
+  const read = await loadReportColors(currentReport, theme.fromReport ? { dataColors: theme.colors } : null).then(() => true, () => false);
+  hint.hidden = read || !$("optMatchColors").checked;
 }
 
 /* Consent for Dataset.Read.All. Microsoft's sign-in page reopens this report, on this page, afterwards. */
@@ -272,6 +278,7 @@ function readDrawerOptions() {
     excelSlicers: false,   // option removed
     includeNotes: $("optNotes").checked,
     matchColors: $("optMatchColors").checked,
+    chartBackground: document.querySelector('input[name="optChartBackground"]:checked')?.value || "white",
     exhibitNumbers: $("optExhibitNumbers").checked,
     visualsAs: document.querySelector('input[name="optVisualsAs"]:checked')?.value || "tables",
     tableNumbers: document.querySelector('input[name="optTableNumbers"]:checked')?.value || "exact",

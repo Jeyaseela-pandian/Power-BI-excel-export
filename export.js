@@ -297,6 +297,39 @@ function seriesOrder(data, keyCol, groupCols) {
   return order;
 }
 
+/*
+ * Legend values in the order Power BI gives them colours (and stacks and lists them). The
+ * export's own order (seriesOrder) is Power BI's series order, except when the visual sorts by
+ * a measure: then each axis group's rows run largest first (or smallest first), which says
+ * nothing about the series order, and Power BI's own order applies: the legend field's values
+ * ascending (numbers by value, dates and month names by date, text alphabetically).
+ */
+function legendOrder(data, keyCol, groupCols, valueCol) {
+  const order = seriesOrder(data, keyCol, groupCols);
+  if (valueCol === undefined || valueCol < 0 || order.length < 2) return order;
+  const num = (r) => { const v = toCellValue(r[valueCol]).value; return typeof v === "number" ? v : null; };
+  const groups = new Map();
+  for (const r of data) {
+    if (!String(r[keyCol] ?? "").trim() || num(r) === null) continue;
+    const g = groupCols.map((c) => r[c]).join("\u0001");
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(num(r));
+  }
+  const seqs = [...groups.values()].filter((s) => s.length > 1);
+  const runs = (s, dir) => s.every((v, i) => i === 0 || (dir > 0 ? v >= s[i - 1] : v <= s[i - 1]));
+  const strict = seqs.some((s) => s.some((v, i) => i > 0 && v !== s[i - 1]));
+  const byValue = seqs.length > 0 && strict && (seqs.every((s) => runs(s, -1)) || seqs.every((s) => runs(s, 1)));
+  if (!byValue) return order;
+  // Ascending, as Power BI sorts a legend field
+  const plain = (v) => v.replace(/,/g, "");
+  const month = (v) => { const t = Date.parse(`${v} 1, 2000`); return /\d/.test(v) || isNaN(t) ? null : new Date(t).getMonth(); };
+  const sortKey = order.every((v) => /^-?\d+(\.\d+)?$/.test(plain(v))) ? (v) => Number(plain(v))
+    : order.every((v) => parseDate(v)) ? (v) => parseDate(v).date.getTime()
+      : order.every((v) => month(v) !== null) ? month : null;
+  return [...order].sort(sortKey ? (a, b) => sortKey(a) - sortKey(b)
+    : (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+}
+
 /* "≥ 0", "> 80% of range", "= Bikes": a rule case for caption legends */
 function describeTest(c) {
   if (c.and) return c.and.map(describeTest).join(" and ");
@@ -393,7 +426,7 @@ function colorRuleRows(rules, t) {
     }
     let { colors, missing } = evaluateColorRule(r.rule, column(r.scope), n);
     if (missing.length && r.rule.kind === "gradient" && r.scope === "series" && legendCol >= 0) {
-      const order = seriesOrder(data, legendCol, cols.filter((ci) => ci !== legendCol && !seriesCols.includes(ci) && !hex[ci]));
+      const order = legendOrder(data, legendCol, cols.filter((ci) => ci !== legendCol && !seriesCols.includes(ci) && !hex[ci]), seriesCols[0]);
       ({ colors } = evaluateColorRule(r.rule, () => data.map((row) => order.indexOf(String(row[legendCol] ?? "").trim())), n));
       approx.push(r.rule.input);
     } else if (missing.length) {
@@ -706,7 +739,7 @@ function columnColors(item, palette, info) {
   };
   const keyedRows = (keyCol, colorOfValue, bySeries) => {
     const values = bySeries
-      ? seriesOrder(data, keyCol, cols.filter((ci) => ci !== keyCol && !seriesCols.includes(ci) && !hex[ci]))
+      ? legendOrder(data, keyCol, cols.filter((ci) => ci !== keyCol && !seriesCols.includes(ci) && !hex[ci]), seriesCols[0])
       : largestFirst(keyCol, [...new Set(filled(keyCol))]);   // order of first appearance (a treemap's largest first)
     return { col: keyCol, colorOf: Object.fromEntries(values.map((v, i) => [v, colorOfValue(v, i)])) };
   };
@@ -747,6 +780,28 @@ function columnColors(item, palette, info) {
     const result = colorRuleRows(fxRules, { header, data, cols, norm, lower, numeric, hex, seriesCols, findCol, info, seriesColor, title: item.displayTitle || item.title });
     if (result && !result.none) return { ...result, hexCols, exact };
     if (result) ruleNote = result.note;   // the rule couldn't be applied: default colours, with a note
+  }
+
+  // An expanded treemap, pie or donut (a tile / slice per Region and State, "East New York"):
+  // each in its own theme colour (a treemap's largest first, a pie's in data order), or the
+  // colour set by hand for it, as Power BI draws it; in the table, on its last level's cell
+  const levels = COLOR_BY_CATEGORY_TYPES.includes(item.type) ? expandedLevelCols(item, info, header) : null;
+  if (levels && seriesCols.length) {
+    const label = (r) => levelsLabel(r, levels);
+    const total = {}, byLabel = {};
+    data.forEach((r) => {
+      const v = toCellValue(r[seriesCols[0]]).value;
+      if (typeof v === "number") total[label(r)] = (total[label(r)] || 0) + v;
+      if (!byLabel[label(r)]) byLabel[label(r)] = levels.map((ci) => normalizeValue(String(r[ci] ?? "").trim()));
+    });
+    const seen = [...new Set(data.map(label))];
+    const order = item.type === "treemap" ? seen.sort((a, b) => (total[b] || 0) - (total[a] || 0)) : seen;
+    const setFor = (v) => overrides["i:" + byLabel[v].join("|")] || overrides["i:" + [...byLabel[v]].reverse().join("|")];
+    const colorOf = Object.fromEntries(order.map((v, i) => [v, toArgb(setFor(v) || overrides.all || palette[i % palette.length])]));
+    const rowColors = data.map((r) => colorOf[label(r)]);
+    const last = levels[levels.length - 1];
+    return { series: {}, rowCols: [last], perCol: { [last]: rowColors }, rowColors, hexCols, rowKey: null, dot: null,
+      legend: { entries: order.map((v) => ({ label: v, argb: colorOf[v] })) }, tiles: { levels, colorOf }, exact, note: ruleNote };
   }
 
   // 4. Rows coloured by a field: the legend (Series) or, for pie / donut / treemap, the category
@@ -1748,16 +1803,32 @@ async function rollUpToDrillLevel(item, info, filters) {
       const groupBy = keyCols.map((ci) => daxColumn(entries[ci].field.entity, entries[ci].field.prop));
       const query = `EVALUATE SUMMARIZECOLUMNS(${[...groupBy, ...filterTables, ...measures.map((m, i) => `"v${i}", ${m}`)].join(", ")})`;
       const res = await executeDaxQuery(query);
-      if (res.error) error = res.error;
-      else {
-        const byKey = new Map(res.rows.map((r) => [keyCols.map((ci) => matchKey(r[`${entries[ci].field.entity}[${entries[ci].field.prop}]`])).join("\u0001"), r]));
+      let byKey = null, missingIsEmpty = false;
+      if (res.error) {
+        // No permission to query the model (a Viewer): Power BI's own query service, used only
+        // when it reproduces the exported rows exactly
+        const detailCols = header.map((_, ci) => ci).filter((ci) => hidden[ci] || keyCols.includes(ci));
+        const site = await websiteLevelValues(header, entries, keyCols, detailCols, open, data, cells, filters);
+        if (site.byKey) {
+          byKey = site.byKey;
+          missingIsEmpty = !!site.missingIsEmpty;
+          log(`"${item.title}": values at the drill level from Power BI's query service (checked against the export)`);
+        } else {
+          error = res.error;
+          item.siteQueryError = site.error;   // for the visual check
+          log(`"${item.title}": Power BI's query service not used: ${site.error}`);
+        }
+      } else {
+        byKey = new Map(res.rows.map((r) => [keyCols.map((ci) => matchKey(r[`${entries[ci].field.entity}[${entries[ci].field.prop}]`])).join("\u0001"), open.map((_, i) => r[`[v${i}]`])]));
+      }
+      if (byKey) {
         const keys = [...groups.keys()];
-        if (keys.some((k) => !byKey.has(k))) error = "its answer didn't match the exported rows";
+        if (!missingIsEmpty && keys.some((k) => !byKey.has(k))) error = "its answer didn't match the exported rows";
         else keys.forEach((k, gi) => {
-          const r = byKey.get(k);
+          const r = byKey.get(k) || [];
           open.forEach((ci, i) => {
-            const v = r[`[v${i}]`];
-            out[gi][ci] = typeof v === "number" ? displayText(v, fmtOf(ci)) : "";
+            const v = typeof r[i] === "number" ? r[i] : r[i] !== null && r[i] !== undefined && r[i] !== "" && Number.isFinite(Number(r[i])) ? Number(r[i]) : null;
+            out[gi][ci] = v !== null ? displayText(v, fmtOf(ci)) : "";
           });
         });
       }
@@ -1856,7 +1927,11 @@ function withLiveDrill(item, info) {
     const list = roles[role];
     if (!list || !list.length || !Array.isArray(exprs)) continue;
     const live = exprs.map((e) => fieldInfo(e)).filter(Boolean);
-    const isLive = (f) => !!f.field && live.some((l) => key(l) === key(f.field) || (!f.field.entity && String(l.prop).toLowerCase() === String(f.field.prop || "").toLowerCase()));
+    // A level with no query field (some layouts, like the website's, leave the visual's query
+    // out) matches by its name
+    const isLive = (f) => (f.field
+      ? live.some((l) => key(l) === key(f.field) || (!f.field.entity && String(l.prop).toLowerCase() === String(f.field.prop || "").toLowerCase()))
+      : !!f.ref && live.some((l) => normalizeField(l.prop) === f.ref));
     if (!list.some(isLive)) continue;   // the fields didn't match: keep the saved levels
     roles[role] = list.map((f) => ({ ...f, active: isLive(f) }));
   }
@@ -2241,8 +2316,9 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
   const compact = compactFormat(hero.value, heroFmt);
   ws.mergeCellsWithoutStyle(top + 1, col, top + 2, col + 1);
   const v = ws.getCell(top + 1, col);
-  v.value = hero.value;
-  if (compact || heroFmt) v.numFmt = compact || heroFmt;
+  const heroNone = hero.value === null || hero.value === undefined || hero.value === "";
+  v.value = heroNone ? "(Blank)" : hero.value;
+  if ((compact || heroFmt) && !heroNone) v.numFmt = compact || heroFmt;
   v.font = tinted(fonts.kpiValue, 0);
   v.alignment = { horizontal: "left", vertical: "middle", indent: 1 };
 
@@ -2262,12 +2338,14 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
     l.font = fonts.kpiSubLabel;
     l.alignment = { vertical: "middle", indent: 1 };
     const sv = ws.getCell(next, col + 1);
-    sv.value = cells[i].value;
-    if (fmtOf(i)) sv.numFmt = fmtOf(i);
+    // An empty value reads "(Blank)", as on the card in Power BI
+    const none = cells[i].value === null || cells[i].value === undefined || cells[i].value === "";
+    sv.value = none ? "(Blank)" : cells[i].value;
+    if (fmtOf(i) && !none) sv.numFmt = fmtOf(i);
     sv.font = tinted(fonts.kpiSubValue, i);
     sv.alignment = { horizontal: "right", vertical: "middle", indent: 1 };
     widths.want(col, Math.min(60, cellUnits(header[i], fonts.kpiSubLabel, 1)));
-    widths.want(col + 1, cellUnits(displayText(cells[i].value, fmtOf(i)), fonts.kpiSubValue, 1));
+    widths.want(col + 1, cellUnits(none ? "(Blank)" : displayText(cells[i].value, fmtOf(i)), fonts.kpiSubValue, 1));
   }
 
   const last = Math.max(next - 1, strip ? r + strip.height - 1 : 0);
@@ -2854,6 +2932,47 @@ function applyTableFormats(ws, hr, col, item, header, data, lay, rowsOf) {
   }
 }
 
+/*
+ * A chart's look on a white background (Export options → Chart background: White). The chart
+ * area turns white; on a visual that was dark in the report, text, gridlines and analytics
+ * lines too pale to read on white take Power BI's light-theme defaults. Data colours (bars,
+ * lines, slices) and anything already readable are kept; a light visual only loses its tint.
+ */
+function lookOnWhite(look) {
+  if (!look || !look.frame) return look;
+  const bg = look.frame.background;
+  const pale = (c) => !!c && contrast(toArgb(c, C.WHITE), C.WHITE) < 3;
+  // A visual without a background shows the page behind it: made for a dark page when its
+  // title or axis labels are pale (on a light page they would be unreadable in the report too)
+  const dark = bg ? luminance(toArgb(bg, C.WHITE)) < 0.5 : (!look.title.background && pale(look.title.color)) || pale(look.cat.text.color);
+  if (!bg && !dark) return look;   // no background on a light page: the sheet's white shows through, as before
+  const out = structuredClone(look);
+  if (bg) {
+    out.frame.background = "#FFFFFF";
+    out.frame.transparency = 0;
+  }
+  if (!dark) return out;   // a light visual: its colours read on white
+  const hex = (argb) => "#" + argb.slice(2);
+  const ink = hex(C.INK);
+  const fix = (t, dflt) => { if (t && pale(t.color)) t.color = dflt; };
+  if (!out.title.background) fix(out.title, ink);
+  fix(out.subtitle, LABEL_GREY);
+  fix(out.legend.text, LABEL_GREY);
+  for (const a of [out.cat, out.val, out.sec]) {
+    fix(a.text, LABEL_GREY);
+    fix(a.titleFont, ink);
+    if (a.grid) a.grid.color = GRID_GREY;   // a dark visual's gridlines are drawn for dark: Power BI's light grey
+  }
+  if (!out.labels.background) fix(out.labels.text, LABEL_GREY);
+  fix(out.totals.text, LABEL_GREY);
+  for (const l of out.refLines || []) {
+    if (pale(l.color)) l.color = LABEL_GREY;
+    fix(l.label, LABEL_GREY);
+  }
+  fix(out.trend, ink);
+  return out;
+}
+
 /* Text colour that reads best on a filled cell: white or ink, whichever contrasts more */
 function textOn(argb) {
   return contrast(argb, C.WHITE) >= contrast(argb, C.INK) ? C.WHITE : C.INK;
@@ -3104,7 +3223,13 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     // A title turned off in the report isn't shown either (it is often an internal name such
     // as "TYS Card"): a table is titled from its columns instead, a KPI tile by its label
     const hidden = !!(info && info.titleHidden);
-    let title = hidden || isGenericTitle(item.title, item.type) ? (item.isKpi ? null : describeTitle(item)) : item.title;
+    // A chart whose title the author left automatic (the embed API gives no title): the title
+    // Power BI shows (as it reads on screen, else built as Power BI builds it)
+    const automatic = !hidden && !item.isKpi && item.title === `${item.type} (${item.name})`;
+    const live = item.liveSettings || {};
+    const shownTitle = automatic ? (typeof live.titleText === "string" && live.titleText.trim()) || autoTitle(item, info) : null;
+    let title = shownTitle || (hidden || isGenericTitle(item.title, item.type) ? (item.isKpi ? null : describeTitle(item)) : item.title);
+    const chartTitle = title;   // a chart keeps its own title; "(2)" only tells the sheet's blocks apart
     if (title) {
       const key = title.toLowerCase();
       usedTitles[key] = (usedTitles[key] || 0) + 1;
@@ -3115,12 +3240,15 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     item.colors = lay.palette && !item.isKpi && !item.trend ? columnColors(item, lay.palette, info) : null;
     item.tableFormat = item.gridFormat || (info && info.tableFormats && info.tableFormats.length ? info : null);
     item.colorInfo = info;
-    item.chart = options.visualsAs === "charts" && !item.trend ? chartPlan(item) : null;   // charts mode only
+    item.themePalette = lay.palette && lay.palette.length ? lay.palette : null;   // colours for charts without their own settings
+    item.chart =options.visualsAs === "charts" && !item.trend ? chartPlan(item) : null;   // charts mode only
     if (item.chart) {
       // The visual's format settings (Power BI's defaults without the report file)
-      const look = (info && info.look) || chartLook({ type: item.type }, null);
+      const reportLook = (info && info.look) || chartLook({ type: item.type }, null);
+      const look = options.chartBackground === "report" ? reportLook : lookOnWhite(reportLook);   // white unless asked otherwise
+      if (chartTitle) item.chart.title = chartTitle;
       Object.assign(item.chart, { look, sizePx: item.chart.sizePx || chartSizePx(item), showTitle: !(info && info.titleHidden) && look.title.show !== false });
-      item.chart = withDateAxis(item.chart);
+      item.chart = withDateAxis(withNumberOrder(item.chart));
     }
     if (item.chart && item.chart.note) colorNotes.push(item.chart.note);
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
@@ -3333,6 +3461,7 @@ async function filtersOf(target) {
 async function collectPage(page, options, onProgress, isCancelled) {
   const visuals = (await page.getVisuals()).sort((a, b) =>
     (a.layout.y - b.layout.y) || (a.layout.x - b.layout.x));
+  if (typeof notePageVisuals === "function") notePageVisuals(page.name, visuals);   // finds visuals by place where names differ
 
   const filterChips = [];
   // The filters as models too: table sparklines are queried under them
@@ -3407,7 +3536,9 @@ async function collectPage(page, options, onProgress, isCancelled) {
       }
       // Visual-level filters: table sparklines and drill-level queries run under them too
       const visualFilters = await filtersOf(v);
-      items.push({ title, name: v.name, page: page.name, type: v.type, layout: v.layout, rows, isKpi, visualFilters });
+      // A chart's settings as Power BI resolves them on screen (axis titles, title text): for every role
+      const liveSettings = !isKpi && chartSpecOf(v.type) ? await liveVisualSettings(v) : null;
+      items.push({ title, name: v.name, page: page.name, type: v.type, layout: v.layout, rows, isKpi, visualFilters, liveSettings });
       log(`Exported "${title}" (${rows.length - 1} rows)`);
     } catch (e) {
       if (NON_DATA_TYPES.includes(v.type)) continue;
@@ -3426,6 +3557,63 @@ const NOT_EXPORTABLE = {
   keyDriversVisual: "key influencers visuals", qnaVisual: "Q&A visuals", scriptVisual: "R visuals", pythonVisual: "Python visuals",
   rdlVisual: "paginated report visuals", powerApps: "Power Apps visuals", PowerApps_PowerBI_Visual: "Power Apps visuals",
 };
+
+/*
+ * A visual's settings as Power BI resolves them on screen (its own setting, else the report's
+ * themes, which Viewers can't read), through the embed API's visual properties: whether each
+ * axis shows its title, and the title's text. Each one undefined when the API doesn't say;
+ * null when it says nothing at all.
+ */
+async function liveVisualSettings(v) {
+  if (typeof v.getProperty !== "function") return null;
+  const read = async (objectName, propertyName) => {
+    try {
+      const r = await v.getProperty({ objectName, propertyName });
+      return r && r.value !== undefined && r.value !== null ? r.value : undefined;
+    } catch (e) {
+      return undefined;
+    }
+  };
+  // (The API has no axis-title setting: those come from the themes, see baseThemeAxisStyles)
+  const out = { titleText: await read("title", "titleText") };
+  return Object.values(out).some((x) => x !== undefined) ? out : null;
+}
+
+/* An auto title's field name, as Power BI writes it: the name it was given in the visual,
+   else an aggregated column's "Sum of Sales" / "Count of Product (Distinct)", else its name */
+const AGG_NAMES = { 0: "Sum of", 1: "Average of", 2: "Count of", 3: "Min of", 4: "Max of", 5: "Count of", 6: "Median of", 7: "Standard deviation of", 8: "Variance of" };
+function autoFieldName(f, header) {
+  if (f.label) {
+    const h = header.find((x) => String(x ?? "").trim().toLowerCase() === f.label);
+    if (h) return String(h).trim();
+  }
+  const fi = f.field;
+  if (!fi || !fi.prop) return null;
+  if (fi.kind === "agg" && AGG_NAMES[fi.agg]) return `${AGG_NAMES[fi.agg]} ${fi.prop}${fi.agg === 2 ? " (Distinct)" : ""}`;
+  return String(fi.prop);
+}
+
+/*
+ * The title Power BI writes on a chart whose author left it automatic: its values, then "by"
+ * and its axis and legend fields ("Sum of Sales and Profit Margin by Month", "Sum of Sales by
+ * Country and Category"); a hierarchy by the level shown. null when the layout doesn't say.
+ */
+const AUTO_TITLE_VALUES = ["Y", "Y2", "Values", "ColumnY", "LineY"];
+const AUTO_TITLE_GROUPS = ["Category", "Group", "Series", "Details", "Breakdown"];
+function autoTitle(item, info) {
+  if (!info || !info.roles || !EXCEL_CHARTS[item.type] || customVisual(item.type) || EXCEL_CHARTS[item.type].kind === "scatter") return null;
+  const header = item.rows[0] || [];
+  const names = (list) => list.map((f) => autoFieldName(f, header));
+  const values = names(AUTO_TITLE_VALUES.flatMap((r) => info.roles[r] || []));
+  const groups = names(AUTO_TITLE_GROUPS.flatMap((r) => {
+    const list = info.roles[r] || [];
+    const shown = list.filter((f) => f.active === true);
+    return shown.length ? shown : list.slice(0, 1);
+  }));
+  if (!values.length || values.some((n) => !n) || groups.some((n) => !n)) return null;
+  const join = (l) => (l.length <= 2 ? l.join(" and ") : `${l.slice(0, -1).join(", ")} and ${l[l.length - 1]}`);
+  return groups.length ? `${join(values)} by ${join(groups)}` : join(values);
+}
 
 /* ── Writing a sheet ──────────────────────────────────────────────────── */
 
@@ -3747,10 +3935,13 @@ function chartPlan(item) {
       return null;
     }
   }
-  const { header, data, numeric, hex, helper } = classifyColumns(item.rows);
+  const { header, data, numeric, hex, helper, filled } = classifyColumns(item.rows);
   if (!data.length) return null;
   const cols = header.map((_, ci) => ci);
   const colors = item.colors || null;
+  // A drawn measure with no value at all (a Target not set yet): Power BI still lists it in
+  // the legend and keeps its room beside the others
+  const empty = (ci) => filled(ci).length === 0;
   const info = item.colorInfo || null;
   const key = (r, ci) => String(r[ci] ?? "").trim();
   const num = (raw) => { const v = toCellValue(raw).value; return typeof v === "number" ? v : null; };
@@ -3784,7 +3975,9 @@ function chartPlan(item) {
     const c = colOf(info.category);
     if (c >= 0) catCol = c; else taken.add(catCol);
     const drawn = (info.measures || []).map((m) => ({ ci: colOf(m), role: m.role }))
-      .filter((m) => m.ci >= 0 && numeric[m.ci] && !hex[m.ci]);
+      .filter((m) => m.ci >= 0 && (numeric[m.ci] || empty(m.ci)) && !hex[m.ci]);
+    // Only alongside a measure with values: a chart of nothing but empty measures stays as it was
+    if (drawn.length && drawn.every((m) => empty(m.ci))) drawn.length = 0;
     if (drawn.length) {
       valueCols = drawn.map((m) => m.ci);
       lineCols = drawn.filter((m) => m.role === "Y2").map((m) => m.ci);
@@ -3831,12 +4024,20 @@ function chartPlan(item) {
   // Pie / donut: one series, a colour per slice
   if (spec.kind === "pie" || spec.kind === "doughnut") {
     const vc = valueCols[0];
-    const byKey = colors && colors.rowKey && colors.rowKey.col === catCol ? colors.rowKey.colorOf : null;
+    // Levels shown together: each slice ("East New York") in its own colour (columnColors)
+    const byKey = colors && colors.tiles ? colors.tiles.colorOf
+      : colors && colors.rowKey && colors.rowKey.col === catCol ? colors.rowKey.colorOf : null;
+    // No colour per slice from the legend: a colour rule's row colours (as a bar chart's), else
+    // each slice's colour set by hand or the theme's in order, as Power BI draws it
+    let pointColors = byKey ? categories.map((c) => byKey[c] || null) : null;
+    if (!pointColors && colors && colors.perCol && colors.perCol[vc]) pointColors = categories.map((c) => colors.perCol[vc][firstRowOf(c)] || null);
+    else if (!pointColors && colors && colors.tabColors) pointColors = categories.map((c) => colors.tabColors[firstRowOf(c)] || null);
+    if (!pointColors) pointColors = themeColorsOf(item, categories);
     return {
       ...base,
       legendName: base.catName,
       series: [{ name: header[vc], values: valuesFor(vc, data), fmt: formatOf(vc), color: null }],
-      pointColors: byKey ? categories.map((c) => byKey[c] || null) : null,
+      pointColors,
     };
   }
 
@@ -3847,6 +4048,8 @@ function chartPlan(item) {
   } else if (!info && textCols.length === 2 && valueCols.length === 1) {
     legendCol = textCols[1];
   }
+  const liveLegend = legendCol < 0 && !info && textCols.length > 2 && valueCols.length === 1;
+  if (liveLegend) legendCol = liveLegendCol(item, header, textCols);
   if (legendCol >= 0 && legendCol !== catCol) {
     // A combo's legend splits only its column values: its line values (Y2) stay one line
     // each, on a second axis. A line value repeats on every legend row of a category, so it
@@ -3854,21 +4057,28 @@ function chartPlan(item) {
     const lines = spec.kind === "combo" && lineCols ? valueCols.filter((ci) => lineCols.includes(ci)) : [];
     const vc = valueCols.find((ci) => !lines.includes(ci)) ?? valueCols[0];
     const byKey = colors && colors.rowKey && colors.rowKey.col === legendCol ? colors.rowKey.colorOf : null;
-    const legends = byKey ? Object.keys(byKey) : seriesOrder(data, legendCol, [catCol]);
+    const legends = byKey ? Object.keys(byKey) : legendOrder(data, legendCol, [catCol], vc);
     const once = (ci) => categories.map((c) => {
       const r = data.find((x) => catOf(x) === c && num(x[ci]) !== null);
       return r ? num(r[ci]) : null;
     });
+    // A colour rule per legend value (fx on the series): each legend value's colour from the rule
+    const byRule = !byKey && colors && colors.dot && colors.dot.keyCol === legendCol ? colors.dot.colorOf : null;
+    // No legend colours worked out (colors): each value's colour set by hand, else the theme's in order
+    const fallback = byKey || liveLegend ? null : themeColorsOf(item, legends);
     return {
       ...base,
       valueName: header[vc],
       legendName: header[legendCol],
       series: [
-        ...legends.map((name) => ({
+        ...legends.map((name, i) => ({
           name,
           values: valuesFor(vc, data.filter((r) => key(r, legendCol) === name)),
           fmt: formatOf(vc),
-          color: (byKey && byKey[name]) || null,
+          // A legend found without the layout: the theme's colours in order, as Power BI gives them
+          color: (byKey && byKey[name]) || (byRule && byRule(name)) ||
+            (liveLegend && !byKey && item.themePalette ? toArgb(item.themePalette[i % item.themePalette.length]) : null) ||
+            (fallback && fallback[i]) || null,
         })),
         ...lines.map((ci) => ({ name: header[ci], values: once(ci), fmt: formatOf(ci), color: (colors && colors.series && colors.series[ci]) || null, line: true })),
       ],
@@ -3877,11 +4087,15 @@ function chartPlan(item) {
 
   // One series per measure; a combo draws its line values (its last measure, without the
   // report file) as lines on a second axis
+  const overrides = (info && info.overrides) || {};
+  const palette = item.themePalette || [];
   const series = valueCols.map((ci, i) => ({
     name: header[ci],
     values: valuesFor(ci, data),
     fmt: formatOf(ci),
-    color: (colors && colors.series && colors.series[ci]) || null,
+    // An empty measure has no colour worked out (it has no values): its own, else the theme's for its place
+    color: (colors && colors.series && colors.series[ci]) ||
+      (empty(ci) && (overrides["m:" + normalizeField(header[ci])] || palette.length) ? toArgb(overrides["m:" + normalizeField(header[ci])] || palette[i % palette.length]) : null),
     line: spec.kind === "combo" && (lineCols ? lineCols.includes(ci) : valueCols.length > 1 && i === valueCols.length - 1),
   }));
   // A combo showing only line values is a line chart
@@ -3891,8 +4105,9 @@ function chartPlan(item) {
   }
   // One measure coloured per bar (colours set by hand, or a colour rule)
   let pointColors = null;
-  if (series.length === 1 && colors) {
-    const ci = valueCols[0];
+  const withValues = valueCols.filter((ci) => !empty(ci));   // an empty measure draws nothing to colour
+  if (withValues.length === 1 && colors) {
+    const ci = withValues[0];
     if (colors.perCol && colors.perCol[ci]) pointColors = categories.map((c) => colors.perCol[ci][firstRowOf(c)] || null);
     else if (colors.rowKey && colors.rowKey.col === catCol) pointColors = categories.map((c) => colors.rowKey.colorOf[c] || null);
     else if (colors.tabColors) pointColors = categories.map((c) => colors.tabColors[firstRowOf(c)] || null);
@@ -4000,7 +4215,46 @@ function withDateAxis(plan) {
   };
 }
 
+/*
+ * Numbers on a line or area chart's axis (Period 1…12) run in ascending order, as on Power BI's
+ * continuous axis, whatever order the rows were exported in (sorted by the measure, say)
+ */
+function withNumberOrder(plan) {
+  if (!plan || !["line", "area"].includes(plan.spec.kind) || plan.multiLevel) return plan;
+  if (plan.look && plan.look.cat.continuous === false) return plan;
+  const nums = plan.categories.map((c) => { const t = String(c ?? "").trim().replace(/,/g, ""); return /^-?\d+(\.\d+)?$/.test(t) ? Number(t) : null; });
+  if (nums.length < 2 || nums.some((n) => n === null)) return plan;
+  const order = nums.map((_, i) => i).sort((a, b) => nums[a] - nums[b]);
+  if (order.every((i, k) => i === k)) return plan;
+  const pick = (list) => (Array.isArray(list) ? order.map((i) => list[i]) : list);
+  return { ...plan, categories: pick(plan.categories), catText: pick(plan.catText), pointColors: pick(plan.pointColors),
+    series: plan.series.map((s) => ({ ...s, values: pick(s.values) })) };
+}
+
 /* Shared helpers for the chart builders below */
+/* Without the report's layout: a chart's legend when the export has more text columns than
+   its axis (Region, VP, Ethnicity: VP a level drilled out of view). The live view names the
+   axis field; Power BI exports the legend after the axis levels, so the last text column is
+   the legend unless it is on the axis. -1 when the live view doesn't say. */
+function liveLegendCol(item, header, textCols) {
+  const axis = ((item.liveDrill && item.liveDrill.activeProjections) || {}).Category;
+  if (!Array.isArray(axis) || !axis.length) return -1;
+  const onAxis = new Set(axis.map((e) => fieldInfo(e)).filter(Boolean).map((f) => normalizeField(f.prop)));
+  if (!onAxis.has(normalizeField(header[textCols[0]]))) return -1;   // the axis isn't where expected
+  const last = textCols[textCols.length - 1];
+  return onAxis.has(normalizeField(header[last])) ? -1 : last;
+}
+
+/* Colours for values (legend values, slices) the colour rules gave none: each one's colour set
+   by hand in the report, else one for every value, else the theme's in order, as Power BI draws
+   them. null without a theme (Excel's own colours, as before). */
+function themeColorsOf(item, values) {
+  const palette = item.themePalette;
+  const overrides = (item.colorInfo && item.colorInfo.overrides) || {};
+  if (!palette || !palette.length || !values.length) return null;
+  return values.map((v, i) => toArgb(overrides["i:" + normalizeValue(v)] || overrides.all || palette[i % palette.length]));
+}
+
 function chartColumns(item) {
   const c = classifyColumns(item.rows);
   const cols = c.header.map((_, ci) => ci);
@@ -4019,12 +4273,13 @@ function chartColumns(item) {
   };
 }
 
-/* One value per category, in the order they appear ("Total" rows are left out) */
-function chartSteps(t, catCol, valueCol) {
+/* One value per category, in the order they appear ("Total" rows are left out). levels: the
+   category's levels shown together ("East New York"), else just catCol */
+function chartSteps(t, catCol, valueCol, levels = null) {
   const additive = !NON_ADDITIVE.test(t.header[valueCol]);
   const steps = [];
   for (const r of t.data) {
-    const label = t.key(r, catCol), v = t.num(r[valueCol]);
+    const label = levels ? levelsLabel(r, levels) : t.key(r, catCol), v = t.num(r[valueCol]);
     if (!label || v === null || /^total$/i.test(label)) continue;
     const s = steps.find((x) => x.label === label);
     if (!s) steps.push({ label, value: v });
@@ -4124,10 +4379,11 @@ function waterfallPlan(item) {
   const catCol = t.textCols.length ? t.textCols[0] : -1;
   const valueCol = t.measureCols.find((ci) => ci !== catCol);
   if (catCol < 0 || valueCol === undefined) return null;
-  const steps = chartSteps(t, catCol, valueCol);
+  // Levels shown together: a step per Region and State ("East New York")
+  const steps = chartSteps(t, catCol, valueCol, expandedLevelCols(item, item.colorInfo || null, t.header));
   if (!steps.length) return null;
   const w = (item.colorInfo && item.colorInfo.waterfall) || {};
-  const up = toArgb(w.increase || "#1AAB40"), down = toArgb(w.decrease || "#D64554"), total = toArgb(w.total || "#118DFF");
+  const up = toArgb(w.increase || "#1AAB40"), down = toArgb(w.decrease || "#D64554"), total = toArgb(w.total || (item.themePalette || [])[0] || "#118DFF");
   const fmt = t.formatOf(valueCol);
   const negFmt = `"-"${fmt}`;   // a decrease is stored as its size and shown with a minus: -25.36%
   const starts = [], ends = [];
@@ -4200,8 +4456,11 @@ function funnelPlan(item) {
   const t = chartColumns(item);
   const catCol = t.textCols.length ? t.textCols[0] : -1;
   const valueCol = t.measureCols.find((ci) => ci !== catCol);
+  if (catCol < 0 && t.measureCols.length > 1) return measureFunnelPlan(item, t);
   if (catCol < 0 || valueCol === undefined) return null;
-  const stages = chartSteps(t, catCol, valueCol);
+  // Levels shown together: a stage per Region and State ("East New York")
+  const levels = expandedLevelCols(item, item.colorInfo || null, t.header);
+  const stages = chartSteps(t, catCol, valueCol, levels);
   if (!stages.length || stages.some((s) => s.value < 0)) return null;
   const max = Math.max(...stages.map((s) => s.value));
   const colors = item.colors || null;
@@ -4213,7 +4472,7 @@ function funnelPlan(item) {
     spec: { kind: "bar", dir: "bar", grouping: "stacked", hideValueAxis: true },
     funnel: true,   // also written as Excel's own funnel chart (addChartsToFile), these bars its fallback
     title: item.displayTitle || item.title,
-    catName: t.header[catCol],
+    catName: levels ? levels.map((ci) => t.header[ci]).join(", ") : t.header[catCol],
     categories: stages.map((s) => s.label),
     series: [
       { name: "Offset", values: stages.map((s) => (max - s.value) / 2), fmt, color: null, hidden: true, noLegend: true },
@@ -4221,6 +4480,54 @@ function funnelPlan(item) {
     ],
     pointColors,
   };
+}
+
+/* A funnel of measures with no category (Sales, Cost, Profit): a stage per measure, in the
+   visual's field order, each in its measure's colour. Its export is one row; anything else
+   keeps the visual as a table. */
+function measureFunnelPlan(item, t) {
+  if (t.data.length !== 1) return null;
+  const cols = t.measureCols;
+  const values = cols.map((ci) => t.num(t.data[0][ci]));
+  if (values.some((v) => v === null || v < 0)) return null;
+  const max = Math.max(...values);
+  const colors = item.colors || null;
+  const palette = item.themePalette || [];
+  const pointColors = cols.map((ci, i) => (colors && colors.series && colors.series[ci]) || (palette.length ? toArgb(palette[i % palette.length]) : null));
+  const fmt = t.formatOf(cols[0]);
+  return {
+    spec: { kind: "bar", dir: "bar", grouping: "stacked", hideValueAxis: true },
+    funnel: true,
+    title: item.displayTitle || item.title,
+    catName: "Measure",
+    categories: cols.map((ci) => t.header[ci]),
+    series: [
+      { name: "Offset", values: values.map((v) => (max - v) / 2), fmt, color: null, hidden: true, noLegend: true },
+      { name: "Value", values, fmt, color: null, labels: true },
+    ],
+    pointColors: pointColors.some(Boolean) ? pointColors : null,
+  };
+}
+
+/* A visual's category levels shown together ("Expand all down one level": a tile, slice or
+   stage per Region and State, labelled "East New York"): their columns in the hierarchy's
+   order, when the report marks at least two of them shown and the export holds them; else
+   null (with no drill state a visual shows its top level, as before). A treemap's levels are
+   its Group (not with Details, which split its tiles instead); the others' their Category. */
+function expandedLevelCols(item, info, header) {
+  if (!info || !info.roles || customVisual(item.type)) return null;
+  const role = item.type === "treemap" ? "Group" : "Category";
+  if (role === "Group" && (info.roles.Details || []).length) return null;
+  const shown = (info.roles[role] || []).filter((f) => f.active === true);
+  if (shown.length < 2) return null;
+  const entries = fieldsByColumn(header, shown);
+  const cols = shown.map((f) => entries.indexOf(f)).filter((ci) => ci >= 0);
+  return cols.length > 1 ? cols : null;
+}
+
+/* A row's label at its levels shown together, joined as Power BI joins them ("East New York") */
+function levelsLabel(row, levels) {
+  return levels.map((ci) => String(row[ci] ?? "").trim()).filter(Boolean).join(" ");
 }
 
 /*
@@ -4237,15 +4544,19 @@ function treemapPlan(item, spec) {
   const inRole = (ci, ...names) => names.some((r) => (roles[r] || []).includes(entries[ci]));
   const groupCol = t.textCols.find((ci) => !info || inRole(ci, "Group", "Category")) ?? t.textCols[0];
   if (groupCol === undefined) return null;
+  // Group levels shown together ("East New York"): each combination is one tile
+  const levels = spec.kind === "treemap" ? expandedLevelCols(item, info, t.header) : null;
+  const groupOf = (r) => (levels ? levelsLabel(r, levels) : t.key(r, groupCol));
   // A treemap's tiles are its Details; a sunburst's outer ring is its second node level
-  const detailCol = t.textCols.find((ci) => ci !== groupCol && (!info || inRole(ci, "Details") || (spec.kind === "sunburst" && inRole(ci, "Category", "Group"))));
+  const detailCol = levels ? undefined
+    : t.textCols.find((ci) => ci !== groupCol && (!info || inRole(ci, "Details") || (spec.kind === "sunburst" && inRole(ci, "Category", "Group"))));
   const valueCol = t.measureCols.find((ci) => !info || inRole(ci, "Values", "Y", "Size")) ?? t.measureCols[0];
   if (valueCol === undefined) return null;
   const additive = !NON_ADDITIVE.test(t.header[valueCol]);
   // One tile per group (and detail): a hierarchy's rows added up, a ratio's first value kept
   const tiles = [];
   for (const r of t.data) {
-    const group = t.key(r, groupCol), detail = detailCol !== undefined ? t.key(r, detailCol) : "";
+    const group = groupOf(r), detail = detailCol !== undefined ? t.key(r, detailCol) : "";
     const v = t.num(r[valueCol]);
     if (v === null) continue;
     const tile = tiles.find((x) => x.group === group && x.detail === detail);
@@ -4261,13 +4572,14 @@ function treemapPlan(item, spec) {
   if (spec.kind !== "sunburst") shown.sort((a, b) => (totals[b.group] - totals[a.group]) || (a.group < b.group ? -1 : a.group > b.group ? 1 : 0) || (b.value - a.value));
   else { const first = [...new Set(shown.map((x) => x.group))]; shown.sort((a, b) => first.indexOf(a.group) - first.indexOf(b.group)); }
   const colors = item.colors || null;
-  const byGroup = colors && colors.rowKey && colors.rowKey.col === groupCol ? colors.rowKey.colorOf : null;
+  const byGroup = levels ? (colors && colors.tiles ? colors.tiles.colorOf : null)
+    : colors && colors.rowKey && colors.rowKey.col === groupCol ? colors.rowKey.colorOf : null;
   const one = colors && colors.series && colors.series[valueCol] || null;
   const label = (v) => axisLabel(v);
   return {
     spec,
     title: item.displayTitle || item.title,
-    catName: t.header[detailCol ?? groupCol],
+    catName: levels ? levels.map((ci) => t.header[ci]).join(", ") : t.header[detailCol ?? groupCol],
     catLevels: detailCol !== undefined ? [{ name: t.header[groupCol], values: shown.map((x) => label(x.group)) }] : [],
     categories: shown.map((x) => (detailCol !== undefined ? x.detail : x.group)),
     series: [{ name: t.header[valueCol], values: shown.map((x) => x.value), fmt: t.formatOf(valueCol), color: one }],
@@ -5221,7 +5533,7 @@ function cartesianXml(plan, look, box, hidden) {
     let sers = main.map(([s, i]) => chartSeriesXml("bar", {
       ...s,
       labelsXml: labelsOn && !s.hidden ? seriesLabelsXml("bar", grouping, s.color || (plan.pointColors || []).find(Boolean),
-        spec.mirror ? unsignedNumFmt(labelNumFmt(s.fmt, labelVals, look.labels, 1)) : labelNumFmt(s.fmt, labelVals, look.labels, 1), look.labels) : "",
+        spec.mirror ? unsignedNumFmt(labelNumFmt(s.fmt, labelVals, look.labels)) : labelNumFmt(s.fmt, labelVals, look.labels), look.labels) : "",
       trendXml: trendOn && !combineTrend && !s.hidden ? trendlineXml(look.trend) : "",
     }, i, plan, refs.series[i])).join("");
     // Total labels over each stack: an empty last segment labelled with the stack's total
@@ -5235,7 +5547,8 @@ function cartesianXml(plan, look, box, hidden) {
       sers += chartSeriesXml("bar", { name: "Total", values: totals.map(() => 0), fmt: "General", literal: true, hidden: true, labelsXml: textLabelsXml(pts, look.totals.text) }, idx, plan, null);
     }
     groups += `<c:barChart><c:barDir val="${horizontal ? "bar" : "col"}"/><c:grouping val="${grouping}"/><c:varyColors val="0"/>${sers}` +
-      `<c:gapWidth val="${gapWidth}"/>${grouping !== "clustered" || spec.mirror ? '<c:overlap val="100"/>' : ""}<c:axId val="${A1}"/><c:axId val="${A2}"/></c:barChart>`;
+      `<c:gapWidth val="${gapWidth}"/>${grouping !== "clustered" || spec.mirror ? '<c:overlap val="100"/>' : ""}` +
+      `<c:axId val="${A1}"/><c:axId val="${A2}"/></c:barChart>`;
   } else if (kind === "area") {
     // Power BI's area: a see-through fill under a solid line along its top
     const tops = [];
@@ -5247,11 +5560,11 @@ function cartesianXml(plan, look, box, hidden) {
     }
     groups += `<c:areaChart><c:grouping val="${grouping}"/><c:varyColors val="0"/>` +
       main.map(([s, i]) => chartSeriesXml("area", { ...s, alpha: look.areaOpacity,
-        labelsXml: labelsOn && grouping !== "standard" ? seriesLabelsXml("area", grouping, s.color, labelNumFmt(s.fmt, labelVals, look.labels, 1), look.labels) : "" }, i, plan, refs.series[i])).join("") +
+        labelsXml: labelsOn && grouping !== "standard" ? seriesLabelsXml("area", grouping, s.color, labelNumFmt(s.fmt, labelVals, look.labels), look.labels) : "" }, i, plan, refs.series[i])).join("") +
       `<c:axId val="${A1}"/><c:axId val="${A2}"/></c:areaChart>`;
     for (const t of tops) {
       overlays.push({ ...t.s, name: t.s.name, values: t.values, literal: true, noLegend: true, lineLook: lineLookOf(t.s),
-        labelsXml: labelsOn && grouping === "standard" ? seriesLabelsXml("line", grouping, t.s.color, labelNumFmt(t.s.fmt, labelVals, look.labels, 1), look.labels) : "" });
+        labelsXml: labelsOn && grouping === "standard" ? seriesLabelsXml("line", grouping, t.s.color, labelNumFmt(t.s.fmt, labelVals, look.labels), look.labels) : "" });
     }
   }
   if (combineTrend) {
@@ -5263,7 +5576,7 @@ function cartesianXml(plan, look, box, hidden) {
     groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
       main.map(([s, i]) => chartSeriesXml("line", {
         ...s, lineLook: lineLookOf(s),
-        labelsXml: labelsOn ? seriesLabelsXml("line", "standard", s.color, labelNumFmt(s.fmt, labelVals, look.labels, 1), look.labels) : "",
+        labelsXml: labelsOn ? seriesLabelsXml("line", "standard", s.color, labelNumFmt(s.fmt, labelVals, look.labels), look.labels) : "",
         trendXml: trendOn && !combineTrend ? trendlineXml(look.trend) : "",
       }, i, plan, refs.series[i])).join("") +
       overlays.map((s) => { const idx = nextIdx++; hidden.push(idx); return chartSeriesXml("line", s, idx, plan, null); }).join("") +
@@ -5287,7 +5600,7 @@ function cartesianXml(plan, look, box, hidden) {
     const secAxis = look.sec.log ? null : valueScale(lineVals, plotH, 75, { round: false, start: look.sec.start, end: look.sec.end });
     groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
       lines.map(([s, i]) => chartSeriesXml("line", { ...s, lineLook: lineLookOf(s),
-        labelsXml: labelsOn ? seriesLabelsXml("line", "standard", s.color, labelNumFmt(s.fmt, lineVals, look.labels, 1), look.labels) : "" }, i, plan, refs.series[i])).join("") +
+        labelsXml: labelsOn ? seriesLabelsXml("line", "standard", s.color, labelNumFmt(s.fmt, lineVals, look.labels), look.labels) : "" }, i, plan, refs.series[i])).join("") +
       `<c:marker val="1"/><c:axId val="${A3}"/><c:axId val="${A4}"/></c:lineChart>`;
     axes += catAxXml(A3, A4, "b", { hidden: true }) +
       valAxXml(A4, A3, "r", axisNumFmt(lines[0][0].fmt, secAxis, look.sec, lineVals), { crosses: "max", grid: false, hidden: !titles.secShow, title: titles.sec, axis: secAxis, look: look.sec });
@@ -5407,6 +5720,10 @@ function funnelChartExXml(plan) {
   // The title as the report draws it, as on the other charts
   const look = plan.look || chartLook({ type: "funnel" }, null);
   const title = chartExTitleXml(plan, look);
+  // The chart area in the visual's background (white without one); on a dark one the stage
+  // names take the report's label colour, so they stay readable
+  const bg = look.frame && look.frame.background ? toArgb(look.frame.background, C.WHITE) : C.WHITE;
+  const catText = luminance(bg) < 0.5 ? toArgb(look.cat.text.color, C.SLATE) : C.SLATE;
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
     `<cx:chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:cx="${CHARTEX_NS}">` +
     `<cx:chartData><cx:data id="0">` +
@@ -5421,9 +5738,9 @@ function funnelChartExXml(plan) {
     `<cx:dataLabels pos="ctr"><cx:numFmt formatCode="${xmlEsc(labelNumFmt(s.fmt, s.values, look.labels) || "General")}" sourceLinked="0"/>${txPr(textOn(main), 900, true)}` +
     `<cx:visibility seriesName="0" categoryName="0" value="1"/></cx:dataLabels>` +
     `<cx:dataId val="0"/></cx:series>` +
-    `</cx:plotAreaRegion><cx:axis id="0"><cx:catScaling gapWidth="0.06"/><cx:tickLabels/><cx:spPr><a:ln><a:noFill/></a:ln></cx:spPr>${txPr(C.SLATE, 900, false)}</cx:axis></cx:plotArea>` +
+    `</cx:plotAreaRegion><cx:axis id="0"><cx:catScaling gapWidth="0.06"/><cx:tickLabels/><cx:spPr><a:ln><a:noFill/></a:ln></cx:spPr>${txPr(catText, 900, false)}</cx:axis></cx:plotArea>` +
     `</cx:chart>` +
-    `<cx:spPr>${fillXml(C.WHITE)}<a:ln w="9525">${fillXml(C.HAIR)}</a:ln></cx:spPr>` +
+    `<cx:spPr>${fillXml(bg)}<a:ln w="9525">${fillXml(C.HAIR)}</a:ln></cx:spPr>` +
     `</cx:chartSpace>`;
 }
 
@@ -6125,6 +6442,141 @@ async function executeDaxQuery(query) {
   }
 }
 
+/*
+ * Power BI's own query service, as its website asks for a chart's data: Viewers can use it
+ * where the semantic model's query API needs Build permission. fields: [{ kind, entity, prop,
+ * agg }], the groups first; filters: the report's and page's (embed API models). Returns rows
+ * as arrays in the fields' order. Internal and undocumented, so its answers are only used
+ * after a check against the exported rows (websiteLevelValues).
+ */
+async function websiteQuery(fields, filters) {
+  let modelId = websiteModelIds[currentReport.id];
+  if (modelId === undefined) { await fetchWebsiteLayout(currentReport); modelId = websiteModelIds[currentReport.id]; }
+  if (modelId === undefined) throw new Error("the report's model wasn't found");
+  const from = [], alias = {};
+  const source = (entity) => {
+    if (!(entity in alias)) { alias[entity] = `t${from.length}`; from.push({ Name: alias[entity], Entity: entity, Type: 0 }); }
+    return { SourceRef: { Source: alias[entity] } };
+  };
+  const column = (entity, prop) => ({ Column: { Expression: source(entity), Property: prop } });
+  const expr = (f) => (f.kind === "measure" ? { Measure: { Expression: source(f.entity), Property: f.prop } }
+    : f.kind === "agg" ? { Aggregation: { Expression: column(f.entity, f.prop), Function: f.agg } } : column(f.entity, f.prop));
+  const select = fields.map((f, i) => ({ ...expr(f), Name: `f${i}` }));
+  const where = semanticWhere(filters, column);
+  const body = { version: "1.0.0", cancelQueries: [], modelId, queries: [{ QueryId: "",
+    ApplicationContext: { ...(currentReport.datasetId ? { DatasetId: currentReport.datasetId } : {}), Sources: [{ ReportId: currentReport.id }] },
+    Query: { Commands: [{ SemanticQueryDataShapeCommand: {
+      Query: { Version: 2, From: from, Select: select, ...(where.length ? { Where: where } : {}) },
+      Binding: { Primary: { Groupings: [{ Projections: fields.map((_, i) => i) }] }, DataReduction: { DataVolume: 4, Primary: { Window: { Count: 30000 } } }, Version: 1 },
+    } }] } }] };
+  const res = await postAsUser(`${await clusterUrl(currentReport)}/explore/querydata?synchronous=true`, body);
+  if (!res.ok) throw new Error(`Power BI's query service answered ${res.status}`);
+  const result = ((((await res.json()).results || [])[0]) || {}).result || {};
+  const data = result.data || {};
+  const ds = ((data.dsr || {}).DS || [])[0];
+  if (!ds) throw new Error(`Power BI's query service returned no data${result.error ? ` (${JSON.stringify(result.error).slice(0, 200)})` : ""}`);
+  if (ds.IC === false) throw new Error("Power BI's query service returned part of the data");
+  return dsrRows(ds, data.descriptor, fields.length);
+}
+
+/* A query service answer (DSR: each row lists only the values that changed, with bit masks for
+   values repeated from the row before (R) and empty ones (Ø), text as indexes into value
+   dictionaries) as rows of values in the query's order (selects named f0, f1…) */
+function dsrRows(ds, descriptor, count) {
+  const nameOf = Object.fromEntries(((descriptor || {}).Select || []).map((s) => [s.Value, s.Name]));
+  const dicts = ds.ValueDicts || {};
+  const rows = [];
+  let schema = null, prev = [];
+  for (const ph of ds.PH || []) {
+    for (const r of ph.DM0 || []) {
+      if (r.S) schema = r.S;
+      if (!schema) continue;
+      const c = [...(r.C || [])], repeat = r.R || 0, empty = r["Ø"] || 0;
+      const vals = schema.map((col, i) => {
+        if (repeat & (1 << i)) return prev[i];
+        if (empty & (1 << i)) return null;
+        const v = c.shift();
+        return col.DN && typeof v === "number" && dicts[col.DN] ? dicts[col.DN][v] : v;
+      });
+      prev = vals;
+      const out = new Array(count).fill(null);
+      schema.forEach((col, i) => {
+        const k = Number(String(nameOf[col.N] || "").replace(/^f/, ""));
+        if (Number.isInteger(k) && k >= 0 && k < count) out[k] = vals[i];
+      });
+      rows.push(out);
+    }
+  }
+  return rows;
+}
+
+/* The report's and page's filters as the query service's conditions. A filter on a measure
+   only drops rows, which the check against the exported rows covers; one that can't be
+   written stops the query. */
+function semanticWhere(filters, column) {
+  const literal = (v) => ({ Literal: { Value: typeof v === "string" ? `'${v.replace(/'/g, "''")}'` : typeof v === "boolean" ? String(v)
+    : v === null || v === undefined ? "null" : Number.isInteger(v) ? `${v}L` : `${v}D` } });
+  const out = [];
+  for (const f of filters || []) {
+    const t = f && f.target;
+    if (t && t.measure) continue;
+    if (!t || !t.table || !t.column || f.timeUnitType !== undefined || f.itemCount !== undefined || f.hierarchyData || f.conditions) {
+      throw new Error(`filter on ${targetName(t)} can't be applied to the query`);
+    }
+    if (!f.values || !f.values.length || f.operator === "All") continue;
+    if (f.values.some(Array.isArray)) throw new Error(`filter on ${targetName(t)} can't be applied to the query`);
+    const inList = { In: { Expressions: [column(t.table, t.column)], Values: f.values.map((v) => [literal(v)]) } };
+    out.push({ Condition: f.operator === "NotIn" || f.isExclude ? { Not: { Expression: inList } } : inList });
+  }
+  return out;
+}
+
+/*
+ * Values that don't add up, at the level a chart shows, from Power BI's query service (for
+ * Viewers). First the same values at the exported rows' own level must match every exported
+ * row exactly (same rows, same values to the digits exported), so filters, slicers and the
+ * fields are known to be the chart's; else nothing is used. Returns { byKey: Map(group key →
+ * values) } or { error }.
+ */
+async function websiteLevelValues(header, entries, keyCols, detailCols, open, data, cells, filters) {
+  if (typeof websiteModelIds === "undefined" || typeof postAsUser !== "function") return { error: "not available" };
+  const fieldOf = (ci) => entries[ci] && entries[ci].field;
+  if (detailCols.some((ci) => { const f = fieldOf(ci); return !f || !f.entity || !["column", "level"].includes(f.kind); })) return { error: "its levels can't be queried" };
+  const values = open.map(fieldOf);
+  const keyOf = (row, cols) => cols.map((ci) => matchKey(row[ci])).join("\u0001");
+  const at = async (cols) => (await websiteQuery([...cols.map(fieldOf), ...values], filters))
+    .map((r) => ({ key: cols.map((_, i) => matchKey(r[i])).join("\u0001"), values: values.map((_, i) => r[cols.length + i]) }));
+  // A value as exported (rounded to the digits shown) against the query's
+  const near = (raw, v, q) => {
+    if (q === null || q === undefined || q === "") return typeof v !== "number";
+    const n = Number(q), s = String(raw ?? "");
+    if (typeof v !== "number" || !Number.isFinite(n)) return false;
+    const digits = ((s.match(/\.(\d+)/) || [])[1] || "").length;
+    const unit = Math.pow(10, -digits) * (s.includes("%") ? 0.01 : 1);
+    return Math.abs(n - v) <= unit * 0.51 + 1e-9 * Math.max(1, Math.abs(n));
+  };
+  try {
+    const detail = await at(detailCols);
+    const exported = new Map(data.map((row, ri) => [keyOf(row, detailCols), ri]));
+    const seen = new Set();
+    for (const r of detail) {
+      if (r.values.every((v) => v === null || v === undefined || v === "")) continue;
+      const ri = exported.get(r.key);
+      if (ri === undefined) return { error: `the query has a row the export doesn't (${r.key.replace(/\u0001/g, " / ")})` };
+      if (!open.every((ci, i) => near(data[ri][ci], cells[ri][ci].value, r.values[i]))) return { error: `its values differ from the export (${r.key.replace(/\u0001/g, " / ")})` };
+      seen.add(ri);
+    }
+    const missing = data.findIndex((row, ri) => !seen.has(ri) && open.some((ci) => typeof cells[ri][ci].value === "number"));
+    if (missing >= 0) return { error: `the export has a row the query doesn't (${keyOf(data[missing], detailCols).replace(/\u0001/g, " / ")})` };
+    const level = await at(keyCols);
+    // The service leaves out groups whose values are all empty (a VP with no separations last
+    // year has no YoY change): with the rows checked above, a group missing is an empty value
+    return { byKey: new Map(level.map((r) => [r.key, r.values])), missingIsEmpty: true };
+  } catch (e) {
+    return { error: errorText(e) };
+  }
+}
+
 /* For every table with sparklines: their points (item.sparklines), or a note */
 async function loadSparklines(collected, options) {
   for (const { page, data } of collected) {
@@ -6150,6 +6602,7 @@ async function loadSparklines(collected, options) {
 async function exportToExcel(pages, options, branding, onProgress, isCancelled) {
   const original = await embeddedReport.getActivePage();
   const collected = [];
+  if (typeof notePageTitles === "function") notePageTitles(pages);   // finds visuals by page title where page names differ
 
   // Chart colours: the theme from the embed API now, and the report file (exact theme and
   // colours set by hand) downloaded while the pages are read

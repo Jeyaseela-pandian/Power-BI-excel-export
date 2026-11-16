@@ -190,6 +190,7 @@ legend + * { clear: both; }
 .diag-table td.fail { color: var(--danger); font-weight: 600; }
 .diag-table td.skip { color: var(--text-muted); }
 .diag-summary { font-weight: 600; }
+.viewer-check { white-space: pre-wrap; font-size: 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin: 10px 0 0; }
 .activity { margin-top: 12px; }
 .activity pre { background: #111827; color: #e5e7eb; font: 12px Consolas, monospace; padding: 10px; border-radius: var(--radius-sm); max-height: 200px; overflow: auto; white-space: pre-wrap; }
 

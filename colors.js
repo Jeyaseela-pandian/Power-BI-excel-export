@@ -9,9 +9,11 @@
  * or KPI shows as its main value.
  * Both report formats are read: the classic one ("Report/Layout") and the newer PBIR
  * folders ("Report/definition/…"). Only this design information is used; nothing is
- * stored or sent anywhere. When the file can't be read the export falls back to the theme
- * colours Power BI reports through the embed API (export.js).
- * Uses globals from app.js: getDesignToken, PBI_API, log, errorText.
+ * stored or sent anywhere. When the file can't be read (workspace Viewers can't download it),
+ * the same layout is read from Power BI's website (see "Reading the website layout"); when
+ * neither can, the export falls back to the theme colours Power BI reports through the embed
+ * API (export.js).
+ * Uses globals from app.js: getDesignToken, getToken, embeddedReport, PBI_API, log, errorText.
  */
 
 /* ── Power BI rules ───────────────────────────────────────────────────────
@@ -477,6 +479,219 @@ async function downloadDesignFile(report, signal) {
   throw new Error(status === 403 ? "NO_ACCESS" : `DOWNLOAD_FAILED ${status}`);
 }
 
+/* ── Reading the website layout ──────────────────────────────────────────
+ * When the design file can't be read (workspace Viewers can't download it), the same layout
+ * comes from the service Power BI's own website calls to draw the report, which answers
+ * anyone who can open it. It is internal and undocumented: if it fails, exports fall back to
+ * the theme as before. Browsers refuse to call it from another site, so it goes through
+ * serve.py's /pbi-proxy, or straight to Power BI where no proxy is running.
+ */
+
+/* The Power BI cluster that serves this report, from the embed address's config */
+async function clusterUrl(report) {
+  try {
+    const config = new URL(report.embedUrl).searchParams.get("config");
+    if (config) {
+      const json = JSON.parse(atob(config.replace(/-/g, "+").replace(/_/g, "/")));
+      if (json.clusterUrl) return json.clusterUrl.replace(/\/$/, "");
+    }
+  } catch (e) { /* ask the global service below */ }
+  const res = await fetch("https://api.powerbi.com/powerbi/globalservice/v201606/clusterdetails", {
+    headers: { Authorization: `Bearer ${await getToken()}` },
+  });
+  if (!res.ok) throw new Error(`WEBSITE_FAILED cluster ${res.status}`);
+  return String((await res.json()).clusterUrl || "").replace(/\/$/, "");
+}
+
+/* GET with the user's token: through serve.py, else straight to Power BI. { res, route } */
+async function fetchAsUser(url, signal) {
+  const headers = { Authorization: `Bearer ${await getToken()}` };
+  const proxied = await fetch(`/pbi-proxy?url=${encodeURIComponent(url)}`, { headers, signal }).catch((e) => {
+    if (e && e.name === "AbortError") throw e;
+    return null;
+  });
+  // 404 / 501: no proxy here (the app isn't served by serve.py)
+  if (proxied && proxied.status !== 404 && proxied.status !== 501) return { res: proxied, route: "through serve.py" };
+  return { res: await fetch(url, { headers, signal }), route: "direct" };
+}
+
+/* POST JSON with the user's token, as fetchAsUser */
+async function postAsUser(url, body, signal) {
+  const id = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
+  const headers = { Authorization: `Bearer ${await getToken()}`, "Content-Type": "application/json", ActivityId: id(), RequestId: id() };
+  const text = JSON.stringify(body);
+  const proxied = await fetch(`/pbi-proxy?url=${encodeURIComponent(url)}`, { method: "POST", headers, body: text, signal }).catch((e) => {
+    if (e && e.name === "AbortError") throw e;
+    return null;
+  });
+  if (proxied && proxied.status !== 404 && proxied.status !== 501) return proxied;
+  return fetch(url, { method: "POST", headers, body: text, signal });
+}
+
+// Each report's semantic model id on Power BI's website (for its query service), by report id
+const websiteModelIds = {};
+
+/* The report's layout as Power BI's website loads it: { sections, config }, as in Report/Layout */
+async function fetchWebsiteLayout(report, signal) {
+  const url = `${await clusterUrl(report)}/explore/reports/${report.id}/modelsAndExploration?preferReadOnlySession=true`;
+  const { res, route } = await fetchAsUser(url, signal);
+  if (!res.ok) throw new Error(`WEBSITE_FAILED ${res.status} (${route})`);
+  const json = await res.json();
+  const model = (json.models || [])[0];
+  if (model && model.id !== undefined) websiteModelIds[report.id] = model.id;
+  const ex = json.exploration || {};
+  if (!Array.isArray(ex.sections)) throw new Error(`WEBSITE_FAILED no pages (${route})`);
+  return { layout: ex, route };
+}
+
+/*
+ * The report's base and custom theme files as Power BI's website loads them (the report lists
+ * them in its resource packages): { base, custom } JSON, either null when it couldn't be read.
+ * The address isn't documented, so each known form is tried in turn; every try is noted in
+ * websiteThemeTries for the visual check.
+ */
+let websiteThemeTries = [];
+const THEME_ITEM_URLS = [
+  (c, r, p, path) => `${c}/explore/reports/${r}/resourcePackage/${p}/item/${encodeURIComponent(path)}`,
+  (c, r, p, path) => `${c}/explore/resourcePackage/${p}/item/${encodeURIComponent(path)}`,
+  (c, r, p, path) => `${c}/explore/reports/${r}/resourcePackages/${p}/items/${encodeURIComponent(path)}`,
+  (c, r, p, path) => `${c}/explore/resourcePackageItem/${p}?path=${encodeURIComponent(path)}`,
+];
+const websiteThemeFiles = {};   // by report id and theme names: { files, tries }, so each export doesn't ask again
+async function fetchWebsiteThemeFiles(report, layout, themeCollection, signal) {
+  const tc = themeCollection || {};
+  const key = [report.id, (tc.baseTheme || {}).name, (tc.customTheme || {}).name].join("|");
+  if (websiteThemeFiles[key]) { websiteThemeTries = websiteThemeFiles[key].tries; return websiteThemeFiles[key].files; }
+  websiteThemeTries = [];
+  const items = [];
+  for (const p of layout.resourcePackages || []) {
+    const pkg = (p && p.resourcePackage) || p || {};
+    for (const it of pkg.items || []) items.push({ pkg, it });
+  }
+  const find = (t) => {
+    const name = String((t && t.name) || "").toLowerCase();
+    if (!name) return null;
+    const base = (s) => String(s || "").toLowerCase().split("/").pop().replace(/\.json$/, "");
+    return items.find(({ it }) => [it.name, it.path].some((s) => base(s) === name.replace(/\.json$/, ""))) || null;
+  };
+  const cluster = await clusterUrl(report);
+  const load = async (t, label) => {
+    const hit = find(t);
+    if (!hit) { if (t && t.name) websiteThemeTries.push(`${label} ${t.name}: not in the report's resources`); return null; }
+    const path = hit.it.path || hit.it.name;
+    for (const ids of [[report.id, hit.pkg.id], [layout.reportId, hit.pkg.id]]) {
+      for (const make of THEME_ITEM_URLS) {
+        const url = make(cluster, ids[0], ids[1], path);
+        try {
+          const { res } = await fetchAsUser(url, signal);
+          if (!res.ok) { websiteThemeTries.push(`${label} ${res.status} ${url.replace(cluster, "")}`); continue; }
+          const json = JSON.parse((await res.text()).replace(/^﻿/, ""));
+          if (json && typeof json === "object") { websiteThemeTries.push(`${label} read ${url.replace(cluster, "")}`); return json; }
+        } catch (e) {
+          if (e && e.name === "AbortError") throw e;
+          websiteThemeTries.push(`${label} failed ${url.replace(cluster, "")} (${errorText(e)})`);
+        }
+      }
+    }
+    return null;
+  };
+  const files = { base: await load(tc.baseTheme, "base theme"), custom: await load(tc.customTheme, "custom theme") };
+  websiteThemeFiles[key] = { files, tries: websiteThemeTries };
+  return files;
+}
+
+/* The themes a newer-format layout names in its content: { baseTheme, customTheme } or null */
+function contentThemeCollection(layout) {
+  const ec = parsedJson(layout.explorationContent) || layout.explorationContent;
+  const report = ec && ec.explorationDocument && ec.explorationDocument.report;
+  const content = report && (parsedJson(report.content) || report.content);
+  return (content && typeof content === "object" && content.themeCollection) || null;
+}
+
+/* The website theme with the theme files' format settings: the files' own theme when the
+   colours couldn't be read otherwise, else the colours as before with the files' settings */
+function withThemeFiles(theme, files, themeCollection) {
+  if (!files || !(files.base || files.custom)) return withBaseThemeAxes(theme, themeCollection);
+  const fromFiles = themeFromJson(files.base, files.custom);
+  const fellBack = !theme || theme === FALLBACK_THEME || /couldn't be read/.test(theme.name || "");
+  // the colours stay; the settings come from the files (the base theme's by its name when unread)
+  const styles = [files.base && files.base.visualStyles, files.custom && files.custom.visualStyles].filter(Boolean);
+  if (!(fellBack && fromFiles) && !styles.length) return withBaseThemeAxes(theme, themeCollection);
+  const out = fellBack && fromFiles ? fromFiles : { ...theme, visualStyles: styles };
+  return files.base ? out : withBaseThemeAxes(out, themeCollection);
+}
+
+/* The theme for the website layout: the full theme the embed API reports, else as for a file */
+async function websiteTheme(themeCollection, embedTheme) {
+  try {
+    const t = await embeddedReport.getTheme();
+    const theme = themeFromJson(null, t && (t.themeJson || t));
+    if (theme) return withBaseThemeAxes({ ...theme, name: theme.name || "Report theme (from Power BI)" }, themeCollection);
+  } catch (e) {
+    log(`Website layout: the full theme couldn't be read (${errorText(e)})`);
+  }
+  return namedThemeFallback(themeCollection, embedTheme);
+}
+
+/* Power BI's base themes before Fluent 2 (CY24SU10) turn every visual's axis titles on. Their
+   JSON is only in the report file, so when it can't be read the export applies that setting
+   by the base theme's name, under every other layer (a later or unknown base theme adds none) */
+function baseThemeAxisStyles(themeCollection) {
+  const name = String(((themeCollection || {}).baseTheme || {}).name || "");
+  const m = /^CY(\d{2})SU(\d{2})/i.exec(name);
+  if (!m || Number(m[1]) * 100 + Number(m[2]) >= 2410) return null;
+  return { "*": { "*": { categoryAxis: [{ showAxisTitle: true }], valueAxis: [{ showAxisTitle: true }] } } };
+}
+function withBaseThemeAxes(theme, themeCollection) {
+  const styles = baseThemeAxisStyles(themeCollection);
+  return theme && styles ? { ...theme, visualStyles: [styles, ...(theme.visualStyles || [])] } : theme;
+}
+
+/* A report that names a theme whose colours couldn't be read: the colours Power BI reported
+   through the embed API, else Power BI's current default colours (what the export uses when
+   the theme can't be read at all). Only a report with no theme at all is classic. */
+function namedThemeFallback(themeCollection, embedTheme) {
+  const named = themeCollection && (themeCollection.baseTheme || themeCollection.customTheme);
+  if (!named) return FALLBACK_THEME;
+  if (embedTheme) return withBaseThemeAxes({ ...FALLBACK_THEME, ...embedTheme, name: "Report theme (from Power BI)" }, themeCollection);
+  return withBaseThemeAxes(typeof DEFAULT_THEME_COLORS !== "undefined"
+    ? { ...FALLBACK_THEME, dataColors: [...DEFAULT_THEME_COLORS], name: "Power BI default (the report's theme colours couldn't be read)" }
+    : FALLBACK_THEME, themeCollection);
+}
+
+/* Reads the website layout: { theme, visuals, byName, format: "website" } */
+async function readWebsiteDesign(report, embedTheme, signal) {
+  const { layout, route } = await fetchWebsiteLayout(report, signal);
+  let config = {};
+  try { config = JSON.parse(layout.config || "{}"); } catch (e) { /* no theme */ }
+  let theme = await websiteTheme(config.themeCollection, embedTheme);
+  // The theme files themselves (axis titles and other settings a custom theme sets), when readable;
+  // the newer format names the themes in its content rather than the config
+  const themes = config.themeCollection || contentThemeCollection(layout);
+  try {
+    theme = withThemeFiles(theme, await fetchWebsiteThemeFiles(report, layout, themes, signal), themes);
+  } catch (e) {
+    if (e && e.name === "AbortError") throw e;
+    log(`Website layout: the theme files couldn't be read (${errorText(e)})`);
+  }
+  let visuals = classicVisuals(layout, theme);
+  // Some reports' pages list only placeholders; their visuals are in the exploration content
+  if (!Object.keys(visuals).length) {
+    const content = contentVisuals(layout.explorationContent, theme, layout.sections);
+    if (content.length) {
+      log(`Website layout: ${content.length} visual(s) read from the exploration content`);
+      visuals = {};
+      // Only visuals whose page is known: names like "VisualContainer1" repeat on every page
+      for (const v of content) if (v.name && v.pageName) visuals[visualKey(v.pageName, v.name)] = v.info;
+      return { theme, visuals, byName: uniqueByName(visuals), byTitle: {}, placed: content.filter((v) => v.title),
+        format: "website", pages: websitePages(layout), themeCollection: themes || null };
+    }
+  }
+  log(`Website layout read ${route}: ${Object.keys(visuals).length} visual(s)`);
+  return { theme, visuals, byName: uniqueByName(visuals), byTitle: keysByPageTitle(layout), placed: placedVisuals(layout, theme),
+    format: "website", pages: websitePages(layout), themeCollection: themes || null };
+}
+
 async function readJson(zip, path, encoding) {
   const file = zip.file(path);
   if (!file) return null;
@@ -498,7 +713,12 @@ async function readTheme(zip, themeCollection) {
   };
   const tc = themeCollection || {};
   const base = await load(tc.baseTheme);
-  const custom = await load(tc.customTheme);
+  const theme = themeFromJson(base, await load(tc.customTheme));
+  return base ? theme : withBaseThemeAxes(theme, tc);
+}
+
+/* A theme from its base and custom theme JSON (either may be null), or null without data colours */
+function themeFromJson(base, custom) {
   const merged = { ...(base || {}), ...(custom || {}) };
   const dataColors = (merged.dataColors || []).filter((c) => /^#[0-9A-F]{6}$/i.test(c));
   if (!dataColors.length) return null;
@@ -1138,7 +1358,93 @@ function uniqueByName(visuals) {
 /* One visual's colour information in loaded report colours, or null */
 function visualInfo(rc, pageName, visualName) {
   if (!rc || !visualName) return null;
-  return rc.visuals[visualKey(pageName, visualName)] || (rc.byName && rc.byName[visualName]) || null;
+  const title = String(PAGE_TITLES[pageName] || "").trim().toLowerCase();
+  const byTitle = title && rc.byTitle ? rc.visuals[rc.byTitle[visualKey(title, visualName)]] : null;
+  return rc.visuals[visualKey(pageName, visualName)] || byTitle || (rc.byName && rc.byName[visualName]) || placedInfo(rc, title, pageName, visualName);
+}
+// Page name → its title, and each visual's type and place, as the embed API lists them
+// (filled when pages and visuals are read)
+const PAGE_TITLES = {};
+const VISUAL_PLACES = {};
+function notePageTitles(pages) {
+  for (const p of pages || []) if (p && p.name) PAGE_TITLES[p.name] = p.displayName || "";
+}
+function notePageVisuals(pageName, visuals) {
+  for (const v of visuals || []) if (v && v.name && v.layout) VISUAL_PLACES[visualKey(pageName, v.name)] = { type: v.type, layout: v.layout };
+}
+
+/* A visual found by its page title, type and place (within a few pixels; the closest wins) */
+function placedInfo(rc, title, pageName, visualName) {
+  const at = VISUAL_PLACES[visualKey(pageName, visualName)];
+  if (!rc.placed || !title || !at) return null;
+  const l = at.layout;
+  let best = null, bestGap = Infinity;
+  for (const p of rc.placed) {
+    if (p.title !== title || p.type !== at.type) continue;
+    const gap = Math.max(Math.abs(p.x - l.x), Math.abs(p.y - l.y), Math.abs(p.w - l.width), Math.abs(p.h - l.height));
+    if (gap < bestGap) { best = p; bestGap = gap; }
+  }
+  if (best && bestGap <= 4) return best.info;
+  // No places to compare: the page's only visual of this type
+  const same = rc.placed.filter((p) => p.title === title && p.type === at.type);
+  return same.length === 1 && !Number.isFinite(same[0].x) ? same[0].info : null;
+}
+
+/* JSON that may be held as text (once or more) */
+function parsedJson(v) {
+  for (let i = 0; i < 3 && typeof v === "string"; i++) {
+    try { v = JSON.parse(v); } catch (e) { return null; }
+  }
+  return v && typeof v === "object" ? v : null;
+}
+
+/* Every visual in the website's exploration content, in the classic form (a container with a
+   config holding singleVisual) or the newer one (a visual.json with visual.visualType), with
+   its page (the nearest page around it) and place: [{ pageName, title, name, type, x, y, w, h, info }] */
+function contentVisuals(content, theme, sections) {
+  const out = [];
+  const seen = new Set();
+  // The layout's pages by any id they go by, for content pages without a title
+  const titleOf = {};
+  for (const s of sections || []) {
+    for (const id of [s.id, s.objectName, s.objectId, s.name]) if (id !== undefined && id !== null && s.displayName) titleOf[String(id)] = String(s.displayName).trim().toLowerCase();
+  }
+  const isVisual = (n) => n.config !== undefined || n.singleVisual || n.visual;
+  const walk = (node, page, depth) => {
+    if (!node || typeof node !== "object" || depth > 12 || seen.has(node)) return;
+    seen.add(node);
+    if (Array.isArray(node)) { node.forEach((n) => walk(parsedJson(n) || n, page, depth + 1)); return; }
+    // A page: a title (its own, or the layout's for its id) and visuals inside
+    if (!isVisual(node) && (node.visualContainers || node.visuals || "displayOption" in node || "ordinal" in node)) {
+      // The newer format keeps the page's own settings (name, title) in its content
+      const meta = (node.content !== undefined && parsedJson(node.content)) || {};
+      const shown = node.displayName ?? meta.displayName;
+      const own = typeof shown === "string" ? shown.trim().toLowerCase() : "";
+      const title = own || [node.id, node.objectName, node.objectId, node.name, meta.name].map((id) => titleOf[String(id)]).find(Boolean) || "";
+      if (title) page = { name: node.name ?? meta.name, title };
+    }
+    const config = node.config !== undefined ? parsedJson(node.config) : null;
+    const pos = (node.position) || ((((config || {}).layouts || [])[0] || {}).position) || {};
+    const place = { x: Number(node.x ?? pos.x), y: Number(node.y ?? pos.y), w: Number(node.width ?? pos.width), h: Number(node.height ?? pos.height) };
+    let visual = null, name = null;
+    try {
+      if (config && config.singleVisual) { visual = legacyVisual(config); name = config.name; }
+      else if (node.singleVisual && node.singleVisual.visualType) { visual = legacyVisual(node); name = node.name; }
+      else if (node.visual && node.visual.visualType) { visual = pbirVisual(node); name = node.name; }
+    } catch (e) { visual = null; }
+    if (visual && visual.type) {
+      out.push({ pageName: page ? page.name : undefined, title: page ? page.title : "", name, type: visual.type, ...place, info: visualColorInfo(visual, theme) });
+      return;
+    }
+    for (const v of Object.values(node)) walk(parsedJson(v) || v, page, depth + 1);
+  };
+  walk(parsedJson(content) || content, null, 0);
+  return out;
+}
+
+/* The website layout's pages, for the visual check: [{ name, title, visuals }] */
+function websitePages(layout) {
+  return (layout.sections || []).map((s) => ({ name: s.name, title: s.displayName, visuals: (s.visualContainers || []).length }));
 }
 
 /* The theme to use when the report names a theme the file doesn't hold: the colours
@@ -1146,8 +1452,60 @@ function visualInfo(rc, pageName, visualName) {
 async function themeOrFallback(zip, themeCollection, embedTheme) {
   const theme = await readTheme(zip, themeCollection);
   if (theme) return theme;
-  const named = themeCollection && (themeCollection.baseTheme || themeCollection.customTheme);
-  return named && embedTheme ? { ...FALLBACK_THEME, ...embedTheme, name: "Report theme (from Power BI)" } : FALLBACK_THEME;
+  return namedThemeFallback(themeCollection, embedTheme);
+}
+
+/* Every visual of a classic layout (the design file's Report/Layout, or the website's) */
+function classicVisuals(layout, theme) {
+  const visuals = {};
+  for (const section of layout.sections || []) {
+    for (const vc of section.visualContainers || []) {
+      try {
+        const c = typeof vc.config === "string" ? JSON.parse(vc.config) : vc.config;
+        if (c.name && c.singleVisual) visuals[visualKey(section.name, c.name)] = visualColorInfo(legacyVisual(c), theme);
+      } catch (e) { /* skip an unreadable visual */ }
+    }
+  }
+  return visuals;
+}
+
+/* Each visual's key by its page's title ("bad hires\u0001<visual>"), for layouts whose page
+   names differ from the embed API's */
+function keysByPageTitle(layout) {
+  const out = {};
+  for (const section of layout.sections || []) {
+    const title = String(section.displayName || "").trim().toLowerCase();
+    if (!title) continue;
+    for (const vc of section.visualContainers || []) {
+      try {
+        const c = typeof vc.config === "string" ? JSON.parse(vc.config) : vc.config;
+        if (c.name && c.singleVisual) out[visualKey(title, c.name)] = visualKey(section.name, c.name);
+      } catch (e) { /* skip an unreadable visual */ }
+    }
+  }
+  return out;
+}
+
+/* Every visual of a layout by page title, type and place on the page, for layouts whose names
+   differ from the embed API's (the website's names its visuals in its own way):
+   [{ title, type, x, y, w, h, info }] */
+function placedVisuals(layout, theme) {
+  const out = [];
+  for (const section of layout.sections || []) {
+    const title = String(section.displayName || "").trim().toLowerCase();
+    if (!title) continue;
+    for (const vc of section.visualContainers || []) {
+      try {
+        const c = typeof vc.config === "string" ? JSON.parse(vc.config) : vc.config;
+        if (!c || !c.singleVisual) continue;
+        const pos = ((c.layouts || [])[0] || {}).position || {};
+        const num = (a, b) => Number(a ?? b ?? NaN);
+        out.push({ title, type: c.singleVisual.visualType, x: num(vc.x, pos.x), y: num(vc.y, pos.y), w: num(vc.width, pos.width), h: num(vc.height, pos.height),
+          info: visualColorInfo(legacyVisual(c), theme) });
+      } catch (e) { /* skip an unreadable visual */ }
+    }
+  }
+  return out;
 }
 
 /* Reads the design file: { theme, visuals: { visualName: info }, format } */
@@ -1158,15 +1516,7 @@ async function readDesign(zip, embedTheme) {
     let config = {};
     try { config = JSON.parse(layout.config || "{}"); } catch (e) { /* no theme */ }
     const theme = await themeOrFallback(zip, config.themeCollection, embedTheme);
-    const visuals = {};
-    for (const section of layout.sections || []) {
-      for (const vc of section.visualContainers || []) {
-        try {
-          const c = JSON.parse(vc.config);
-          if (c.name && c.singleVisual) visuals[visualKey(section.name, c.name)] = visualColorInfo(legacyVisual(c), theme);
-        } catch (e) { /* skip an unreadable visual */ }
-      }
-    }
+    const visuals = classicVisuals(layout, theme);
     return { theme, visuals, byName: uniqueByName(visuals), format: "classic" };
   }
 
@@ -1208,11 +1558,25 @@ function loadReportColors(report, embedTheme) {
     const controller = new AbortController();
     const job = (async () => {
       const started = performance.now();
-      const zip = await JSZip.loadAsync(await downloadDesignFile(report, controller.signal));
-      const design = await readDesign(zip, embedTheme);
+      let design;
+      try {
+        design = await readDesign(await JSZip.loadAsync(await downloadDesignFile(report, controller.signal)), embedTheme);
+      } catch (e) {
+        if (e && e.name === "AbortError") throw e;
+        // No design file (a Viewer, or the permission not granted): the website's layout, else
+        // the file's reason, so the export's note stays the same
+        log(`Report file not read (${errorText(e)}), trying the website layout`);
+        design = await readWebsiteDesign(report, embedTheme, controller.signal).catch((w) => {
+          if (w && w.name === "AbortError") throw w;
+          log(`Website layout not read: ${errorText(w)}`);
+          throw e;
+        });
+      }
       log(`Exact report colours: theme "${design.theme.name}" (${design.theme.dataColors.slice(0, 3).join(", ")}…), ` +
         `${Object.keys(design.visuals).length} visual(s), ${design.format} format, ${Math.round(performance.now() - started)} ms`);
-      return { palette: design.theme.dataColors, theme: design.theme, visuals: design.visuals, byName: design.byName, format: design.format };
+      return { palette: design.theme.dataColors, theme: design.theme, visuals: design.visuals, byName: design.byName, format: design.format,
+        byTitle: design.byTitle || null, placed: design.placed || null, pages: design.pages || null,
+        themeCollection: design.themeCollection || null };
     })();
     job.abort = () => controller.abort();
     reportColorCache.set(report.id, job);

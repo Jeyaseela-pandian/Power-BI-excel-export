@@ -164,6 +164,14 @@
       </fieldset>
       
       <fieldset>
+        <legend>Chart background</legend>
+        <label class="choice"><input type="radio" name="optChartBackground" value="white">
+          <span>White<small>Clean and printable. Text and gridlines made for a dark report turn dark so they stay readable; data colours stay as in the report.</small></span></label>
+        <label class="choice"><input type="radio" name="optChartBackground" value="report">
+          <span>As in the report<small>Each chart keeps its visual's own background, dark or light.</small></span></label>
+      </fieldset>
+
+      <fieldset>
         <legend>Numbers in tables</legend>
         <label class="choice"><input type="radio" name="optTableNumbers" value="exact">
           <span>Exact<small>2,471,203</small></span></label>
@@ -280,6 +288,14 @@
         <tbody></tbody>
       </table>
     </div>
+    <div class="dialog-actions">
+      <button class="btn btn-secondary" id="viewerCheckRun">Check viewer access</button>
+      <button class="btn btn-secondary" id="drillCheckRun">Check visuals</button>
+      <span class="muted">Shows field names, levels and colours; "Check visuals" also lists a few category names.</span>
+      <span class="spacer"></span>
+      <button class="btn btn-ghost" id="viewerCheckCopy" hidden>Copy result</button>
+    </div>
+    <pre class="viewer-check" id="viewerCheckOut" hidden></pre>
     <details class="activity">
       <summary>Activity log</summary>
       <pre id="log"></pre>
@@ -290,7 +306,7 @@
 
   <script>
     // In order, each loaded fresh (see the stylesheet above); ui.js starts the app
-    ["config.js", "app.js", "colors.js", "export.js", "ui.js"].forEach((file) => {
+    ["config.js", "app.js", "colors.js", "export.js", "ui.js", "viewer-check.js"].forEach((file) => {
       const script = document.createElement("script");
       script.src = file + "?v=" + Date.now();
       script.async = false;

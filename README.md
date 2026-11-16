@@ -23,7 +23,7 @@ A browser app that exports Power BI report pages to a clean, branded Excel workb
   - Platform: Single-page application.
   - Redirect URI: `http://localhost:5500`.
   - Delegated Power BI permissions: `Report.Read.All` and `Workspace.Read.All`.
-  - Optional: `Dataset.Read.All`. With it, the app reads the report's design file for exact hand-set colours. It may need admin consent.
+  - Optional: `Dataset.Read.All`. With it, the app reads the report's design file for exact hand-set colours. It may need admin consent. Without it, or for workspace Viewers (who can't download the design file), the app reads the same colours and drill levels from the layout Power BI's website uses to draw the report.
 - Python 3 (to serve the app locally), and a current version of Edge or Chrome.
 - Excel 2016 or later to open the exports. Treemap, sunburst, waterfall, funnel and box & whisker charts use Excel's newer chart types. Older Excel shows a stand-in: a classic chart for waterfalls and funnels, a note for the rest.
 
@@ -43,7 +43,7 @@ A browser app that exports Power BI report pages to a clean, branded Excel workb
 
 4. Open http://localhost:5500 and sign in.
 
-`serve.py` is a small static server that turns off browser caching, so the browser always loads the latest files.
+`serve.py` is a small static server that turns off browser caching, so the browser always loads the latest files. It also passes the app's requests for a report's layout on to Power BI, which browsers won't send directly. If you host the app elsewhere, that host needs the same pass-through, or Viewers' exports use the report theme's colours.
 
 ## Using it
 
