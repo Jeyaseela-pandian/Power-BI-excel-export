@@ -86,6 +86,38 @@ test("a line chart's secondary y-axis values go on a second axis, with their own
   assert.deepStrictEqual(axes, [["l", "Avg Mobility Score"], ["r", "Avg Pain Score"]]);
 });
 
+/* A bar chart's XML with the given colour settings: { color, grouping, labelPos } */
+function barChart(type, rows, info) {
+  ctx.T = { type, title: "t", rows, colorInfo: info, themePalette: PALETTE };
+  ctx.I = info;
+  ctx.P = PALETTE;
+  run(`T.colors = columnColors(T, P, I); var b = chartPlan(T); var bl = chartLook({ type: T.type }, null); bl.labels.show = true;
+    Object.assign(b, { look: bl, sizePx: { w: 360, h: 300 }, title: "t", showTitle: true });
+    b.refs = { catRef: "D!A1:A3", series: b.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B4" })), range: () => "D!B2" };`);
+  const xml = run("chartXml(b).xml");
+  const at = (tag) => { const m = xml.match(new RegExp(`<c:${tag} val="(\\w+)"`)); return m ? m[1] : null; };
+  return { color: run("b.series[0].color"), grouping: at("grouping"), labelPos: at("dLblPos") };
+}
+const oneMeasure = (overrides) => ({ rule: "measure", category: { ref: "product", label: "product" }, categories: [{ ref: "product", label: "product" }],
+  measures: [{ ref: "revenue won", label: "revenue won", role: "Y" }], overrides, rules: [], tooltips: [], roles: {} });
+const PRODUCTS = [["Product", "Revenue Won"], ["Design app", "$5700000"], ["Stand-up Desks", "$2400000"], ["Scanners", "$300000"]];
+
+test("a one-measure bar chart takes its 'Default colour', not a colour left for the measure", () => {
+  assert.strictEqual(barChart("barChart", PRODUCTS, oneMeasure({ "m:revenue won": "#859DC0", all: "#0072BF" })).color, "FF0072BF");
+  // only the measure's colour set: it's used, as before
+  assert.strictEqual(barChart("barChart", PRODUCTS, oneMeasure({ "m:revenue won": "#859DC0" })).color, "FF859DC0");
+  // a line chart keeps its measure's colour
+  assert.strictEqual(barChart("lineChart", PRODUCTS, oneMeasure({ "m:revenue won": "#859DC0", all: "#0072BF" })).color, "FF859DC0");
+});
+
+test("a one-series stacked bar chart is drawn as plain bars, with labels past the bar's end", () => {
+  const one = barChart("barChart", PRODUCTS, oneMeasure({}));
+  assert.deepStrictEqual([one.grouping, one.labelPos], ["clustered", "outEnd"]);
+  // two series stay stacked, labels inside
+  const two = barChart("barChart", [["Product", "Won", "Lost"], ["A", "5", "3"], ["B", "2", "1"]], null);
+  assert.strictEqual(two.grouping, "stacked");
+});
+
 test("ribbon charts stay tables", () => {
   assert.strictEqual(run(`chartSpecOf("ribbonChart")`), null);
   assert.ok(run(`chartSpecOf("columnChart")`));

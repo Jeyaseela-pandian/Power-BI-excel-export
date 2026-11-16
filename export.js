@@ -718,7 +718,13 @@ function columnColors(item, palette, info) {
 
   const overrides = (info && info.overrides) || {};
   const itemOverride = (v) => overrides["i:" + normalizeValue(v)];
+  // A bar or column chart of one measure without a legend has one colour in Power BI's format
+  // pane, its "Default colour" (set for no field); a colour an earlier version of the chart left
+  // for the measure isn't shown
+  const barSpec = chartSpecOf(item.type);
+  const defaultOnly = barSpec && barSpec.kind === "bar" && info && !info.series && (info.measures || []).length === 1 && overrides.all;
   const seriesColor = (ci, slot = indexOf[ci] ?? 0) => {
+    if (defaultOnly) return toArgb(overrides.all);
     const f = fieldOf[ci];
     const set = overrides["m:" + norm[ci]] || (f && (overrides["m:" + f.ref] || (f.label && overrides["m:" + f.label])));
     if (set) return toArgb(set);
@@ -5747,7 +5753,11 @@ function cartesianXml(plan, look, box, hidden) {
   const main = indexed.filter(([s]) => !s.line);
   const lines = indexed.filter(([s]) => s.line);
   const horizontal = spec.dir === "bar";
-  const grouping = spec.grouping || (kind === "area" ? "standard" : "clustered");
+  // One series "stacked" on nothing (Power BI's bar and column charts with one measure) is drawn
+  // as plain bars: they look the same, and only then can Excel put labels past the bar's end, as
+  // Power BI does
+  const single = kind === "bar" && spec.grouping === "stacked" && !lines.length && main.filter(([s]) => !s.hidden).length === 1 && !(look.totals && look.totals.show);
+  const grouping = single ? "clustered" : spec.grouping || (kind === "area" ? "standard" : "clustered");
   const pct = grouping === "percentStacked", stacked = grouping === "stacked";
   const isBar = kind === "bar" || kind === "combo";
   const shown = main.filter(([s]) => !s.hidden).map(([s]) => s);

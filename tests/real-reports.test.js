@@ -83,3 +83,21 @@ test("the AI sample's key influencers and decomposition tree settings are read",
   })()`);
   assert.deepStrictEqual(JSON.parse(settings), { target: "status", value: "Won", explain: 9, bars: 8, levels: 3, opened: 1 });
 });
+
+test("the AI sample's 'Revenue Won by Product': the report's blue, labels past the bar's end", { skip: aiSample ? false : "Artificial Intelligence Sample.pbix not found" }, async () => {
+  const app = loadApp();
+  app.ctx.ZIP = designZip(aiSample);
+  const xml = await app.run(`(async () => {
+    const d = await readDesign(ZIP, null);
+    const info = Object.values(d.visuals).find((v) => v.roles && ((v.roles.Category || [])[0] || {}).ref === "product" && v.look.labels.show === true && v.overrides.all);
+    const T = { type: "barChart", title: "Revenue Won by Product", rows: [["Product", "Revenue Won"], ["Design app", "$5700000"], ["Scanners", "$300000"]], colorInfo: info, themePalette: d.theme.dataColors };
+    T.colors = columnColors(T, d.theme.dataColors, info);
+    const p = chartPlan(T);
+    Object.assign(p, { look: info.look, sizePx: { w: 360, h: 296 }, title: T.title, showTitle: true });
+    p.refs = { catRef: "D!A1:A2", series: p.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B3" })), range: () => "D!B2" };
+    return chartXml(p).xml;
+  })()`);
+  assert.match(xml, /<c:ser>[\s\S]*?<a:srgbClr val="0072BF"/, "bars in the report's default colour #0072BF");
+  assert.match(xml, /<c:grouping val="clustered"\/>/);
+  assert.match(xml, /<c:dLblPos val="outEnd"\/>/);
+});
