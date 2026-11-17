@@ -1632,6 +1632,7 @@ function kpiTrend(item, info, colorsOn) {
  */
 const COUNT_LIKE = /\b(unique|distinct|dcount|customers?|clients?|users?|visitors?|members?|accounts?|headcount|active)\b/i;
 const RATE_LIKE = /\b(price|rate|per|unit|avg|average)\b/i;
+const MEASURE_RATE = /\b(price|per|avg|average)\b/i;   // a measure's rate words (rate itself: NON_ADDITIVE)
 const CHANGE_LIKE = /\b(yoy|mom|qoq|wow|growth|change|var|variance|index|score|share)\b/i;
 const SUBTOTAL_FN = { sum: 9, min: 5, max: 4 };
 
@@ -1641,7 +1642,9 @@ function totalKind(field, name, fmt) {
   const names = [name, field && field.prop].filter(Boolean).join(" ");
   if (field) {
     if (field.kind === "agg") return field.agg === 0 || field.agg === 5 ? "sum" : field.agg === 3 ? "min" : field.agg === 4 ? "max" : null;
-    if (field.kind === "measure") return NON_ADDITIVE.test(names) || COUNT_LIKE.test(names) || CHANGE_LIKE.test(names) ? null : "sum";
+    // a rate or average ("Sales Per Sq Ft", "Avg Price") never adds up across rows ("Business
+    // Unit" in a count's name doesn't make it one)
+    if (field.kind === "measure") return NON_ADDITIVE.test(names) || COUNT_LIKE.test(names) || CHANGE_LIKE.test(names) || MEASURE_RATE.test(names) ? null : "sum";
     return null;   // a column shown as it is, a hierarchy level
   }
   return NON_ADDITIVE.test(names) || COUNT_LIKE.test(names) || CHANGE_LIKE.test(names) || RATE_LIKE.test(names) ? null : "sum";
