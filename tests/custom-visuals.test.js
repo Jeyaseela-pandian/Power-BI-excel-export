@@ -59,11 +59,7 @@ test("a Dual KPI in charts mode: its two area charts, the value and change over 
   assert.ok(!run("(LAY.sparklines || []).length"), "no sparklines in charts mode");
 });
 
-test("a Dual KPI in tables mode too: its two area charts, no table; other visuals still tables", () => {
+test("a Dual KPI in tables mode: its trend cards, as before", () => {
   const { run } = layout({ type: DUAL_KPI, title: "DK1", rows: DK_ROWS }, DK_INFO, "tables");
-  assert.strictEqual(run("LAY.charts.length"), 1);
-  assert.strictEqual(run("LAY.charts[0].plan.panels.plans.length"), 2);
-  const other = layout({ type: "clusteredColumnChart", title: "t", rows: [["A", "B"], ["x", "1"], ["y", "2"]] },
-    { rule: "measure", category: { ref: "a", label: "a" }, categories: [{ ref: "a", label: "a" }], measures: [{ ref: "b", label: "b", role: "Y" }], overrides: {}, rules: [], tooltips: [], roles: {} }, "tables");
-  assert.ok(!other.run("(LAY.charts || []).length"), "a column chart in tables mode: a table, as before");
+  assert.ok(!run("(LAY.charts || []).length"), "no charts in tables mode");
 });

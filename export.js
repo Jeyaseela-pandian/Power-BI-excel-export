@@ -3589,9 +3589,9 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     item.tableFormat = item.gridFormat || (info && info.tableFormats && info.tableFormats.length ? info : null);
     item.colorInfo = info;
     item.themePalette = lay.palette && lay.palette.length ? lay.palette : null;   // colours for charts without their own settings
-    // charts mode only; a Dual KPI is always its two area charts (dualKpiChart), never a table
-    const dualKpi = item.trend && (customVisual(item.type) || {}).layout === "trend";
-    item.chart = dualKpi ? dualKpiChart(item) : options.visualsAs !== "charts" || item.trend ? null : chartPlan(item);
+    // charts mode only; a Dual KPI's trend cards become its two area charts (dualKpiChart)
+    item.chart = options.visualsAs !== "charts" ? null
+      : item.trend ? ((customVisual(item.type) || {}).layout === "trend" ? dualKpiChart(item) : null) : chartPlan(item);
     if (item.chart) {
       // The visual's format settings (Power BI's defaults without the report file)
       const reportLook = (info && info.look) || chartLook({ type: item.type }, null);
