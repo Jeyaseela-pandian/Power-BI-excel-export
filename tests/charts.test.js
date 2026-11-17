@@ -262,7 +262,7 @@ function numberAxis(type, rows) {
 
 test("whole numbers on a line or area axis are spaced by value, on round steps", () => {
   assert.deepStrictEqual(numberAxis("lineChart", [["RecoveryDay", "Score"], ["1", "2"], ["3", "3.5"], ["7", "5"], ["14", "6"], ["30", "7"], ["60", "8"]]),
-    { min: 0, max: 60, step: 20, fmt: "#,##0" });
+    { min: 0, max: 60, step: 20, fmt: "[&lt;1]&quot;&quot;;#,##0" }, "labels 20, 40, 60: the 0 before day 1 left blank, as Power BI's axis starts at 1");
   assert.deepStrictEqual(numberAxis("lineChart", [["Year", "Sales"], ["2019", "5"], ["2020", "6"], ["2022", "7"], ["2024", "9"]]),
     { min: 2019, max: 2024, step: 1, fmt: "0" }, "years read 2019, not 2,019");
   // text, decimals and column charts keep their evenly spaced axis
@@ -288,10 +288,15 @@ test("a line the report shows as markers only ('Show line' off) has no line; oth
   assert.match(normal, /<c:smooth val="1"\/>/, "smooth lines as the report sets them");
 });
 
-test("shortened labels of a whole-number measure: one decimal below ten of the unit (6.8K), none from there (33K)", () => {
+test("shortened labels of a whole-number measure: one decimal for the whole chart when any label is under ten of the unit, else none", () => {
   const fmt = (f, values) => { ctx.F = f; ctx.V = values; return run("labelNumFmt(F, V, { units: 0, precision: null })"); };
-  assert.strictEqual(fmt("#,##0", [6800, 6400, 2200, 13200]), '[>=9950]#,##0,"K";#,##0.0,"K"');
-  assert.strictEqual(fmt('"$"#,##0', [11000000, 5200000]), '[>=9950000]"$"#,##0,,"M";"$"#,##0.0,,"M"');
+  // Corporate Spend: $15.2M, $13.9M beside $9.0M … $0.5M; Warehouse: 13.6K beside 4.0K
+  assert.strictEqual(fmt('"$"#,##0', [15160941, 9761517, 5747716, 2013686, 843681]), '"$"#,##0.0,,"M"');
+  assert.strictEqual(fmt("#,##0", [13600, 9100, 8300, 4000]), '#,##0.0,"K"');
+  // Quantity by Category: every label 10K or more, none (33K, 31K, 24K, 15K)
+  assert.strictEqual(fmt("#,##0", [32500, 31000, 24000, 15000]), '#,##0,"K"');
+  // negative values: the same rule, Excel writes the minus sign (-$0.6M)
+  assert.strictEqual(fmt('"$"#,##0', [1900000, -610000]), '"$"#,##0.0,,"M"');
   // the measure's own decimals, numbers below 10,000 and percentages: unchanged
   assert.strictEqual(fmt('"$"#,##0.00', [11520000]), '"$"#,##0.00,,"M"');
   assert.strictEqual(fmt("#,##0", [2128, 701]), "#,##0");
@@ -386,4 +391,21 @@ test("the last date label is never cut off at the chart's right edge (May 2021 u
   // the last point well before the next label: the axis ends at it, as before
   const r = room(monthStarts(2020, 5, 11), 700);   // to Apr 2021; the last label is Mar 2021
   assert.ok(r.max === undefined || r.max === r.last, JSON.stringify(r));
+});
+
+test("a column-and-line combo chart over dates gets the date axis too (May 2021 …), its line on the same dates", () => {
+  ctx.T = { type: "lineClusteredColumnComboChart", title: "Shipping Trend", rows: [["SUPPLY_DATE", "Shipped Qty", "Shipped CBM"],
+    ...Array.from({ length: 200 }, (_, i) => { const d = new Date(Date.UTC(2021, 3, 1 + i)); return [`${d.getUTCMonth() + 1}/${d.getUTCDate()}/2021`, String(i % 50), String((i * 7) % 90)]; })] };
+  ctx.P = PALETTE;
+  ctx.I = { rule: "measure", category: { ref: "supply_date", label: "supply_date" }, categories: [{ ref: "supply_date", label: "supply_date" }],
+    measures: [{ ref: "shipped qty", label: "shipped qty", role: "Y" }, { ref: "shipped cbm", label: "shipped cbm", role: "Y2" }], overrides: {}, rules: [], tooltips: [],
+    roles: { Category: [{ ref: "supply_date", label: "supply_date" }], Y: [{ ref: "shipped qty", label: "shipped qty" }], Y2: [{ ref: "shipped cbm", label: "shipped cbm" }] } };
+  run(`T.colorInfo = I; T.colors = columnColors(T, P, I); T.themePalette = P; var cb = chartPlan(T);
+    Object.assign(cb, { look: chartLook({ type: T.type }, null), sizePx: { w: 768, h: 440 }, title: "t", showTitle: true });
+    cb = withDateAxis(withNumberAxis(withNumberOrder(cb)));
+    cb.refs = { catRef: "D!A2:A201", series: cb.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B201" })), range: () => "D!B2" };`);
+  assert.ok(run("!!cb.dateAxis && cb.dateAxis.timeUnit === 'months'"), "a date axis by months");
+  const xml = run("chartXml(cb).xml");
+  assert.strictEqual((xml.match(/<c:dateAx>/g) || []).length, 2, "the columns' axis and the line's (hidden) both by date");
+  assert.ok(!/<c:catAx>/.test(xml));
 });

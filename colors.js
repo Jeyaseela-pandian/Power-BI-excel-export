@@ -173,7 +173,9 @@ const CUSTOM_VISUALS = {
   // Tornado: one fixed colour per side, purple then teal (the AppSource build; its newest source
   // switches to theme colours), whether the sides are legend values or two measures
   TornadoChart1452517688218: { name: "Tornado chart", rule: "auto", roles: { Category: "Category", Series: "Series", Values: "Values" },
-    palette: ["#800080", "#008080"] },
+    palette: ["#800080", "#008080"],
+    // its own defaults: values inside the bars, region names on, no legend title; it has no value axis
+    settings: { labels: ["dataLabels", "show", true], categories: ["categoryAxis", "show", true], legendTitle: ["legend", "showTitle", false] } },
   // Box and whisker (Jan Pieter Posthuma): a theme colour per category box, in order (a colour set
   // per category kept); every box one colour when "one colour" is on (its own, else the first)
   BoxWhiskerChart1455240051538: { name: "Box and whisker chart", rule: "item", roles: { Groups: "Category", Samples: "Samples", Values: "Values" },
@@ -649,14 +651,19 @@ async function websiteTheme(themeCollection, embedTheme) {
 }
 
 /* Power BI's base themes (CY24SU02, CY26SU05 …) turn every visual's axis titles on; its Fluent2
-   ones (Fluent2-CY26SU08 …) turn subtitles on instead. Their JSON is only in the report file, so
+   ones (Fluent2-CY26SU08 …) turn subtitles on instead; both label pie slices by value and share. Their JSON is only in the report file, so
    when it can't be read the export applies that setting by the base theme's name, under every
    other layer (an unknown base theme adds none) */
 function baseThemeAxisStyles(themeCollection) {
   const name = String(((themeCollection || {}).baseTheme || {}).name || "");
-  if (/^Fluent2-/i.test(name)) return { "*": { "*": { subTitle: [{ show: true }] } } };
+  // From CY19SU12 (and every Fluent2 theme) pie and donut slices read "Data value, percent of
+  // total"; older themes leave Power BI's default, the slice's category
+  const v = name.match(/CY(\d{2})SU(\d{2})/i);
+  const pieStyle = { "*": { labels: [{ labelStyle: "Data value, percent of total" }] } };
+  const pies = /^Fluent2-/i.test(name) || (v && Number(v[1]) * 100 + Number(v[2]) >= 1912) ? { pieChart: pieStyle, donutChart: pieStyle } : {};
+  if (/^Fluent2-/i.test(name)) return { "*": { "*": { subTitle: [{ show: true }] } }, ...pies };
   if (!/^CY\d{2}SU\d{2}/i.test(name)) return null;
-  return { "*": { "*": { categoryAxis: [{ showAxisTitle: true }], valueAxis: [{ showAxisTitle: true }] } } };
+  return { "*": { "*": { categoryAxis: [{ showAxisTitle: true }], valueAxis: [{ showAxisTitle: true }] } }, ...pies };
 }
 function withBaseThemeAxes(theme, themeCollection) {
   const styles = baseThemeAxisStyles(themeCollection);
@@ -911,7 +918,9 @@ function chartLook(visual, theme) {
     ? { color: get("labels", "backgroundColor") || "#FFFFFF", transparency: settingNumber(get("labels", "backgroundTransparency"), 0) } : null;
   const labels = { show: get("labels", "show"), text: labelText("labels", "color"), units: settingNumber(get("labels", "labelDisplayUnits"), 0),
     precision: settingNumber(get("labels", "labelPrecision")), position: String(get("labels", "labelPosition") || "Auto"),
-    style: get("labels", "labelStyle") || null, percentPrecision: settingNumber(get("labels", "percentageLabelPrecision")), background: labelBack };
+    // a pie's labels: the visual's or its theme's style, else Power BI's own default (the slice's
+    // category) when the report's design is known; unknown design: null (as before)
+    style: get("labels", "labelStyle") || (theme ? "Category" : null), percentPrecision: settingNumber(get("labels", "percentageLabelPrecision")), background: labelBack };
   const totals = { show: settingFlag(get("totals", "show"), false), text: labelText("totals", "color"), units: settingNumber(get("totals", "labelDisplayUnits"), 0),
     precision: settingNumber(get("totals", "labelPrecision")) };
   const lineOf = (entry) => {
@@ -921,7 +930,8 @@ function chartLook(visual, theme) {
     return { width: settingNumber(g("strokeWidth"), 3), style: String(g("lineStyle") || "solid").toLowerCase(),
       show: settingFlag(g("strokeShow"), true),   // "Show line" off: the markers alone
       markers: markers ? { shape: String(g("markerShape") || "circle"), size: settingNumber(g("markerSize"), 5), color: g("markerColor") || null } : null,
-      smooth: kind === "smooth" };
+      smooth: kind === "smooth",
+      stepped: settingFlag(g("stepped"), false) };   // "Stepped": flat steps from one value to the next
   };
   const series = {};
   for (const e of ((visual.objects || {}).lineStyles || [])) {
@@ -1077,7 +1087,7 @@ function legacyVisual(config) {
   const o = sv.objects || {};
   return { type: sv.visualType, roles, objects: o, container: sv.vcObjects || {}, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [],
     values: [...(o.value || []), ...(o.labels || [])], titleShown: titleShown(sv.vcObjects), expansion: sv.expansionStates || null,
-    sort: sortOf((sv.prototypeQuery || {}).OrderBy, sources) };
+    sort: sortOf((sv.prototypeQuery || {}).OrderBy, sources), position: ((config.layouts || [])[0] || {}).position || null };
 }
 
 /*
@@ -1110,7 +1120,52 @@ function pbirVisual(json) {
   const o = v.objects || {};
   return { type: v.visualType, roles, objects: o, container: v.visualContainerObjects || {}, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [],
     values: [...(o.value || []), ...(o.labels || [])], titleShown: titleShown(v.visualContainerObjects), expansion: v.expansionStates || null,
-    sort: sortOf(v.query && v.query.sortDefinition && v.query.sortDefinition.sort) };
+    sort: sortOf(v.query && v.query.sortDefinition && v.query.sortDefinition.sort), position: json.position || null };
+}
+
+/*
+ * A text box's text, its largest font size in points and that text's look, and each part of the
+ * text in its own look ("CORPORATE SPEND SAMPLE PBIX" in 18pt bold, then "YTD IT Spend Trend
+ * Analysis" in the default 10pt): { text, lines, size, bold, color, face, runs }, or null when empty
+ */
+const TEXT_BOX_DEFAULT_PT = 10;   // a text box's type without a size of its own
+function textRunLook(st) {
+  st = st || {};
+  const raw = String(st.fontFamily || "").split(",")[0].replace(/['"]/g, "").trim();
+  // Power BI's own font names carry the weight: "Segoe (Bold)", "Segoe (Semibold)", "DIN Light"
+  const weight = (raw.match(/\((Bold|Semibold|Light)\)$/i) || [])[1] || "";
+  const family = raw.replace(/\s*\((Bold|Semibold|Light)\)$/i, "").trim();
+  const face = /^segoe$/i.test(family) ? (/semibold/i.test(weight) ? "Segoe UI Semibold" : /light/i.test(weight) ? "Segoe UI Light" : "Segoe UI")
+    : /^wf_segoe-ui/i.test(family) ? "Segoe UI" : family || null;
+  const size = parseFloat(String(st.fontSize || ""));
+  return {
+    size: isFinite(size) ? (/px/i.test(String(st.fontSize)) ? size * 0.75 : size) : null,
+    bold: /bold|[6-9]00/i.test(String(st.fontWeight || "")) || /^bold$/i.test(weight),
+    italic: /italic/i.test(String(st.fontStyle || "")),
+    color: /^#[0-9a-f]{6}$/i.test(String(st.color || "")) ? st.color : null,
+    face,
+  };
+}
+function textBoxText(objects) {
+  const general = ((objects || {}).general || [])[0];
+  const paragraphs = (general && general.properties && general.properties.paragraphs) || [];
+  const lines = [], runs = [];
+  for (const p of Array.isArray(paragraphs) ? paragraphs : []) {
+    const parts = (p.textRuns || []).filter((r) => String(r.value ?? "") !== "");
+    const line = parts.map((r) => String(r.value ?? "")).join("").replace(/\s+/g, " ").trim();
+    if (!line) continue;
+    if (lines.length) runs.push({ text: "\n" });
+    lines.push(line);
+    for (const r of parts) runs.push({ text: String(r.value).replace(/\s+/g, " "), ...textRunLook(r.textStyle) });
+  }
+  if (!lines.length) return null;
+  const sized = runs.filter((r) => r.text.trim() && r.text !== "\n");
+  const sizeOf = (r) => r.size ?? TEXT_BOX_DEFAULT_PT;
+  // the text box's look: its largest text's ("CORPORATE SPEND SAMPLE PBIX")
+  const main = sized.reduce((a, r) => (sizeOf(r) > sizeOf(a) ? r : a), sized[0]);
+  const anySize = sized.some((r) => r.size !== null);
+  return { text: lines.join("\n"), lines: lines.length, size: anySize ? sizeOf(main) : null,
+    bold: main.bold, color: main.color, face: main.face, runs };
 }
 
 /* Icon rules ("fx" icons): each case's lower bound (a threshold) and its icon */
@@ -1376,6 +1431,12 @@ function visualColorInfo(visual, theme) {
     // A matrix's saved expand / collapse state: per role, each level's default and the groups toggled
     expansion: visual.expansion || null,
     sort: visual.sort || null,   // the visual's saved sort: [{ field, desc }]
+    // Power BI's anomaly detection on a line chart (its band and expected values are worked out on screen)
+    anomalies: ((visual.objects || {}).anomalyDetection || []).some((d) => String((((d.properties || {}).show || {}).expr || {}).Literal ? d.properties.show.expr.Literal.Value : "") === "true"),
+    // Where it sits on the page, and a text box's text (the page's title, when it heads the page)
+    visualType: visual.type || null,
+    position: visual.position || null,
+    textBox: visual.type === "textbox" ? textBoxText(visual.objects) : null,
     keyDrivers: visual.type === "keyDriversVisual" ? keyDriversSettings(visual) : null,
     // A decomposition tree's bars per level (its levels and open branches are in expansion)
     barsPerLevel: visual.type === "decompositionTreeVisual" ? treeBarsPerLevel(visual) : null,
