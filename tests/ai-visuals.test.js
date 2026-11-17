@@ -156,3 +156,81 @@ test("smart narratives and Q&A are listed in the notes; other visuals are export
   assert.ok(r.notes.some((n) => /Revenue Summary.*smart narrative/.test(n)));
   assert.ok(r.notes.some((n) => /Q&A/.test(n)));
 });
+
+/* The visual's sort, from each place it's kept: the classic query, the newer format, a captured view */
+test("a visual's sort is read from the report (classic and newer formats) and from the session's view", () => {
+  const { json } = loadApp();
+  const measure = { Measure: { Expression: { SourceRef: { Source: "o" } }, Property: "Revenue Won" } };
+  assert.deepStrictEqual(json(`sortOf(${JSON.stringify([{ Direction: 2, Expression: measure }])}, { o: "Opportunities" })`),
+    [{ field: { kind: "measure", entity: "Opportunities", prop: "Revenue Won" }, desc: true }]);
+  assert.deepStrictEqual(json(`sortOf(${JSON.stringify([{ field: { Column: { Expression: { SourceRef: { Entity: "Owners" } }, Property: "Manager" } }, direction: "Ascending" }])})`),
+    [{ field: { kind: "column", entity: "Owners", prop: "Manager" }, desc: false }]);
+  assert.strictEqual(json("sortOf(undefined)"), null);
+});
+
+/* Small multiples built from SM_ROWS (exported largest first, as Power BI exports them) with a sort */
+function smallMultiples(sort, live) {
+  const { ctx, run, json } = loadApp();
+  const field = (kind, entity, prop) => ({ kind, entity, prop });
+  ctx.INFO = { ...SM_INFO, sort,
+    roles: { Rows: [{ ref: "product category", label: "product category", field: field("column", "Products", "Product category") }],
+      Category: [{ ref: "manager", label: "manager", field: field("column", "Owners", "Manager") }],
+      Y: [{ ref: "revenue won", label: "revenue won", field: field("measure", "Opportunities", "Revenue Won") }] } };
+  // exported by revenue, largest first: Software, Computers, Furniture, Electronics
+  ctx.ROWS = [SM_ROWS[0], SM_ROWS[8], SM_ROWS[7], SM_ROWS[1], SM_ROWS[2], SM_ROWS[6], SM_ROWS[5], SM_ROWS[4], SM_ROWS[3]];
+  ctx.LIVE = live || null;
+  run(`[SM] = smallMultipleItems({ type: "clusteredBarChart", title: "t", name: "sm", page: "p", rows: ROWS, liveDrill: LIVE ? { orderBy: LIVE } : null, layout: { x: 0, y: 0, width: 304, height: 312 } }, INFO);`);
+  return json("SM.panels.map((p) => p.value + ': ' + p.rows.slice(1).map((r) => r[0]).join(' / '))");
+}
+const BY_REVENUE_DESC = [{ field: { kind: "measure", entity: "Opportunities", prop: "Revenue Won" }, desc: true }];
+
+test("small multiples: panels A to Z, and the bars in one order in every panel, from the visual's sort", () => {
+  // saved sort: Revenue Won, high to low, by each manager's total (Weiler 5.3M, Low 4.5M)
+  assert.deepStrictEqual(smallMultiples(BY_REVENUE_DESC), [
+    "Computers: Weiler, Anne / Low, Spencer", "Electronics: Weiler, Anne / Low, Spencer",
+    "Furniture: Weiler, Anne / Low, Spencer", "Software: Weiler, Anne / Low, Spencer"]);
+  // the session's own sort wins: Manager, A to Z
+  const byManager = [{ Direction: 1, Expression: { Column: { Expression: { SourceRef: { Entity: "Owners" } }, Property: "Manager" } } }];
+  assert.deepStrictEqual(smallMultiples(BY_REVENUE_DESC, byManager), [
+    "Computers: Low, Spencer / Weiler, Anne", "Electronics: Low, Spencer / Weiler, Anne",
+    "Furniture: Low, Spencer / Weiler, Anne", "Software: Low, Spencer / Weiler, Anne"]);
+  // sorted by the panels' own field, Z to A: panels Z to A
+  assert.deepStrictEqual(smallMultiples([{ field: { kind: "column", entity: "Products", prop: "Product category" }, desc: true }]).map((p) => p.split(":")[0]),
+    ["Software", "Furniture", "Electronics", "Computers"]);
+  // no sort known: panels A to Z, bars as exported
+  assert.deepStrictEqual(smallMultiples(null), [
+    "Computers: Low, Spencer / Weiler, Anne", "Electronics: Weiler, Anne / Low, Spencer",
+    "Furniture: Weiler, Anne / Low, Spencer", "Software: Weiler, Anne / Low, Spencer"]);
+});
+
+test("small multiples: axes only on the outer panels, the same plot in every panel, names on one line", () => {
+  const { ctx, run, json } = loadApp();
+  ctx.INFO = SM_INFO; ctx.ROWS = SM_ROWS; ctx.P = ["#118DFF"];
+  run(`[SM] = smallMultipleItems({ type: "clusteredBarChart", title: "t", name: "sm", page: "p", rows: ROWS, layout: { x: 0, y: 0, width: 304, height: 312 } }, INFO);
+    SM.colors = columnColors(SM, P, INFO); SM.colorInfo = INFO; SM.themePalette = P; SM.chart = chartPlan(SM);
+    Object.assign(SM.chart, { look: chartLook({ type: SM.type }, null), title: "t", sizePx: chartSizePx(SM), showTitle: true });
+    G = panelPlans(SM, INFO, SM.chart.look, P);
+    G.plans.forEach((p) => { p.refs = { catRef: "'D'!$B$3:$B$4", series: p.series.map(() => ({ nameRef: "'D'!$C$2", valRef: "'D'!$C$3:$C$4" })), range: () => "'D'!$C$3" }; });
+    X = G.plans.map((p) => chartXml(p).xml);`);
+  const X = json("X");
+  const axes = X.map((x) => {
+    const cat = x.match(/<c:catAx>[\s\S]*?<\/c:catAx>/)[0], val = x.match(/<c:valAx>[\s\S]*?<\/c:valAx>/)[0];
+    const noNames = /<c:delete val="1"\/>/.test(cat);
+    return [noNames ? "no names" : "names", /<c:tickLblPos val="none"\/>/.test(val) ? "no numbers" : "numbers", /<c:majorGridlines>/.test(val), noNames || /wrap="none"/.test(cat)];
+  });
+  // Computers (top left), Electronics (top right), Furniture (bottom left), Software (bottom right)
+  assert.deepStrictEqual(axes, [["names", "no numbers", true, true], ["no names", "no numbers", true, true], ["names", "numbers", true, true], ["no names", "numbers", true, true]]);
+  // one plot size for all, one place per column
+  const boxes = X.map((x) => {
+    const m = x.match(/<c:plotArea><c:layout><c:manualLayout>[\s\S]*?<\/c:manualLayout>/)[0];
+    return ["x", "y", "w", "h"].map((k) => Number((m.match(new RegExp(`<c:${k} val="([^"]+)"`)) || [])[1]));
+  });
+  assert.ok(boxes.every((b) => b[2] === boxes[0][2] && b[3] === boxes[0][3]), JSON.stringify(boxes));
+  assert.ok(boxes[0][0] === boxes[2][0] && boxes[1][0] === boxes[3][0] && boxes[0][0] > boxes[1][0], JSON.stringify(boxes));
+  // an ordinary bar chart: as before (no fixed layout, names wrap as Excel decides)
+  ctx.T = { type: "clusteredBarChart", title: "t", rows: SM_ROWS.map((r) => r.slice(1)) };
+  run(`T.colors = columnColors(T, P, null); T.themePalette = P; var one = chartPlan(T); Object.assign(one, { look: chartLook({ type: T.type }, null), sizePx: { w: 400, h: 300 }, title: "t", showTitle: true });
+    one.refs = { catRef: "D!A1:A2", series: one.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B3" })), range: () => "D!B2" }; ONE = chartXml(one).xml;`);
+  const one = json("ONE");
+  assert.ok(one.includes("<c:plotArea><c:layout/>") && !/wrap="none"/.test(one.match(/<c:catAx>[\s\S]*?<\/c:catAx>/)[0]));
+});

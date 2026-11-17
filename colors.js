@@ -1076,7 +1076,23 @@ function legacyVisual(config) {
   }
   const o = sv.objects || {};
   return { type: sv.visualType, roles, objects: o, container: sv.vcObjects || {}, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [],
-    values: [...(o.value || []), ...(o.labels || [])], titleShown: titleShown(sv.vcObjects), expansion: sv.expansionStates || null };
+    values: [...(o.value || []), ...(o.labels || [])], titleShown: titleShown(sv.vcObjects), expansion: sv.expansionStates || null,
+    sort: sortOf((sv.prototypeQuery || {}).OrderBy, sources) };
+}
+
+/*
+ * A visual's sort, as saved (the classic format's query OrderBy, the newer format's
+ * sortDefinition) or as captured from the session (a bookmark's orderBy): [{ field, desc }],
+ * in order of precedence; null when it has none
+ */
+function sortOf(list, sources) {
+  if (!Array.isArray(list) || !list.length) return null;
+  const out = list.map((e) => {
+    const expr = e.Expression || e.field || e.expression;
+    const dir = e.Direction ?? e.direction;
+    return { field: expr ? fieldInfo(expr, sources) : null, desc: dir === 2 || /^desc/i.test(String(dir)) };
+  }).filter((e) => e.field);
+  return out.length ? out : null;
 }
 
 function pbirVisual(json) {
@@ -1093,7 +1109,8 @@ function pbirVisual(json) {
   }
   const o = v.objects || {};
   return { type: v.visualType, roles, objects: o, container: v.visualContainerObjects || {}, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [],
-    values: [...(o.value || []), ...(o.labels || [])], titleShown: titleShown(v.visualContainerObjects), expansion: v.expansionStates || null };
+    values: [...(o.value || []), ...(o.labels || [])], titleShown: titleShown(v.visualContainerObjects), expansion: v.expansionStates || null,
+    sort: sortOf(v.query && v.query.sortDefinition && v.query.sortDefinition.sort) };
 }
 
 /* Icon rules ("fx" icons): each case's lower bound (a threshold) and its icon */
@@ -1358,6 +1375,7 @@ function visualColorInfo(visual, theme) {
     builtin: builtInSettings(visual, theme),
     // A matrix's saved expand / collapse state: per role, each level's default and the groups toggled
     expansion: visual.expansion || null,
+    sort: visual.sort || null,   // the visual's saved sort: [{ field, desc }]
     keyDrivers: visual.type === "keyDriversVisual" ? keyDriversSettings(visual) : null,
     // A decomposition tree's bars per level (its levels and open branches are in expansion)
     barsPerLevel: visual.type === "decompositionTreeVisual" ? treeBarsPerLevel(visual) : null,

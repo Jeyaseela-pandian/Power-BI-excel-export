@@ -204,6 +204,18 @@ test("data labels: full numbers below 10,000, K from there, as Power BI's Auto u
   assert.ok(big.every((f) => /,,"M"/.test(f)), `millions: ${big}`);
 });
 
+test("data labels follow where the axis ends: bars up to 8,468 under a 10K gridline show 8.5K, and the axis stays at 10K", () => {
+  ctx.T = { type: "clusteredBarChart", title: "t", rows: [["Region", "Opportunity Count"], ["North America", "8468"], ["LATAM", "1315"], ["EMEA", "1149"], ["APAC", "488"]] };
+  ctx.P = PALETTE;
+  run(`T.colors = columnColors(T, P, null); T.themePalette = P; var oc = chartPlan(T); var ocl = chartLook({ type: T.type }, null); ocl.labels.show = true;
+    Object.assign(oc, { look: ocl, sizePx: { w: 385, h: 315 }, title: "t", showTitle: true });
+    oc.refs = { catRef: "D!A1:A4", series: oc.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B5" })), range: () => "D!B2" };`);
+  const xml = run("chartXml(oc).xml");
+  const fmt = ((xml.match(/<c:dLbls><c:numFmt formatCode="([^"]*)"/) || [])[1] || "").replace(/&quot;/g, '"');
+  assert.ok(/,"K"/.test(fmt) && /0\.0,"K"/.test(fmt), `8.5K, 0.5K: ${fmt}`);
+  assert.strictEqual(Number((xml.match(/<c:valAx>[\s\S]*?<c:max val="([^"]+)"/) || [])[1]), 10000, "8.5K fits before 10K");
+});
+
 test("labels past the bar's end get room: the axis runs on to a whole step until they fit", () => {
   ctx.T = { type: "clusteredBarChart", title: "t", rows: [["AgeGroup", "BadHire%ofActives"], ["<30", "30.90%"], ["30-49", "11.37%"], ["50+", "5.39%"]] };
   ctx.P = PALETTE;
@@ -289,4 +301,89 @@ test("shortened labels of a whole-number measure: one decimal below ten of the u
 test("ribbon charts stay tables", () => {
   assert.strictEqual(run(`chartSpecOf("ribbonChart")`), null);
   assert.ok(run(`chartSpecOf("columnChart")`));
+});
+
+test("a Year › Month hierarchy on a line chart's continuous axis is drawn as dates (Jul 2020), as Power BI does", () => {
+  const axis = (outer, inner, continuous = true) => json(`(() => {
+    const p = { spec: { kind: "line" }, multiLevel: true, categories: ${JSON.stringify(inner.map((m, i) => outer[i] + " " + m))},
+      catText: ${JSON.stringify(inner)}, catLevels: [{ name: "Year", values: ${JSON.stringify(outer)}, starts: [] }],
+      series: [{ name: "Revenue Won", values: ${JSON.stringify(inner.map((_, i) => 100 + i))}, fmt: "#,##0" }], pointColors: null,
+      look: { cat: { continuous: ${continuous} } }, sizePx: { w: 600, h: 300 } };
+    const r = withDateAxis(p);
+    return { multi: !!r.multiLevel, fmt: r.dateAxis ? r.dateAxis.fmt : null, first: r.categories[0], values: r.series[0].values };
+  })()`);
+  const months = ["June", "July", "August", "September", "October", "November", "December", "January", "February", "March", "April", "May"];
+  const years = months.map((_, i) => (i < 7 ? "2020" : "2021"));
+  const d = axis(years, months);
+  assert.deepStrictEqual([d.multi, d.first], [false, "2020-06-01"]);
+  // rows out of date order are put in date order, values with them
+  const shuffled = axis(["2021", "2020"], ["January", "December"]);
+  assert.deepStrictEqual([shuffled.first, shuffled.values], ["2020-12-01", [101, 100]]);
+  // month numbers too
+  assert.strictEqual(axis(["2020", "2020"], ["11", "12"]).first, "2020-11-01");
+  // the report sets the axis to Categorical, or the hierarchy isn't dates: levels of labels, as before
+  assert.strictEqual(axis(years, months, false).multi, true);
+  assert.strictEqual(axis(["East", "West"], ["Store 1", "Store 2"]).multi, true);
+});
+
+/* The labels Excel shows on a chart's date axis: from the axis's start, a step at a time, the
+   ones the number format leaves blank (before the first point) left out */
+function dateLabels(dates, width = 700) {
+  return json(`(() => {
+    const p = withDateAxis({ spec: { kind: "line" }, categories: ${JSON.stringify(dates)}, series: [{ name: "v", values: ${JSON.stringify(dates.map((_, i) => i))}, fmt: "#,##0" }],
+      pointColors: null, look: { cat: { continuous: true } }, sizePx: { w: ${width}, h: 300 } });
+    const a = p.dateAxis, out = [];
+    const toDate = (s) => new Date(Math.round((s - 25569) * 86400000));
+    const first = Math.min(...a.serials), last = Math.max(...a.serials);
+    let t = toDate(a.min ?? first);
+    for (let k = 0; k < 400; k++) {
+      const s = Math.round(t.getTime() / 86400000 + 25569);
+      if (s > last) break;
+      if (s >= Math.floor(first)) out.push(t.toISOString().slice(0, 10));
+      t = a.timeUnit === "years" ? new Date(Date.UTC(t.getUTCFullYear() + a.unit, t.getUTCMonth(), 1))
+        : a.timeUnit === "months" ? new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth() + a.unit, 1)) : new Date(t.getTime() + a.unit * 86400000);
+    }
+    return { step: a.unit + " " + a.timeUnit, labels: out };
+  })()`);
+}
+const monthStarts = (y, m, n) => Array.from({ length: n }, (_, i) => new Date(Date.UTC(y, m + i, 1)).toISOString().slice(0, 10));
+
+test("date axis labels fall on the same round dates as Power BI's (Jul 2020, Sep 2020 … for points from Jun 2020)", () => {
+  // Contoso's Revenue Won, Jun 2020 – May 2021, every 2 months: Jul, Sep, Nov, Jan, Mar, May as in the report
+  const contoso = dateLabels(monthStarts(2020, 5, 12));
+  assert.strictEqual(contoso.step, "2 months");
+  assert.deepStrictEqual(contoso.labels, ["2020-07-01", "2020-09-01", "2020-11-01", "2021-01-01", "2021-03-01", "2021-05-01"]);
+  // points starting on a round month: labelled from the first point, as before
+  assert.deepStrictEqual(dateLabels(monthStarts(2020, 0, 12)).labels.slice(0, 2), ["2020-01-01", "2020-03-01"]);
+  // quarters: Jan, Apr, Jul, Oct
+  const q = dateLabels(monthStarts(2019, 1, 36), 600);
+  assert.ok(q.step === "3 months" || q.step === "6 months", q.step);
+  assert.ok(q.labels.every((d) => ["01", "04", "07", "10"].includes(d.slice(5, 7))), q.labels.join());
+  // years: the years divisible by the step, on 1 January
+  const yrs = dateLabels(Array.from({ length: 30 }, (_, i) => `${1993 + i}-06-01`), 500);
+  const n = Number(yrs.step.split(" ")[0]);
+  assert.ok(yrs.step.endsWith("years") && yrs.labels.every((d) => Number(d.slice(0, 4)) % n === 0 && d.endsWith("-01-01")), JSON.stringify(yrs));
+  // every point still on the chart: the axis runs on to the last one
+  assert.ok(contoso.labels[contoso.labels.length - 1] <= "2021-05-01");
+});
+
+test("the last date label is never cut off at the chart's right edge (May 2021 under the last point)", () => {
+  const room = (dates, w) => json(`(() => {
+    const p = withDateAxis({ spec: { kind: "line" }, categories: ${JSON.stringify(dates)}, series: [{ name: "v", values: ${JSON.stringify(dates.map((_, i) => i))}, fmt: "#,##0" }],
+      pointColors: null, look: chartLook({ type: "lineChart" }, null), sizePx: { w: ${w}, h: 300 } });
+    const a = p.dateAxis, last = Math.max(...a.serials);
+    return { min: a.min, max: a.max, last };
+  })()`);
+  for (const w of [400, 700, 1100]) {
+    const r = room(monthStarts(2020, 5, 12), w);
+    const lastLabel = dateLabels(monthStarts(2020, 5, 12), w).labels.pop();
+    const tick = Date.parse(lastLabel) / 86400000 + 25569;
+    const plotPx = Math.max(120, w - 90);
+    const end = r.max ?? r.last, start = r.min ?? Math.min(tick, r.last);
+    const halfPx = ((end - tick) / (end - start)) * plotPx;
+    assert.ok(halfPx >= 25, `${w}px: ${halfPx.toFixed(1)}px beside the last label`);
+  }
+  // the last point well before the next label: the axis ends at it, as before
+  const r = room(monthStarts(2020, 5, 11), 700);   // to Apr 2021; the last label is Mar 2021
+  assert.ok(r.max === undefined || r.max === r.last, JSON.stringify(r));
 });
