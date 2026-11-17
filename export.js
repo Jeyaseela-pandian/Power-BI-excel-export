@@ -4022,6 +4022,32 @@ function hfText(s) {
  * widths → rules and fills (need the final width) → logo → collapse notes (wording
  * fits the table width) → notes and footer → row heights, outline, print setup.
  */
+/*
+ * The title the page shows, from its design: a short heading in a text box, one line in large
+ * type (16pt or more), at least a fifth of the page wide, set above every chart and table on
+ * the page ("Warehouse Fulfillment Dashboard"); the largest when there are several. null when the page has none (its name is
+ * used, as before).
+ */
+const PAGE_TITLE_MIN_PT = 16;
+function pageTitleText(reportColors, page) {
+  const visuals = (reportColors && reportColors.visuals) || {};
+  const prefix = String(page && page.name) + "\u0001";
+  const onPage = Object.keys(visuals).filter((k) => k.startsWith(prefix)).map((k) => visuals[k]).filter((v) => v && v.position);
+  const top = (v) => Number(v.position.y);
+  const dataTops = onPage.filter((v) => v.visualType && !NON_DATA_TYPES.includes(v.visualType) && v.visualType !== "slicer").map(top).filter(isFinite);
+  const firstData = dataTops.length ? Math.min(...dataTops) : Infinity;
+  if (!isFinite(firstData)) return null;   // a page of text only: no heading over a chart or table
+  // a title spans a good part of the page (a small badge such as "Free" isn't one)
+  const pageW = Math.max(...onPage.map((v) => Number(v.position.x || 0) + Number(v.position.width || 0)).filter(isFinite), 1);
+  // a heading, not a sentence: short, and not ending in a full stop
+  const titles = onPage.filter((v) => v.visualType === "textbox" && v.textBox && v.textBox.lines === 1 && v.textBox.size >= PAGE_TITLE_MIN_PT &&
+    v.textBox.text.length <= 70 && !/[.!?]$/.test(v.textBox.text) && Number(v.position.width || 0) >= pageW * 0.2 &&
+    isFinite(top(v)) && top(v) + Number(v.position.height || 0) <= firstData + 1);
+  if (!titles.length) return null;
+  titles.sort((a, b) => b.textBox.size - a.textBox.size || top(a) - top(b));
+  return titles[0].textBox.text;
+}
+
 function writePageSheet(wb, sheetName, page, data, options, branding, logo, nameTable, ctx) {
   const accent = accentPlan(toArgb(branding.accent));
   const fonts = makeFonts(branding.titleFont);
@@ -4056,7 +4082,7 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
   heights[row++] = 15;
 
   const title = ws.getCell(row, B);
-  title.value = page.displayName;
+  title.value = pageTitleText(lay.reportColors, page) || page.displayName;
   title.font = fonts.title;
   title.alignment = { vertical: "bottom" };
   heights[row++] = 34;
@@ -4123,7 +4149,7 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
   }
 
   // 3. Column widths; the page is at least as wide as its masthead text
-  const titleUnits = Math.ceil(String(page.displayName).length * (branding.titleFont === "Georgia" ? 2.3 : 2.1)) + 6;
+  const titleUnits = Math.ceil(String(title.value).length * (branding.titleFont === "Georgia" ? 2.3 : 2.1)) + 6;
   const minPage = Math.max(MIN_PAGE_W, titleUnits, Math.ceil(eyebrowText.length * 0.95) + 6,
     Math.ceil(metaText.length * 0.9) + 6, Math.ceil(longestFilterLine * 0.9) + 6);
   const { contentEnd, bandEnd } = widths.apply(ws, Math.max(layout.lastCol, B), minPage);
@@ -4569,7 +4595,8 @@ function boxPlan(item) {
 const DATE_STEPS = [[1, "days", 1], [7, "days", 7], [1, "months", 30.44], [2, "months", 60.9], [3, "months", 91.3], [6, "months", 182.6],
   [1, "years", 365.25], [2, "years", 730.5], [5, "years", 1826], [10, "years", 3652]];
 function withDateAxis(plan) {
-  if (!plan || !["line", "area"].includes(plan.spec.kind) || plan.dateAxis) return plan;
+  // a combo's columns and line share the axis: dates spaced by date there too ("May 2021")
+  if (!plan || !["line", "area", "combo"].includes(plan.spec.kind) || plan.dateAxis) return plan;
   if (plan.look && plan.look.cat.continuous === false) return plan;
   // A Year › Month (› Day) hierarchy on a continuous axis: Power BI draws it as dates
   // ("Jul 2020"); any other hierarchy keeps its levels of labels
@@ -6286,7 +6313,8 @@ function cartesianXml(plan, look, box, hidden) {
       lines.map(([s, i]) => chartSeriesXml("line", { ...s, lineLook: lineLookOf(s),
         labelsXml: labelsOn ? seriesLabelsXml("line", "standard", s.color, labelNumFmt(s.fmt, lineVals, look.labels), look.labels) : "" }, i, plan, refs.series[i])).join("") +
       `<c:marker val="1"/><c:axId val="${A3}"/><c:axId val="${A4}"/></c:lineChart>`;
-    axes += catAxXml(A3, A4, "b", { hidden: true }) +
+    // the second axis's line follows the same dates as the columns under it
+    axes += (plan.dateAxis ? dateAxXml(A3, A4, { hidden: true, date: plan.dateAxis }) : catAxXml(A3, A4, "b", { hidden: true })) +
       valAxXml(A4, A3, "r", axisNumFmt(lines[0][0].fmt, secAxis, look.sec, lineVals), { crosses: "max", grid: false, hidden: !titles.secShow, title: titles.sec, axis: secAxis, look: look.sec });
   }
 

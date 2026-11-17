@@ -387,3 +387,20 @@ test("the last date label is never cut off at the chart's right edge (May 2021 u
   const r = room(monthStarts(2020, 5, 11), 700);   // to Apr 2021; the last label is Mar 2021
   assert.ok(r.max === undefined || r.max === r.last, JSON.stringify(r));
 });
+
+test("a column-and-line combo chart over dates gets the date axis too (May 2021 …), its line on the same dates", () => {
+  ctx.T = { type: "lineClusteredColumnComboChart", title: "Shipping Trend", rows: [["SUPPLY_DATE", "Shipped Qty", "Shipped CBM"],
+    ...Array.from({ length: 200 }, (_, i) => { const d = new Date(Date.UTC(2021, 3, 1 + i)); return [`${d.getUTCMonth() + 1}/${d.getUTCDate()}/2021`, String(i % 50), String((i * 7) % 90)]; })] };
+  ctx.P = PALETTE;
+  ctx.I = { rule: "measure", category: { ref: "supply_date", label: "supply_date" }, categories: [{ ref: "supply_date", label: "supply_date" }],
+    measures: [{ ref: "shipped qty", label: "shipped qty", role: "Y" }, { ref: "shipped cbm", label: "shipped cbm", role: "Y2" }], overrides: {}, rules: [], tooltips: [],
+    roles: { Category: [{ ref: "supply_date", label: "supply_date" }], Y: [{ ref: "shipped qty", label: "shipped qty" }], Y2: [{ ref: "shipped cbm", label: "shipped cbm" }] } };
+  run(`T.colorInfo = I; T.colors = columnColors(T, P, I); T.themePalette = P; var cb = chartPlan(T);
+    Object.assign(cb, { look: chartLook({ type: T.type }, null), sizePx: { w: 768, h: 440 }, title: "t", showTitle: true });
+    cb = withDateAxis(withNumberAxis(withNumberOrder(cb)));
+    cb.refs = { catRef: "D!A2:A201", series: cb.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B201" })), range: () => "D!B2" };`);
+  assert.ok(run("!!cb.dateAxis && cb.dateAxis.timeUnit === 'months'"), "a date axis by months");
+  const xml = run("chartXml(cb).xml");
+  assert.strictEqual((xml.match(/<c:dateAx>/g) || []).length, 2, "the columns' axis and the line's (hidden) both by date");
+  assert.ok(!/<c:catAx>/.test(xml));
+});

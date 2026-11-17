@@ -84,3 +84,24 @@ test("Viewers: theme names in a newer-format layout are found (an empty theme en
   assert.deepStrictEqual(await websiteAxes(JSON.stringify({ themeCollection: {} }), content({ baseTheme: { name: "Fluent2-CY26SU08" } })), [false, false]);
   assert.deepStrictEqual(await websiteAxes("{}", content({})), [false, false]);
 });
+
+test("the page's title is its heading text box ('Warehouse Fulfillment Dashboard'), else its name", () => {
+  const { json } = loadApp();
+  const box = (text, size, pos) => ({ visualType: "textbox", textBox: { text, lines: 1, size }, position: pos });
+  const chart = { visualType: "clusteredColumnChart", position: { x: 0, y: 142, width: 768, height: 365 } };
+  const title = (visuals) => json(`pageTitleText({ visuals: ${JSON.stringify(Object.fromEntries(visuals.map((v, i) => ["p" + String.fromCharCode(1) + "v" + i, v])))} }, { name: "p" })`);
+  assert.strictEqual(title([chart, box("Warehouse Fulfillment Dashboard", 28, { x: 384, y: 0, width: 616, height: 77 })]), "Warehouse Fulfillment Dashboard");
+  // not a title: small type, a sentence, a small badge, below a chart, or a page with no charts
+  assert.strictEqual(title([chart, box("Warehouse Fulfillment Dashboard", 11, { x: 384, y: 0, width: 616, height: 77 })]), null);
+  assert.strictEqual(title([chart, box("Upgrade to get more out of this report.", 20, { x: 0, y: 0, width: 900, height: 60 })]), null);
+  assert.strictEqual(title([chart, box("Free", 20, { x: 1200, y: 0, width: 60, height: 40 })]), null);
+  assert.strictEqual(title([chart, box("Notes", 20, { x: 0, y: 600, width: 700, height: 40 })]), null);
+  assert.strictEqual(title([box("Welcome", 28, { x: 0, y: 0, width: 700, height: 60 })]), null);
+});
+
+test("a text box's text and type size are read from the report (classic layout)", () => {
+  const { json } = loadApp();
+  const objects = { general: [{ properties: { paragraphs: [{ textRuns: [{ value: "Warehouse Fulfillment Dashboard", textStyle: { fontWeight: "bold", fontSize: "28pt" } }] }] } }] };
+  assert.deepStrictEqual(json(`textBoxText(${JSON.stringify(objects)})`), { text: "Warehouse Fulfillment Dashboard", lines: 1, size: 28 });
+  assert.strictEqual(json(`textBoxText({})`), null);
+});

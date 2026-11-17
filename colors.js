@@ -1077,7 +1077,7 @@ function legacyVisual(config) {
   const o = sv.objects || {};
   return { type: sv.visualType, roles, objects: o, container: sv.vcObjects || {}, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [],
     values: [...(o.value || []), ...(o.labels || [])], titleShown: titleShown(sv.vcObjects), expansion: sv.expansionStates || null,
-    sort: sortOf((sv.prototypeQuery || {}).OrderBy, sources) };
+    sort: sortOf((sv.prototypeQuery || {}).OrderBy, sources), position: ((config.layouts || [])[0] || {}).position || null };
 }
 
 /*
@@ -1110,7 +1110,26 @@ function pbirVisual(json) {
   const o = v.objects || {};
   return { type: v.visualType, roles, objects: o, container: v.visualContainerObjects || {}, dataPoint: o.dataPoint || [], bubbles: o.bubbleLayer || [],
     values: [...(o.value || []), ...(o.labels || [])], titleShown: titleShown(v.visualContainerObjects), expansion: v.expansionStates || null,
-    sort: sortOf(v.query && v.query.sortDefinition && v.query.sortDefinition.sort) };
+    sort: sortOf(v.query && v.query.sortDefinition && v.query.sortDefinition.sort), position: json.position || null };
+}
+
+/* A text box's text and its largest font size in points: { text, size }, or null when empty */
+function textBoxText(objects) {
+  const general = ((objects || {}).general || [])[0];
+  const paragraphs = (general && general.properties && general.properties.paragraphs) || [];
+  const lines = [], sizes = [];
+  for (const p of Array.isArray(paragraphs) ? paragraphs : []) {
+    const runs = p.textRuns || [];
+    const line = runs.map((r) => String(r.value ?? "")).join("").replace(/\s+/g, " ").trim();
+    if (line) lines.push(line);
+    for (const r of runs) {
+      const size = parseFloat(String((r.textStyle || {}).fontSize || ""));
+      const px = /px/i.test(String((r.textStyle || {}).fontSize || ""));
+      if (isFinite(size) && String(r.value ?? "").trim()) sizes.push(px ? size * 0.75 : size);
+    }
+  }
+  if (!lines.length) return null;
+  return { text: lines.join("\n"), lines: lines.length, size: sizes.length ? Math.max(...sizes) : null };
 }
 
 /* Icon rules ("fx" icons): each case's lower bound (a threshold) and its icon */
@@ -1376,6 +1395,10 @@ function visualColorInfo(visual, theme) {
     // A matrix's saved expand / collapse state: per role, each level's default and the groups toggled
     expansion: visual.expansion || null,
     sort: visual.sort || null,   // the visual's saved sort: [{ field, desc }]
+    // Where it sits on the page, and a text box's text (the page's title, when it heads the page)
+    visualType: visual.type || null,
+    position: visual.position || null,
+    textBox: visual.type === "textbox" ? textBoxText(visual.objects) : null,
     keyDrivers: visual.type === "keyDriversVisual" ? keyDriversSettings(visual) : null,
     // A decomposition tree's bars per level (its levels and open branches are in expansion)
     barsPerLevel: visual.type === "decompositionTreeVisual" ? treeBarsPerLevel(visual) : null,
