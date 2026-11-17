@@ -24,9 +24,9 @@ function card(type, rows, info, reportNumbers) {
 test("a card shows its value in the report's display units: Auto picks them, as Power BI does", () => {
   const auto = card("card", [["Sum of Sales"], ["$3937628"]], { valueUnits: { units: 0, precision: null } }, true);
   assert.strictEqual(auto.value, 3937628, "the cell keeps the exact value");
-  assert.strictEqual(auto.numFmt, '[>=9950000]"$"#,##0,,"M";"$"#,##0.0,,"M"', "shown as $3.9M: one decimal below ten of the unit");
+  assert.strictEqual(auto.numFmt, '"$"#,##0.0,,"M"', "shown as $3.9M: one decimal below ten of the unit");
   // the Adventure Works cards: 18K, 31K, $110M, $97M, $13M, as Power BI shows them
-  for (const [raw, fmt] of [["18490", '[>=9950]#,##0,"K";#,##0.0,"K"'], ["$109810000", '[>=9950000]"$"#,##0,,"M";"$"#,##0.0,,"M"'], ["$12550000", '[>=9950000]"$"#,##0,,"M";"$"#,##0.0,,"M"']]) {
+  for (const [raw, fmt] of [["18490", '#,##0,"K"'], ["$109810000", '"$"#,##0,,"M"'], ["$12550000", '"$"#,##0,,"M"']]) {
     assert.strictEqual(card("cardVisual", [["Value"], [raw]], { valueUnits: { units: 0, precision: null } }, true).numFmt, fmt, raw);
   }
   const thousands = card("card", [["Orders"], ["52345"]], { valueUnits: { units: 1000, precision: 0 } }, true);

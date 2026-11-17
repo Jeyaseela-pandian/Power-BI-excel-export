@@ -2235,6 +2235,14 @@ function keyInfluencerItems(item, info, notes) {
  * without the report's layout, the visual stays the table it was.
  */
 const TREE_INDENT = "  ";   // two em spaces per level
+/* A decomposition tree's open levels, in order (the report's expansion state): { state, levelFields } */
+function treeLevels(info) {
+  const state = ((info.expansion || []).find((s) => (s.roles || []).includes("ExplainBy"))) || null;
+  const explain = info.roles.ExplainBy || [];
+  const byQuery = (q) => explain.find((f) => f.queryRef === q);
+  const levelFields = state ? (state.levels || []).filter((l) => l.isPinned).map((l) => byQuery((l.queryRefs || [])[0])) : [];
+  return { state, levelFields: levelFields.some((f) => !f) ? [null] : levelFields };
+}
 const joinNames = (n) => (n.length <= 1 ? n.join("") : `${n.slice(0, -1).join(", ")} and ${n[n.length - 1]}`);
 function decompositionTreeItem(item, info) {
   if (item.type !== "decompositionTreeVisual" || !info || !info.roles) return item;
@@ -2243,12 +2251,13 @@ function decompositionTreeItem(item, info) {
   const measure = (info.roles.Analyze || [])[0];
   const mc = colOf(measure);
   const additive = measure && measure.field && measure.field.kind === "agg" && [0, 5].includes(measure.field.agg);   // Sum, Count
-  if (mc < 0 || !additive) return item;
+  // A measure that doesn't add up (Var Plan): its values as Power BI worked them out
+  // (loadTreeValues), else the visual stays the table it was
+  const asked = !additive && item.treeValues ? item.treeValues : null;
+  if (mc < 0 || (!additive && !asked)) return item;
   // The open levels, in order, and the opened branch at each (the report's expansion state)
-  const state = ((info.expansion || []).find((s) => (s.roles || []).includes("ExplainBy"))) || null;
-  const explain = info.roles.ExplainBy || [];
-  const byQuery = (q) => explain.find((f) => f.queryRef === q);
-  const levels = state ? (state.levels || []).filter((l) => l.isPinned).map((l) => colOf(byQuery((l.queryRefs || [])[0]))) : [];
+  const { state, levelFields } = treeLevels(info);
+  const levels = levelFields.map(colOf);
   if (!levels.length || levels.some((ci) => ci < 0)) return item;
   const literal = (v) => { const s = String(((v || {}).Literal || {}).Value ?? ""); return /^'.*'$/s.test(s) ? s.slice(1, -1).replace(/''/g, "'") : s; };
   const text = (r, ci) => String(r[ci] ?? "").trim();
@@ -2261,23 +2270,26 @@ function decompositionTreeItem(item, info) {
   const pct = (x) => `${(x * 100).toFixed(1)}%`;
   const limit = Math.max(1, info.barsPerLevel || 10);
   const out = [];
-  const total = data.reduce((s, r) => s + num(r), 0);
+  const total = asked ? asked.total ?? 0 : data.reduce((s, r) => s + num(r), 0);
   out.push(["Total", "", show(total), "100.0%"]);
   // One level under a branch: its values largest first, the opened one expanded beneath it
-  const walk = (rows, depth, node, parentTotal) => {
+  const walk = (rows, depth, node, parentTotal, path = []) => {
     const ci = levels[depth];
     const groups = new Map();
     for (const r of rows) { const k = text(r, ci) || "(Blank)"; groups.set(k, (groups.get(k) || 0) + num(r)); }
+    if (asked) for (const k of groups.keys()) groups.set(k, asked.byPath[[...path, k].map(matchKey).join("\u0001")] ?? 0);
     const sorted = [...groups].sort((a, b) => b[1] - a[1]);
     const open = new Set(((node && node.children) || []).filter((c) => c.isToggled).map((c) => literal((c.identityValues || [])[0])));
-    sorted.slice(0, limit).forEach(([name, value]) => {
+    // values asked of Power BI don't add up, so none are put together: every bar is listed
+    const shown = asked ? sorted.length : limit;
+    sorted.slice(0, shown).forEach(([name, value]) => {
       out.push([TREE_INDENT.repeat(depth) + header[ci], name, show(value), pct(parentTotal ? value / parentTotal : 0)]);
       if (open.has(name) && depth + 1 < levels.length) {
         const child = node.children.find((c) => c.isToggled && literal((c.identityValues || [])[0]) === name);
-        walk(rows.filter((r) => (text(r, ci) || "(Blank)") === name), depth + 1, child, value);
+        walk(rows.filter((r) => (text(r, ci) || "(Blank)") === name), depth + 1, child, value, [...path, name]);
       }
     });
-    const rest = sorted.slice(limit);
+    const rest = sorted.slice(shown);
     if (rest.length) {
       const value = rest.reduce((s, [, v]) => s + v, 0);
       out.push([TREE_INDENT.repeat(depth) + header[ci], `${rest.length} more`, show(value), pct(parentTotal ? value / parentTotal : 0)]);
@@ -2295,7 +2307,7 @@ function decompositionTreeItem(item, info) {
     ...item,
     type: "decompositionTree",   // a plain table: its own Total row, no totals row added
     title: isGenericTitle(item.title, item.type) ? `${header[mc]} by ${joinNames(levels.map((ci) => header[ci]))}` : item.title,
-    captionText: `As opened in the report${path.length ? `: ${path.join(" › ")}` : ""} · values added up from the report's data`,
+    captionText: `As opened in the report${path.length ? `: ${path.join(" › ")}` : ""} · ${asked ? "values from Power BI" : "values added up from the report's data"}`,
     rows: [["Level", "Name", header[mc], shareHead], ...out],
     gridFormat: { measures: [], tableFormats: [{ target: "m:" + normalizeField(shareHead), kind: "bar",
       bar: { color: DEFAULT_THEME_COLORS[0], negative: null, axis: null, reverse: false, showValue: true, share: true } }] },
@@ -3572,7 +3584,8 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     const ownSub = info && info.look && info.look.subtitle && info.look.subtitle.text;
     if (ownSub && !item.isKpi && !hidden) item.subtitle = ownSub;
     // A trend visual's colours are on its cards; its table stays plain
-    item.colors = lay.palette && !item.isKpi && !item.trend && !item.captionText ? columnColors(item, lay.palette, info) : null;
+    // (a decomposition tree kept as its table: its bars' colour isn't a column's, so none)
+    item.colors = lay.palette && !item.isKpi && !item.trend && !item.captionText && item.type !== "decompositionTreeVisual" ? columnColors(item, lay.palette, info) : null;
     item.tableFormat = item.gridFormat || (info && info.tableFormats && info.tableFormats.length ? info : null);
     item.colorInfo = info;
     item.themePalette = lay.palette && lay.palette.length ? lay.palette : null;   // colours for charts without their own settings
@@ -3611,6 +3624,8 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
       if (item.chart && !item.chart.panels) item.chart = growForLegend(item.chart);
     }
     if (item.chart && item.chart.note) colorNotes.push(item.chart.note);
+    // The anomaly band and expected values: Power BI's AI works them out on screen only
+    if (info && info.anomalies) colorNotes.push(`Not included: the anomaly detection on "${item.displayTitle || item.title}" (its expected range and values) – Power BI's AI works it out on screen. The values themselves are exported.`);
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
   }
   const executive = !BUILT_IN_STYLES.includes(lay.tableStyle);
@@ -4055,13 +4070,23 @@ function pageTitleText(reportColors, page) {
   return box ? box.text : null;
 }
 
-/* The title text box across the page's width, in its own type (up to 26pt), placed as in the report */
+/* The title text box across the page's width, placed as in the report, each part of its text in
+   its own type ("CORPORATE SPEND SAMPLE PBIX" big and bold, "YTD IT Spend Trend Analysis" small);
+   type over 26pt is scaled down, every part alike */
 const PAGE_TITLE_MAX_PT = 26;
 function writeTitleBox(ws, row, c1, c2, box) {
   if (c2 > c1) ws.mergeCellsWithoutStyle(row, c1, row, c2);
   const c = ws.getCell(row, c1);
-  c.value = box.text;
-  c.font = { name: box.face || "Segoe UI", size: Math.round(Math.min(box.size, PAGE_TITLE_MAX_PT)), bold: !!box.bold, color: { argb: toArgb(box.color || "#252423") } };
+  const scale = box.size > PAGE_TITLE_MAX_PT ? PAGE_TITLE_MAX_PT / box.size : 1;
+  const fontOf = (r) => ({ name: r.face || box.face || "Segoe UI", size: Math.max(6, Math.round((r.size ?? TEXT_BOX_DEFAULT_PT) * scale)),
+    bold: !!r.bold, italic: !!r.italic, color: { argb: toArgb(r.color || "#252423") } });
+  const runs = (box.runs || []).filter((r) => r.text !== "\n");
+  if (runs.length > 1) {
+    c.value = { richText: runs.map((r) => ({ text: r.text, font: fontOf(r) })) };
+  } else {
+    c.value = box.text;
+    c.font = fontOf(runs[0] || box);
+  }
   c.alignment = { vertical: "middle", horizontal: box.align, indent: box.align === "center" ? 0 : 1 };
 }
 
@@ -4834,7 +4859,11 @@ function withNumberAxis(plan) {
   const lo = Math.max(0, Math.floor(Math.min(...nums) / scale.step) * scale.step);
   const hi = Math.max(...nums);
   const years = nums.every((n) => n >= 1900 && n <= 2100);
-  return { ...plan, dateAxis: { serials: nums, unit: scale.step, timeUnit: "days", fmt: years ? "0" : "#,##0", cellFmt: years ? "0" : "#,##0",
+  // Power BI's axis starts at the lowest number (Period 1, labels 2, 4 … 12): Excel's starts on
+  // the step below it, and the label there, before the first point, is left blank
+  const shown = years ? "0" : "#,##0";
+  const first = Math.min(...nums);
+  return { ...plan, dateAxis: { serials: nums, unit: scale.step, timeUnit: "days", fmt: lo < first ? `[<${first}]"";${shown}` : shown, cellFmt: shown,
     min: lo, max: hi > lo ? hi : lo + scale.step, numbers: true } };
 }
 
@@ -5221,7 +5250,7 @@ function dataLabelsXml(fmt, argb, t) {
  * ink, whichever reads on the bar, unless the report sets their colour.
  */
 const LABEL_POSITIONS = { insideend: "inEnd", outsideend: "outEnd", insidecenter: "ctr", insidebase: "inBase", above: "t", under: "b", below: "b", left: "l", right: "r", center: "ctr" };
-function seriesLabelsXml(kind, grouping, color, numFmt, labels) {
+function labelPosOf(kind, grouping, labels) {
   let pos = LABEL_POSITIONS[String(labels.position || "").toLowerCase()] || null;
   if (kind === "bar") {
     const allowed = grouping === "clustered" ? ["ctr", "inEnd", "inBase", "outEnd"] : ["ctr", "inEnd", "inBase"];
@@ -5231,11 +5260,17 @@ function seriesLabelsXml(kind, grouping, color, numFmt, labels) {
   } else {
     pos = null;   // area: Excel places them
   }
+  return pos;
+}
+/* hide: the points whose label isn't shown (a bar too small to hold its label inside) */
+function seriesLabelsXml(kind, grouping, color, numFmt, labels, hide = []) {
+  const pos = labelPosOf(kind, grouping, labels);
   const inside = kind === "bar" && pos !== "outEnd";
   const own = labels.text.color && hexOf(labels.text.color) !== hexOf(LOOK_TEXT.color);
   const text = inside && !own && color ? { ...labels.text, color: textOn(argbOf(color)) } : labels.text;
   const back = labels.background ? fillA(labels.background.color, 1 - labels.background.transparency / 100) : "<a:noFill/>";
-  return `<c:dLbls><c:numFmt formatCode="${xmlEsc(numFmt || "General")}" sourceLinked="0"/><c:spPr>${back}<a:ln><a:noFill/></a:ln></c:spPr>${txPrA(text)}` +
+  const off = hide.map((i) => `<c:dLbl><c:idx val="${i}"/><c:delete val="1"/></c:dLbl>`).join("");
+  return `<c:dLbls>${off}<c:numFmt formatCode="${xmlEsc(numFmt || "General")}" sourceLinked="0"/><c:spPr>${back}<a:ln><a:noFill/></a:ln></c:spPr>${txPrA(text)}` +
     (pos ? `<c:dLblPos val="${pos}"/>` : "") + `${labelFlags({ val: true })}</c:dLbls>`;
 }
 
@@ -5323,6 +5358,40 @@ function analyticValue(line, values) {
     }
     default: return null;
   }
+}
+
+/*
+ * A line Power BI draws "stepped": each value flat across its own category (from the first
+ * category's middle to the last's), a straight drop at each boundary to the next, as scatter
+ * pieces across the plot (0 to 1 over the categories). Excel draws no more points of one such
+ * series than the chart has categories, so each flat and each drop is a piece of its own; the
+ * first carries the line's name for the legend, the rest are left out of it. Labels over each
+ * category's middle. alloc(): a new series number, kept out of the legend.
+ */
+function steppedLineSeriesXml([s, i], n, plan, refs, ls, label, alloc) {
+  const lit = (vals) => `<c:numLit><c:formatCode>General</c:formatCode><c:ptCount val="${vals.length}"/>${vals.map((v, k) => `<c:pt idx="${k}"><c:v>${v}</c:v></c:pt>`).join("")}</c:numLit>`;
+  const ref = refs.series[i];
+  const sp = `<c:spPr>${lineA({ color: s.color, width: ls.width, style: ls.style })}</c:spPr><c:marker><c:symbol val="none"/></c:marker>`;
+  let first = true;
+  const piece = (pts, labelAt) => {
+    const idx = first ? i : alloc();
+    const name = first && ref ? `<c:tx><c:strRef><c:f>${xmlEsc(ref.nameRef)}</c:f>${strCacheXml([s.name])}</c:strRef></c:tx>` : `<c:tx><c:v>${xmlEsc(s.name)}</c:v></c:tx>`;
+    first = false;
+    const hide = pts.map((_, k) => k).filter((k) => k !== labelAt);
+    const labels = label && labelAt >= 0 ? seriesLabelsXml("line", "standard", s.color, label.fmt, label.labels, hide) : "";
+    return `<c:ser><c:idx val="${idx}"/><c:order val="${idx}"/>${name}${sp}${labels}` +
+      `<c:xVal>${lit(pts.map((p) => p[0]))}</c:xVal><c:yVal>${lit(pts.map((p) => p[1]))}</c:yVal><c:smooth val="0"/></c:ser>`;
+  };
+  const shown = s.values.map((v, k) => [k, v]).filter(([, v]) => typeof v === "number");
+  const out = [];
+  shown.forEach(([k, v], j) => {
+    const left = j === 0 ? null : [k / n, v], mid = [(k + 0.5) / n, v], right = j === shown.length - 1 ? null : [(k + 1) / n, v];
+    const pts = [left, mid, right].filter(Boolean);
+    out.push(piece(pts, pts.indexOf(mid)));
+    // the drop at the boundary to the next value
+    if (right) out.push(piece([[(k + 1) / n, v], [(k + 1) / n, shown[j + 1][1]]], -1));
+  });
+  return out.join("");
 }
 
 /* One constant or analytics line: a two-point scatter series ([x, y] pairs), with its label
@@ -5701,10 +5770,12 @@ function labelNumFmt(fmt, values, cfg, minDecimals = 0, auto = labelAutoUnit) {
   if (s.includes("%")) return precision !== null ? unitFormat(s, 1, precision) : s;
   const unit = cfg && cfg.units > 0 ? cfg.units : auto(maxAbsOf(values));
   if (unit <= 1 && precision === null) return s;
-  // A whole-number measure shortened (data labels): Power BI shows one decimal below ten of the
-  // unit and none from there (6.8K, 33K, $11M), label by label, as Excel's conditional format does
-  if (unit > 1 && precision === null && minDecimals === 0 && fmtDecimals(s) === 0 && values.every((v) => typeof v !== "number" || v >= 0)) {
-    return `[>=${9.95 * unit}]${unitFormat(s, unit, 0)};${unitFormat(s, unit, 1)}`;
+  // A whole-number measure shortened (data labels): Power BI gives the whole chart one number of
+  // decimals: one when any label is below ten of the unit ($15.2M, $9.0M, $0.5M on one chart;
+  // 13.6K beside 4.0K), none when every label is ten or more (33K, 31K, 24K, 15K)
+  if (unit > 1 && precision === null && minDecimals === 0 && fmtDecimals(s) === 0) {
+    const shown = values.filter((v) => typeof v === "number" && v !== 0);
+    return unitFormat(s, unit, shown.length && shown.every((v) => Math.abs(v) >= 9.95 * unit) ? 0 : 1);
   }
   return unitFormat(s, unit, precision !== null ? precision : unit > 1 ? Math.max(minDecimals, fmtDecimals(s)) : null);
 }
@@ -6176,7 +6247,12 @@ function cartesianXml(plan, look, box, hidden) {
   const W = (plan.sizePx && plan.sizePx.w) || 400, H = (plan.sizePx && plan.sizePx.h) || 300;
   const indexed = series.map((s, i) => [s, i]);
   const main = indexed.filter(([s]) => !s.line);
-  const lines = indexed.filter(([s]) => s.line);
+  const lineSeries = indexed.filter(([s]) => s.line);
+  // A combo whose Y-axis the report turns off: Power BI draws no second axis either, and its line
+  // on the columns' own scale (Plan's $13.9M just under Actual's $15.2M)
+  const shareScale = lineSeries.length > 0 && kind !== "line" && !!(plan.axes && plan.axes.val && plan.axes.val.show === false);
+  const lines = shareScale ? [] : lineSeries;
+  const sameScaleLines = shareScale ? lineSeries : [];
   const horizontal = spec.dir === "bar";
   // One series "stacked" on nothing (Power BI's bar and column charts with one measure) is drawn
   // as plain bars: they look the same, and only then can Excel put labels past the bar's end, as
@@ -6193,7 +6269,8 @@ function cartesianXml(plan, look, box, hidden) {
 
   // The value axis like Power BI's: room for its labels, a tick every ~55 px up or ~100 px across
   const titles = axisTitles(plan, main, lines);
-  const mainVals = stacked ? stackExtents(main.map(([s]) => s), n) : main.flatMap(([s]) => s.values);
+  const mainVals = (stacked ? stackExtents(main.map(([s]) => s), n) : main.flatMap(([s]) => s.values))
+    .concat(sameScaleLines.flatMap(([s]) => s.values));
   // A tornado's axis runs as far left as right
   if (spec.mirror) { const m = maxAbsOf(mainVals); mainVals.push(m, -m); }
   const refUsable = (l) => l.kind !== "constant" || l.axis === (horizontal ? "x" : "y");
@@ -6228,14 +6305,26 @@ function cartesianXml(plan, look, box, hidden) {
     if (top > 0) {
       const L = stacked && look.totals.show ? look.totals : look.labels;
       const unit = L.units > 0 ? L.units : labelAuto(maxAbsOf(tops));
-      // the widest label as it shows: shortened labels take a decimal below ten of the unit (8.5K)
-      const dec = L.precision ?? (unit > 1 && fmtDecimals(String(fmt0 || "")) === 0 ? (top >= 9.95 * unit ? 0 : 1) : null);
+      // the widest label as it shows: shortened labels take a decimal unless every one is ten or more of the unit
+      const dec = L.precision ?? (unit > 1 && fmtDecimals(String(fmt0 || "")) === 0 ? (tops.every((v) => !v || Math.abs(v) >= 9.95 * unit) ? 0 : 1) : null);
       const text = displayValue(top, fmt0, unit, dec);
       const labelPx = horizontal ? textPx(text, L.text) + 10 : lineHeightPx(L.text) + 6;
       const fits = () => ((top - axis.min) / (axis.max - axis.min)) * axisPx + labelPx <= axisPx;
       // first to the next whole step (the axis ends on a gridline), then a step more at a time
       if (!fits()) axis.max = Number((Math.ceil(axis.max / axis.step - 1e-9) * axis.step).toFixed(12));
       for (let i = 0; i < 10 && !fits(); i++) axis.max = Number((axis.max + axis.step).toFixed(12));
+    }
+    // A negative bar's label sits past its end too, towards the names: the axis runs on below
+    // zero, a step at a time, until "-0.61M" fits clear of them (not when the report sets the start)
+    const bottom = Math.min(0, ...tops);
+    if (bottom < 0 && (look.val.start === null || look.val.start === undefined)) {
+      const L = stacked && look.totals.show ? look.totals : look.labels;
+      const unit = L.units > 0 ? L.units : labelAuto(maxAbsOf(tops));
+      const dec = L.precision ?? (unit > 1 && fmtDecimals(String(fmt0 || "")) === 0 ? (tops.every((v) => !v || Math.abs(v) >= 9.95 * unit) ? 0 : 1) : null);
+      const labelPx = horizontal ? textPx(displayValue(bottom, fmt0, unit, dec), L.text) + 10 : lineHeightPx(L.text) + 6;
+      const fitsLow = () => ((bottom - axis.min) / (axis.max - axis.min)) * axisPx >= labelPx;
+      if (!fitsLow()) axis.min = Number((Math.floor(axis.min / axis.step + 1e-9) * axis.step).toFixed(12));
+      for (let i = 0; i < 10 && !fitsLow(); i++) axis.min = Number((axis.min - axis.step).toFixed(12));
     }
   }
   const valFmt = pct ? stepFormat("0%", axis, []) : spec.mirror ? unsignedNumFmt(axisNumFmt(fmt0, axis, look.val, mainVals)) : axisNumFmt(fmt0, axis, look.val, mainVals);
@@ -6254,10 +6343,22 @@ function cartesianXml(plan, look, box, hidden) {
     const share = look.cat.padding === null || look.cat.padding === undefined ? 0.25 : Math.min(0.9, Math.max(0, look.cat.padding / 100 + 0.05));
     const per = grouping === "clustered" ? Math.max(1, shown.length) : 1;
     const gapWidth = spec.gap !== undefined ? spec.gap : Math.round(Math.min(500, share / (1 - share) * per * 100));
+    // Labels inside the bars: Power BI leaves out the ones a bar is too small to hold
+    const insideBars = labelsOn && axis && axis.max > axis.min && labelPosOf("bar", grouping, look.labels) !== "outEnd";
+    const tooSmall = (s) => {
+      if (!insideBars) return [];
+      const unit = look.labels.units > 0 ? look.labels.units : labelAuto(maxAbsOf(labelVals));
+      return s.values.map((v, i) => {
+        if (typeof v !== "number") return -1;
+        const barPx = (Math.abs(v) / (axis.max - axis.min)) * axisPx;
+        const needPx = horizontal ? textPx(displayValue(v, s.fmt, unit, look.labels.precision ?? (unit > 1 ? 1 : null)), look.labels.text) + 6 : lineHeightPx(look.labels.text) + 4;
+        return barPx < needPx ? i : -1;
+      }).filter((i) => i >= 0);
+    };
     let sers = main.map(([s, i]) => chartSeriesXml("bar", {
       ...s,
       labelsXml: labelsOn && !s.hidden ? seriesLabelsXml("bar", grouping, s.color || (plan.pointColors || []).find(Boolean),
-        spec.mirror ? unsignedNumFmt(labelNumFmt(s.fmt, labelVals, look.labels, 0, labelAuto)) : labelNumFmt(s.fmt, labelVals, look.labels, 0, labelAuto), look.labels) : "",
+        spec.mirror ? unsignedNumFmt(labelNumFmt(s.fmt, labelVals, look.labels, 0, labelAuto)) : labelNumFmt(s.fmt, labelVals, look.labels, 0, labelAuto), look.labels, tooSmall(s)) : "",
       trendXml: trendOn && !combineTrend && !s.hidden ? trendlineXml(look.trend) : "",
     }, i, plan, refs.series[i])).join("");
     // Total labels over each stack: an empty last segment labelled with the stack's total
@@ -6305,6 +6406,12 @@ function cartesianXml(plan, look, box, hidden) {
     const mean = plan.categories.map((_, ci) => { const v = shown.map((s) => s.values[ci]).filter((x) => typeof x === "number"); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; });
     overlays.push({ name: "Trend", values: mean, fmt: fmt0, literal: true, hidden: true, noLegend: true, trendXml: trendlineXml(look.trend) });
   }
+  // A combo's line the report draws "stepped" (flat from one value to the next): drawn as steps
+  // below, on the hidden axes the analytics lines use; any other line as before
+  const sameVals = sameScaleLines.flatMap(([s]) => s.values);
+  const steppedLine = ([s]) => !horizontal && !plan.dateAxis && !plan.multiLevel && n > 1 && !!lineLookOf(s).stepped;
+  const sameScaleFlat = sameScaleLines.filter((e) => !steppedLine(e));
+  const sameScaleSteps = sameScaleLines.filter(steppedLine);
   if (kind === "line") {
     groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
       main.map(([s, i]) => chartSeriesXml("line", {
@@ -6314,8 +6421,10 @@ function cartesianXml(plan, look, box, hidden) {
       }, i, plan, refs.series[i])).join("") +
       overlays.map((s) => { const idx = nextIdx++; hidden.push(idx); return chartSeriesXml("line", s, idx, plan, null); }).join("") +
       `<c:marker val="1"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:lineChart>`;
-  } else if (overlays.length) {
+  } else if (overlays.length || sameScaleFlat.length) {
     groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
+      sameScaleFlat.map(([s, i]) => chartSeriesXml("line", { ...s, lineLook: lineLookOf(s),
+        labelsXml: labelsOn ? seriesLabelsXml("line", "standard", s.color, labelNumFmt(s.fmt, sameVals, look.labels, 0, labelAuto), look.labels) : "" }, i, plan, refs.series[i])).join("") +
       overlays.map((s) => { const idx = nextIdx++; hidden.push(idx); return chartSeriesXml("line", s, idx, plan, null); }).join("") +
       `<c:marker val="1"/><c:axId val="${A1}"/><c:axId val="${A2}"/></c:lineChart>`;
   }
@@ -6359,6 +6468,9 @@ function cartesianXml(plan, look, box, hidden) {
       refSers.push(refLineSeriesXml(idx, l, horizontal ? [[v, 0], [v, 1]] : [[0, v], [1, v]], fmt0, horizontal, v));
     }
   }
+  const legendless = () => { const idx = nextIdx++; hidden.push(idx); return idx; };
+  if (axis) for (const e of sameScaleSteps) refSers.push(steppedLineSeriesXml(e, n, plan, refs, lineLookOf(e[0]),
+    labelsOn ? { fmt: labelNumFmt(e[0].fmt, sameVals, look.labels, 0, labelAuto), labels: look.labels } : null, legendless));
   if (refSers.length) {
     const unitAxis = { min: 0, max: 1 };
     groups += `<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>${refSers.join("")}<c:axId val="${A7}"/><c:axId val="${A8}"/></c:scatterChart>`;
@@ -7406,6 +7518,63 @@ async function loadKeyInfluencers(collected, options) {
   }
 }
 
+/*
+ * A decomposition tree whose measure doesn't add up from the exported rows (Var Plan, a
+ * calculated measure): its value for the whole tree and for each level the report has open,
+ * grouped by the levels above, asked of Power BI under the same report, page and visual
+ * filters: through the semantic model (Build permission), else Power BI's own query service
+ * (Viewers). item.treeValues: { total, byPath: { "europe": v, "europe\u00011": v } }; when
+ * neither answers, item.treeError and the tree stays the table it was.
+ */
+async function loadTreeValues(collected, options) {
+  for (const { data } of collected) {
+    for (const item of data.items) {
+      if (item.type !== "decompositionTreeVisual") continue;
+      const info = visualInfo(options.reportColors, item.page, item.name);
+      const measure = info && info.roles && (info.roles.Analyze || [])[0];
+      const mf = measure && measure.field;
+      if (!mf || (mf.kind === "agg" && [0, 5].includes(mf.agg))) continue;   // a sum or count adds up from the rows
+      const { levelFields } = treeLevels(info);
+      if (!levelFields.length || levelFields.some((f) => !f || !f.field || !["column", "level"].includes(f.field.kind) || !f.field.entity)) continue;
+      const filters = [...(data.queryFilters || []), ...(item.visualFilters || [])];
+      const byPath = {};
+      let total = null;
+      for (let d = 0; d <= levelFields.length && !item.treeError; d++) {
+        const res = await groupedMeasure(levelFields.slice(0, d).map((f) => f.field), mf, filters);
+        if (res.error) { item.treeError = res.error; break; }
+        for (const r of res.rows) {
+          if (!d) total = r[0];
+          else byPath[r.slice(0, d).map(matchKey).join("\u0001")] = r[d];
+        }
+      }
+      if (!item.treeError) item.treeValues = { total, byPath };
+      log(`Decomposition tree "${item.title}": ${item.treeError ? `values not asked (${item.treeError}); kept as its table` : `${Object.keys(byPath).length} value(s) from Power BI`}`);
+    }
+  }
+}
+
+/* A measure grouped by some columns (none: one total) under the filters: { rows: [[...values, measure]] } or { error } */
+async function groupedMeasure(columns, measure, filters) {
+  let daxError = null;
+  try {
+    const value = daxValue(measure);
+    if (!value) throw new Error("its measure can't be queried");
+    const filterTables = (filters || []).filter((f) => !(f && f.target && f.target.measure)).map(daxFilter).filter(Boolean);
+    const query = `EVALUATE SUMMARIZECOLUMNS(${[...columns.map((c) => daxColumn(c.entity, c.prop)), ...filterTables, `"v", ${value}`].join(", ")})`;
+    const res = await executeDaxQuery(query);
+    if (!res.error) return { rows: res.rows.map((r) => [...columns.map((c) => r[`${c.entity}[${c.prop}]`]), r["[v]"]]) };
+    daxError = res.error;
+  } catch (e) {
+    daxError = errorText(e);
+  }
+  try {
+    if (typeof websiteQuery !== "function") throw new Error("not available");
+    return { rows: await websiteQuery([...columns, measure], filters) };
+  } catch (e) {
+    return { error: `${daxError}; ${errorText(e)}` };
+  }
+}
+
 /* Rows per value of one field and of the analysed field: { rows: [[value, target, count]] } or { error } */
 async function keyInfluencerCounts(field, target, filters) {
   let daxError = null;
@@ -7510,6 +7679,7 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
     onProgress({ pageIndex: pages.length, pageCount: pages.length, pageName: pages[pages.length - 1].displayName, visualIndex: 0, visualCount: 0, visualTitle: "Reading sparklines…" });
     await loadSparklines(collected, options);
     await loadKeyInfluencers(collected, options);
+    await loadTreeValues(collected, options);
   }
 
   // "Match the report" accent: the report theme's main colour, else a neutral navy

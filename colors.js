@@ -921,7 +921,8 @@ function chartLook(visual, theme) {
     return { width: settingNumber(g("strokeWidth"), 3), style: String(g("lineStyle") || "solid").toLowerCase(),
       show: settingFlag(g("strokeShow"), true),   // "Show line" off: the markers alone
       markers: markers ? { shape: String(g("markerShape") || "circle"), size: settingNumber(g("markerSize"), 5), color: g("markerColor") || null } : null,
-      smooth: kind === "smooth" };
+      smooth: kind === "smooth",
+      stepped: settingFlag(g("stepped"), false) };   // "Stepped": flat steps from one value to the next
   };
   const series = {};
   for (const e of ((visual.objects || {}).lineStyles || [])) {
@@ -1113,32 +1114,49 @@ function pbirVisual(json) {
     sort: sortOf(v.query && v.query.sortDefinition && v.query.sortDefinition.sort), position: json.position || null };
 }
 
-/* A text box's text, its largest font size in points and that text's look:
-   { text, lines, size, bold, color, face }, or null when empty */
+/*
+ * A text box's text, its largest font size in points and that text's look, and each part of the
+ * text in its own look ("CORPORATE SPEND SAMPLE PBIX" in 18pt bold, then "YTD IT Spend Trend
+ * Analysis" in the default 10pt): { text, lines, size, bold, color, face, runs }, or null when empty
+ */
+const TEXT_BOX_DEFAULT_PT = 10;   // a text box's type without a size of its own
+function textRunLook(st) {
+  st = st || {};
+  const raw = String(st.fontFamily || "").split(",")[0].replace(/['"]/g, "").trim();
+  // Power BI's own font names carry the weight: "Segoe (Bold)", "Segoe (Semibold)", "DIN Light"
+  const weight = (raw.match(/\((Bold|Semibold|Light)\)$/i) || [])[1] || "";
+  const family = raw.replace(/\s*\((Bold|Semibold|Light)\)$/i, "").trim();
+  const face = /^segoe$/i.test(family) ? (/semibold/i.test(weight) ? "Segoe UI Semibold" : /light/i.test(weight) ? "Segoe UI Light" : "Segoe UI")
+    : /^wf_segoe-ui/i.test(family) ? "Segoe UI" : family || null;
+  const size = parseFloat(String(st.fontSize || ""));
+  return {
+    size: isFinite(size) ? (/px/i.test(String(st.fontSize)) ? size * 0.75 : size) : null,
+    bold: /bold|[6-9]00/i.test(String(st.fontWeight || "")) || /^bold$/i.test(weight),
+    italic: /italic/i.test(String(st.fontStyle || "")),
+    color: /^#[0-9a-f]{6}$/i.test(String(st.color || "")) ? st.color : null,
+    face,
+  };
+}
 function textBoxText(objects) {
   const general = ((objects || {}).general || [])[0];
   const paragraphs = (general && general.properties && general.properties.paragraphs) || [];
-  const lines = [], sizes = [];
-  let main = null;   // the run in the largest type: its look is the text box's
+  const lines = [], runs = [];
   for (const p of Array.isArray(paragraphs) ? paragraphs : []) {
-    const runs = p.textRuns || [];
-    const line = runs.map((r) => String(r.value ?? "")).join("").replace(/\s+/g, " ").trim();
-    if (line) lines.push(line);
-    for (const r of runs) {
-      const size = parseFloat(String((r.textStyle || {}).fontSize || ""));
-      const px = /px/i.test(String((r.textStyle || {}).fontSize || ""));
-      if (isFinite(size) && String(r.value ?? "").trim()) {
-        const pt = px ? size * 0.75 : size;
-        if (!sizes.length || pt > Math.max(...sizes)) main = r.textStyle || {};
-        sizes.push(pt);
-      }
-    }
+    const parts = (p.textRuns || []).filter((r) => String(r.value ?? "") !== "");
+    const line = parts.map((r) => String(r.value ?? "")).join("").replace(/\s+/g, " ").trim();
+    if (!line) continue;
+    if (lines.length) runs.push({ text: "\n" });
+    lines.push(line);
+    for (const r of parts) runs.push({ text: String(r.value).replace(/\s+/g, " "), ...textRunLook(r.textStyle) });
   }
   if (!lines.length) return null;
-  const st = main || {};
-  const face = String(st.fontFamily || "").split(",")[0].replace(/['"]/g, "").trim() || null;
-  return { text: lines.join("\n"), lines: lines.length, size: sizes.length ? Math.max(...sizes) : null,
-    bold: /bold|[6-9]00/i.test(String(st.fontWeight || "")), color: /^#[0-9a-f]{6}$/i.test(String(st.color || "")) ? st.color : null, face };
+  const sized = runs.filter((r) => r.text.trim() && r.text !== "\n");
+  const sizeOf = (r) => r.size ?? TEXT_BOX_DEFAULT_PT;
+  // the text box's look: its largest text's ("CORPORATE SPEND SAMPLE PBIX")
+  const main = sized.reduce((a, r) => (sizeOf(r) > sizeOf(a) ? r : a), sized[0]);
+  const anySize = sized.some((r) => r.size !== null);
+  return { text: lines.join("\n"), lines: lines.length, size: anySize ? sizeOf(main) : null,
+    bold: main.bold, color: main.color, face: main.face, runs };
 }
 
 /* Icon rules ("fx" icons): each case's lower bound (a threshold) and its icon */
@@ -1404,6 +1422,8 @@ function visualColorInfo(visual, theme) {
     // A matrix's saved expand / collapse state: per role, each level's default and the groups toggled
     expansion: visual.expansion || null,
     sort: visual.sort || null,   // the visual's saved sort: [{ field, desc }]
+    // Power BI's anomaly detection on a line chart (its band and expected values are worked out on screen)
+    anomalies: ((visual.objects || {}).anomalyDetection || []).some((d) => String((((d.properties || {}).show || {}).expr || {}).Literal ? d.properties.show.expr.Literal.Value : "") === "true"),
     // Where it sits on the page, and a text box's text (the page's title, when it heads the page)
     visualType: visual.type || null,
     position: visual.position || null,

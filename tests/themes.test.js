@@ -102,7 +102,15 @@ test("the page's title text box is found ('Warehouse Fulfillment Dashboard'); ot
 test("a text box's text and type size are read from the report (classic layout)", () => {
   const { json } = loadApp();
   const objects = { general: [{ properties: { paragraphs: [{ textRuns: [{ value: "Warehouse Fulfillment Dashboard", textStyle: { fontWeight: "bold", fontSize: "28pt" } }] }] } }] };
-  assert.deepStrictEqual(json(`textBoxText(${JSON.stringify(objects)})`), { text: "Warehouse Fulfillment Dashboard", lines: 1, size: 28, bold: true, color: null, face: null });
+  const one = json(`textBoxText(${JSON.stringify(objects)})`);
+  assert.deepStrictEqual([one.text, one.lines, one.size, one.bold, one.runs.length], ["Warehouse Fulfillment Dashboard", 1, 28, true, 1]);
+  // two parts in two looks (Corporate Spend): 18pt in "Segoe (Bold)", then the default type
+  const two = json(`textBoxText(${JSON.stringify({ general: [{ properties: { paragraphs: [{ textRuns: [
+    { value: "CORPORATE SPEND SAMPLE PBIX ", textStyle: { fontFamily: "Segoe (Bold)", fontSize: "18pt" } },
+    { value: "YTD IT Spend Trend Analysis", textStyle: { fontFamily: "Segoe UI" } }] }] } }] })})`);
+  assert.deepStrictEqual([two.text, two.size, two.bold, two.face], ["CORPORATE SPEND SAMPLE PBIX YTD IT Spend Trend Analysis", 18, true, "Segoe UI"]);
+  assert.deepStrictEqual(two.runs.map((r) => [r.text, r.size, r.bold, r.face]),
+    [["CORPORATE SPEND SAMPLE PBIX ", 18, true, "Segoe UI"], ["YTD IT Spend Trend Analysis", null, false, "Segoe UI"]]);
   assert.strictEqual(json(`textBoxText({})`), null);
 });
 
@@ -118,4 +126,15 @@ test("the title text box gets its own row above the visuals, centred as in the r
   assert.deepStrictEqual(cells.merged, [9, 2, 9, 20]);
   assert.strictEqual(cells["9,2"].value, "Warehouse Fulfillment Dashboard");
   assert.deepStrictEqual([cells["9,2"].font.size, cells["9,2"].font.bold, cells["9,2"].alignment.horizontal], [26, true, "center"]);
+});
+
+test("a title text box in two looks is written in both: big and bold, then small", () => {
+  const { ctx, run } = loadApp();
+  const cells = {};
+  ctx.WS = { mergeCellsWithoutStyle() {}, getCell: (r, c) => (cells[r + "," + c] = cells[r + "," + c] || {}) };
+  ctx.BOX = { text: "CORPORATE SPEND SAMPLE PBIX YTD IT Spend Trend Analysis", lines: 1, size: 18, bold: true, face: "Segoe UI", align: "left",
+    runs: [{ text: "CORPORATE SPEND SAMPLE PBIX ", size: 18, bold: true, face: "Segoe UI" }, { text: "YTD IT Spend Trend Analysis", size: null, bold: false, face: "Segoe UI" }] };
+  run("writeTitleBox(WS, 9, 2, 20, BOX)");
+  const rich = cells["9,2"].value.richText;
+  assert.deepStrictEqual(rich.map((r) => [r.text, r.font.size, r.font.bold]), [["CORPORATE SPEND SAMPLE PBIX ", 18, true], ["YTD IT Spend Trend Analysis", 10, false]]);
 });
