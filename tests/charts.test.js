@@ -366,3 +366,24 @@ test("date axis labels fall on the same round dates as Power BI's (Jul 2020, Sep
   // every point still on the chart: the axis runs on to the last one
   assert.ok(contoso.labels[contoso.labels.length - 1] <= "2021-05-01");
 });
+
+test("the last date label is never cut off at the chart's right edge (May 2021 under the last point)", () => {
+  const room = (dates, w) => json(`(() => {
+    const p = withDateAxis({ spec: { kind: "line" }, categories: ${JSON.stringify(dates)}, series: [{ name: "v", values: ${JSON.stringify(dates.map((_, i) => i))}, fmt: "#,##0" }],
+      pointColors: null, look: chartLook({ type: "lineChart" }, null), sizePx: { w: ${w}, h: 300 } });
+    const a = p.dateAxis, last = Math.max(...a.serials);
+    return { min: a.min, max: a.max, last };
+  })()`);
+  for (const w of [400, 700, 1100]) {
+    const r = room(monthStarts(2020, 5, 12), w);
+    const lastLabel = dateLabels(monthStarts(2020, 5, 12), w).labels.pop();
+    const tick = Date.parse(lastLabel) / 86400000 + 25569;
+    const plotPx = Math.max(120, w - 90);
+    const end = r.max ?? r.last, start = r.min ?? Math.min(tick, r.last);
+    const halfPx = ((end - tick) / (end - start)) * plotPx;
+    assert.ok(halfPx >= 25, `${w}px: ${halfPx.toFixed(1)}px beside the last label`);
+  }
+  // the last point well before the next label: the axis ends at it, as before
+  const r = room(monthStarts(2020, 5, 11), 700);   // to Apr 2021; the last label is Mar 2021
+  assert.ok(r.max === undefined || r.max === r.last, JSON.stringify(r));
+});

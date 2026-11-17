@@ -4517,8 +4517,43 @@ function withDateAxis(plan) {
     categories: pick(plan.categories),
     series: plan.series.map((s) => ({ ...s, values: pick(s.values) })),
     pointColors: plan.pointColors ? pick(plan.pointColors) : null,
-    dateAxis: { serials, unit, timeUnit, days, ...alignedDateTicks(serials, unit, timeUnit, fmt), ...(plan.monthsOnly ? { cellFmt: "mmm yyyy" } : {}) },
+    dateAxis: withLastLabelRoom({ serials, unit, timeUnit, days, ...alignedDateTicks(serials, unit, timeUnit, fmt), ...(plan.monthsOnly ? { cellFmt: "mmm yyyy" } : {}) },
+      fmt, plan.sizePx, plan.look && plan.look.cat && plan.look.cat.text),
   };
+}
+
+/*
+ * Excel centres each date label under its date and cuts off one that runs past the chart's
+ * right edge ("May 20…"). When the last label sits that close to the end, the axis runs on
+ * just far enough for all of it to show (Power BI keeps that room beside its plot too).
+ */
+function withLastLabelRoom(axis, fmt, sizePx, text) {
+  if (!["months", "years"].includes(axis.timeUnit) && axis.unit !== 7 && axis.unit !== 1) return axis;
+  const first = Math.min(...axis.serials), last = Math.max(...axis.serials);
+  const min = axis.min ?? first;
+  const toDate = (v) => new Date(Math.round((v - 25569) * 86400000));
+  const serial = (d) => Math.round(d.getTime() / 86400000 + 25569);
+  // the labels' dates: from the axis's start, a step at a time, up to the last point
+  let t = toDate(min), lastTick = null;
+  for (let k = 0; k < 2000; k++) {
+    const v = serial(t);
+    if (v > last) break;
+    lastTick = t;
+    t = axis.timeUnit === "years" ? new Date(Date.UTC(t.getUTCFullYear() + axis.unit, t.getUTCMonth(), t.getUTCDate()))
+      : axis.timeUnit === "months" ? new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth() + axis.unit, t.getUTCDate()))
+        : new Date(t.getTime() + axis.unit * 86400000);
+  }
+  if (!lastTick || last <= min) return axis;
+  const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const y = lastTick.getUTCFullYear(), mo = MON[lastTick.getUTCMonth()], dd = lastTick.getUTCDate();
+  const label = /^yyyy$/.test(fmt) ? String(y) : /mmm yyyy/.test(fmt) ? `${mo} ${y}` : `${dd} ${mo}`;
+  const half = textPx(label, text || {}) / 2 + 6;
+  const plotPx = Math.max(120, ((sizePx && sizePx.w) || 400) - 90);
+  // the end at which the last label's half fits: (end - tick) / (end - min) × plot = half
+  const tick = serial(lastTick);
+  const end = (tick - (half / plotPx) * min) / (1 - half / plotPx);
+  if (!(end > last)) return axis;
+  return { ...axis, min, max: Math.ceil(end) };
 }
 
 /*
