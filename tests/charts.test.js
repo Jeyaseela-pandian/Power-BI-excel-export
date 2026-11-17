@@ -182,6 +182,41 @@ test("a chart legend with a few entries shows them all", () => {
   assert.strictEqual((legend.match(/<c:delete val="1"\/>/g) || []).length, 0);
 });
 
+/* The number formats of a chart's data labels */
+function labelFormats(type, rows) {
+  ctx.T = { type, title: "t", rows };
+  ctx.P = PALETTE;
+  run(`T.colors = columnColors(T, P, null); T.themePalette = P; var lf = chartPlan(T); var ll2 = chartLook({ type: T.type }, null); ll2.labels.show = true;
+    Object.assign(lf, { look: ll2, sizePx: { w: 500, h: 300 }, title: "t", showTitle: true });
+    lf.refs = { catRef: "D!A1:A2", series: lf.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B3" })), range: () => "D!B2" };`);
+  return [...run("chartXml(lf).xml").matchAll(/<c:dLbls><c:numFmt formatCode="([^"]*)"/g)].map((m) => m[1].replace(/&quot;/g, '"'));
+}
+
+test("data labels: full numbers below 10,000, K from there, as Power BI's Auto units", () => {
+  // a line reaching 2,128: 1,037 / 701 / 73 in full (not 1K / 0K)
+  const line = labelFormats("lineChart", [["Month", "Part-Time", "Full-Time"], ["Jan", "701", "73"], ["Feb", "1037", "77"], ["Sep", "2128", "84"]]);
+  assert.ok(line.length && line.every((f) => !/,"K"/.test(f)), `full numbers: ${line}`);
+  // stacks reaching about 13,000: K (6.8K), though each part is under 10,000
+  const stacked = labelFormats("columnChart", [["AgeGroup", "Gender", "New Hires"], ["<30", "Male", "6400"], ["<30", "Female", "6800"], ["30-49", "Male", "2200"], ["30-49", "Female", "1300"]]);
+  assert.ok(stacked.length && stacked.every((f) => /,"K"/.test(f)), `thousands: ${stacked}`);
+  // a chart reaching millions keeps M
+  const big = labelFormats("clusteredColumnChart", [["Product", "Revenue"], ["A", "$5700000"], ["B", "$300000"]]);
+  assert.ok(big.every((f) => /,,"M"/.test(f)), `millions: ${big}`);
+});
+
+test("labels past the bar's end get room: the axis runs on to a whole step until they fit", () => {
+  ctx.T = { type: "clusteredBarChart", title: "t", rows: [["AgeGroup", "BadHire%ofActives"], ["<30", "30.90%"], ["30-49", "11.37%"], ["50+", "5.39%"]] };
+  ctx.P = PALETTE;
+  run(`T.colors = columnColors(T, P, null); T.themePalette = P; var ax = chartPlan(T); var axl = chartLook({ type: T.type }, null); axl.labels.show = true;
+    Object.assign(ax, { look: axl, sizePx: { w: 420, h: 360 }, title: "t", showTitle: true });
+    ax.refs = { catRef: "D!A1:A2", series: ax.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B3" })), range: () => "D!B2" };`);
+  const max = Number((run("chartXml(ax).xml").match(/<c:valAx>[\s\S]*?<c:max val="([^"]+)"/) || [])[1]);
+  assert.strictEqual(max, 0.4, "30.90% fits before the axis ends at 40%");
+  // the report sets the axis's end: kept
+  run(`axl.val.end = 0.35; ax.look = axl;`);
+  assert.strictEqual(Number((run("chartXml(ax).xml").match(/<c:valAx>[\s\S]*?<c:max val="([^"]+)"/) || [])[1]), 0.35);
+});
+
 test("ribbon charts stay tables", () => {
   assert.strictEqual(run(`chartSpecOf("ribbonChart")`), null);
   assert.ok(run(`chartSpecOf("columnChart")`));

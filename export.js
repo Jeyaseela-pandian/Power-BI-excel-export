@@ -1131,7 +1131,7 @@ function reportValueFormat(item, info, value, fmt) {
   if (typeof value !== "number") return null;
   const set = (info && info.valueUnits) || (VALUE_UNIT_SETTINGS[item.type] ? { units: 0, precision: null } : null);
   if (!set) return null;
-  const f = labelNumFmt(fmt || "#,##0", [value], set, 2);
+  const f = labelNumFmt(fmt || "#,##0", [value], set, 2, autoUnit);   // cards shorten from 1,000
   return f && f !== (fmt || "#,##0") ? f : null;
 }
 
@@ -2508,7 +2508,13 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
     }
     return hex ? toArgb(hex) : null;
   };
-  const tinted = (font, i) => (valueColor(i) ? { ...font, color: { argb: valueColor(i) } } : font);
+  // "Chart background: As in the report": the tile in the card's own background, its text
+  // readable on it; otherwise the tile's usual light fill
+  const frame = lay.reportBackground && info && info.look && info.look.frame;
+  const ownBg = frame && frame.background && (frame.transparency || 0) < 100 ? toArgb(frame.background) : null;
+  const tileFill = ownBg ? solidFill(ownBg) : SURFACE_FILL;
+  const onTile = (font) => (ownBg && luminance(ownBg) < 0.5 ? { ...font, color: { argb: C.WHITE } } : font);
+  const tinted = (font, i) => (valueColor(i) ? { ...onTile(font), color: { argb: valueColor(i) } } : onTile(font));
   // The cap takes the card's own colour from the report (its accent bar, else its value
   // colour), so the tile reads as one unit; otherwise the brand accent
   const fieldValues = (name) => {
@@ -2538,8 +2544,9 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
   ws.mergeCellsWithoutStyle(top, col, top, col + 1);
   const label = ws.getCell(top, col);
   label.value = labelText;
-  label.font = fonts.kpiLabel;
-  label.alignment = { horizontal: "left", vertical: "bottom", indent: 1 };
+  label.font = onTile(fonts.kpiLabel);
+  // Shrunk to fit when Excel draws it wider than measured, so a long label is never cut off
+  label.alignment = { horizontal: "left", vertical: "bottom", indent: 1, shrinkToFit: true };
 
   const hero = cells[0];
   const report = lay.reportNumbers && reportValueFormat(item, info, hero.value, fmtOf(0));
@@ -2559,14 +2566,14 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
     const e = ws.getCell(next, col);
     e.value = hero.value;
     e.numFmt = heroFmt || "#,##0.00";
-    e.font = fonts.kpiExact;
+    e.font = onTile(fonts.kpiExact);
     e.alignment = { horizontal: "left", vertical: "top", indent: 1 };
     next++;
   }
   for (let i = 1; i < header.length; i++, next++) {
     const l = ws.getCell(next, col);
     l.value = header[i];
-    l.font = fonts.kpiSubLabel;
+    l.font = onTile(fonts.kpiSubLabel);
     l.alignment = { vertical: "middle", indent: 1 };
     const sv = ws.getCell(next, col + 1);
     // An empty value reads "(Blank)", as on the card in Power BI
@@ -2583,7 +2590,7 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
   for (let rr = top; rr <= last; rr++) {
     for (let cc = col; cc <= col + 1; cc++) {
       const cell = ws.getCell(rr, cc);
-      cell.fill = SURFACE_FILL;
+      cell.fill = tileFill;
       const b = {};
       if (rr === top) b.top = { style: "medium", color: { argb: cap } };
       if (rr === last) b.bottom = LIGHT_RULE;
@@ -2597,7 +2604,7 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
   widths.want(col, 12);
   widths.want(col + 1, 10);
   widths.span(col, col + 1, Math.max(24,
-    cellUnits(labelText, fonts.kpiLabel, 1),
+    cellUnits(labelText, fonts.kpiLabel, 1) * 1.1,
     cellUnits(heroText, v.font, 1),
     compact ? cellUnits(displayText(hero.value, heroFmt || "#,##0.00"), fonts.kpiExact, 1) : 0));
 }
@@ -3427,6 +3434,7 @@ function alignNoteRows(plan, maxExtend) {
 function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
   const stacked = options.layout === "stacked";
   lay.reportNumbers = options.tableNumbers === "report";   // cards in the report's display units
+  lay.reportBackground = options.chartBackground === "report";   // cards on their own background
   const threshold = options.collapse ? options.visibleRows : Infinity;
   const maxExtend = Math.max(12, options.visibleRows);
   const tables = [];
@@ -5097,7 +5105,7 @@ function pieLabelPoints(plan, look) {
   const total = values.reduce((a, b) => a + b, 0) || 1;
   const L = look.labels;
   const style = String(L.style || "Data value, percent of total").toLowerCase();
-  const unit = L.units > 0 ? L.units : autoUnit(maxAbsOf(values));
+  const unit = L.units > 0 ? L.units : labelAutoUnit(maxAbsOf(values));
   const dec = L.precision !== null && L.precision !== undefined ? L.precision : null;
   const pctDec = L.percentPrecision !== null && L.percentPrecision !== undefined ? L.percentPrecision : 2;
   const pctText = (v) => (v / total * 100).toLocaleString("en-US", { minimumFractionDigits: L.percentPrecision !== null && L.percentPrecision !== undefined ? pctDec : 0, maximumFractionDigits: pctDec }) + "%";
@@ -5402,6 +5410,11 @@ function unitFormat(f, unit, dec) {
 function autoUnit(maxAbs) {
   return maxAbs >= 1e12 ? 1e12 : maxAbs >= 1e9 ? 1e9 : maxAbs >= 1e6 ? 1e6 : maxAbs >= 1e3 ? 1e3 : 1;
 }
+/* Display units "Auto" for data labels: Power BI shows thousands in full below 10,000 (1,037 on a
+   line reaching 2,128) and in K from there (6.8K on stacks reaching 13K) */
+function labelAutoUnit(maxAbs) {
+  return maxAbs >= 1e4 ? autoUnit(maxAbs) : 1;
+}
 function maxAbsOf(values) {
   let m = 0;
   for (const v of values) if (typeof v === "number" && isFinite(v)) m = Math.max(m, Math.abs(v));
@@ -5410,11 +5423,11 @@ function maxAbsOf(values) {
 /* A data label's number format. Display units "Auto" pick one unit for the whole visual from
    its largest value; with them Power BI keeps the measure's decimals, at least minDecimals
    (bar, line and area labels show one: $7.1K, $0.4K) */
-function labelNumFmt(fmt, values, cfg, minDecimals = 0) {
+function labelNumFmt(fmt, values, cfg, minDecimals = 0, auto = labelAutoUnit) {
   const s = String(fmt || "General");
   const precision = cfg && cfg.precision !== null && cfg.precision !== undefined ? cfg.precision : null;
   if (s.includes("%")) return precision !== null ? unitFormat(s, 1, precision) : s;
-  const unit = cfg && cfg.units > 0 ? cfg.units : autoUnit(maxAbsOf(values));
+  const unit = cfg && cfg.units > 0 ? cfg.units : auto(maxAbsOf(values));
   if (unit <= 1 && precision === null) return s;
   return unitFormat(s, unit, precision !== null ? precision : unit > 1 ? Math.max(minDecimals, fmtDecimals(s)) : null);
 }
@@ -5889,8 +5902,30 @@ function cartesianXml(plan, look, box, hidden) {
       : valueScale([...mainVals, ...refConst], axisPx, gapPx, { zero: isBar, round: roomForLabels, start: look.val.start, end: look.val.end });
   if (spec.mirror && axis) { axis.max = Math.max(axis.max, -axis.min); axis.min = -axis.max; }
   const fmt0 = (main[0] ? main[0][0] : series[0]).fmt;
+  // Labels past the bar's end need room before the axis ends: as Power BI, the axis runs on a
+  // step at a time until the largest label fits (not when the report sets the axis's end)
+  const outside = roomForLabels && !pct && !spec.mirror && !/inside|center|base/i.test(String(look.labels.position || ""));
+  if (outside && axis && axis.step > 0 && (look.val.end === null || look.val.end === undefined)) {
+    const tops = stacked
+      ? plan.categories.map((_, ci) => shown.reduce((a, s) => a + (typeof s.values[ci] === "number" ? s.values[ci] : 0), 0))
+      : mainVals.filter((v) => typeof v === "number");
+    const top = Math.max(0, ...tops);
+    if (top > 0) {
+      const L = stacked && look.totals.show ? look.totals : look.labels;
+      const unit = L.units > 0 ? L.units : labelAutoUnit(maxAbsOf(tops));
+      const text = displayValue(top, fmt0, unit, L.precision ?? null);
+      const labelPx = horizontal ? textPx(text, L.text) + 10 : lineHeightPx(L.text) + 6;
+      const fits = () => ((top - axis.min) / (axis.max - axis.min)) * axisPx + labelPx <= axisPx;
+      // first to the next whole step (the axis ends on a gridline), then a step more at a time
+      if (!fits()) axis.max = Number((Math.ceil(axis.max / axis.step - 1e-9) * axis.step).toFixed(12));
+      for (let i = 0; i < 10 && !fits(); i++) axis.max = Number((axis.max + axis.step).toFixed(12));
+    }
+  }
   const valFmt = pct ? stepFormat("0%", axis, []) : spec.mirror ? unsignedNumFmt(axisNumFmt(fmt0, axis, look.val, mainVals)) : axisNumFmt(fmt0, axis, look.val, mainVals);
-  const labelVals = shown.flatMap((s) => s.values);
+  // Labels take their units from the chart's size: a stacked chart's stack totals, else its values
+  const labelVals = stacked
+    ? plan.categories.map((_, ci) => shown.reduce((a, s) => a + (typeof s.values[ci] === "number" ? Math.abs(s.values[ci]) : 0), 0))
+    : shown.flatMap((s) => s.values);
   const lineLookOf = (s) => look.lines.series[normalizeField(s.name)] || look.lines;
   const trendOn = !!look.trend && !pct && !stacked && (kind === "line" || (isBar && grouping === "clustered"));
   const combineTrend = trendOn && look.trend.combine && shown.length > 1;
@@ -5911,7 +5946,7 @@ function cartesianXml(plan, look, box, hidden) {
     // Total labels over each stack: an empty last segment labelled with the stack's total
     if (stacked && look.totals.show && !spec.hideValueAxis) {
       const totals = plan.categories.map((_, ci) => shown.reduce((a, s) => a + (typeof s.values[ci] === "number" ? s.values[ci] : 0), 0));
-      const unit = look.totals.units > 0 ? look.totals.units : autoUnit(maxAbsOf(totals));
+      const unit = look.totals.units > 0 ? look.totals.units : labelAutoUnit(maxAbsOf(totals));
       const dec = look.totals.precision !== null && look.totals.precision !== undefined ? look.totals.precision : null;
       const pts = totals.map((v, idx) => ({ idx, text: displayValue(v, fmt0, unit, dec), pos: "inBase" }));
       const idx = nextIdx++;

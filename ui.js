@@ -22,7 +22,7 @@ const DEFAULT_OPTIONS = {
   chartBackground: "white", // "white" (readable text on white) | "report" (each visual's own background)
   exhibitNumbers: false,   // "01  Title" numbering of visuals
   visualsAs: "tables",     // "tables" (data tables, as before) | "charts" (real Excel charts)
-  tableNumbers: "exact",   // "exact" (2,471,203) | "short" (2.47M; the cells keep exact values)
+  tableNumbers: "report",  // numbers as the report shows them (the cells keep exact values)
   matrixLayout: "flat",    // "flat" (one row per combination) | "grid" (Power BI's stepped layout)
   excelSlicers: false,     // the page's slicer fields as Excel slicers on the tables
 };
@@ -60,6 +60,7 @@ function saveJson(key, value) {
 
 let exportOptions = loadJson(OPTIONS_KEY, DEFAULT_OPTIONS);
 exportOptions.matrixLayout = "flat";   // matrices always export as normal tables (the option was removed)
+exportOptions.tableNumbers = "report";   // numbers always as in the report (the option was removed)
 exportOptions.excelSlicers = false;    // Excel slicers: option removed (tables have their own filter buttons)
 // Saved settings without a version are v1: the defaults' v2 must not hide them from migrateBranding
 let branding = migrateBranding(loadJson(BRANDING_KEY, { ...DEFAULT_BRANDING, v: 1 }));
@@ -159,7 +160,6 @@ async function openOptionsDrawer() {
   document.querySelectorAll('input[name="optPages"]').forEach((r) => { r.checked = r.value === exportOptions.pages; });
   document.querySelectorAll('input[name="optLayout"]').forEach((r) => { r.checked = r.value === exportOptions.layout; });
     document.querySelectorAll('input[name="optVisualsAs"]').forEach((r) => { r.checked = r.value === (exportOptions.visualsAs || "tables"); });
-  document.querySelectorAll('input[name="optTableNumbers"]').forEach((r) => { r.checked = r.value === (exportOptions.tableNumbers || "exact"); });
   document.querySelectorAll('input[name="optChartBackground"]').forEach((r) => { r.checked = r.value === (exportOptions.chartBackground || "white"); });
   $("optCollapse").checked = exportOptions.collapse;
   $("optVisibleRows").value = exportOptions.visibleRows;
@@ -281,7 +281,7 @@ function readDrawerOptions() {
     chartBackground: document.querySelector('input[name="optChartBackground"]:checked')?.value || "white",
     exhibitNumbers: $("optExhibitNumbers").checked,
     visualsAs: document.querySelector('input[name="optVisualsAs"]:checked')?.value || "tables",
-    tableNumbers: document.querySelector('input[name="optTableNumbers"]:checked')?.value || "exact",
+    tableNumbers: "report",   // option removed: numbers as in the report
     matrixLayout: "flat",  
   };
   saveJson(OPTIONS_KEY, exportOptions);
