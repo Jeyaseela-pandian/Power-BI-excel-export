@@ -648,11 +648,13 @@ async function websiteTheme(themeCollection, embedTheme) {
   return namedThemeFallback(themeCollection, embedTheme);
 }
 
-/* Power BI's base themes (CY24SU02, CY26SU05 …) turn every visual's axis titles on. Their
-   JSON is only in the report file, so when it can't be read the export applies that setting
-   by the base theme's name, under every other layer (an unknown base theme adds none) */
+/* Power BI's base themes (CY24SU02, CY26SU05 …) turn every visual's axis titles on; its Fluent2
+   ones (Fluent2-CY26SU08 …) turn subtitles on instead. Their JSON is only in the report file, so
+   when it can't be read the export applies that setting by the base theme's name, under every
+   other layer (an unknown base theme adds none) */
 function baseThemeAxisStyles(themeCollection) {
   const name = String(((themeCollection || {}).baseTheme || {}).name || "");
+  if (/^Fluent2-/i.test(name)) return { "*": { "*": { subTitle: [{ show: true }] } } };
   if (!/^CY\d{2}SU\d{2}/i.test(name)) return null;
   return { "*": { "*": { categoryAxis: [{ showAxisTitle: true }], valueAxis: [{ showAxisTitle: true }] } } };
 }
@@ -865,7 +867,8 @@ function chartLook(visual, theme) {
     ...text("title", { ...titleClass, colorProp: "fontColor" }), align: String(get("title", "alignment") || "left").toLowerCase(),
     background: get("title", "background") || null };
   const subText = get("subTitle", "text");
-  const subtitle = shown("subTitle", false) && subText ? { text: String(subText), ...text("subTitle", { size: 10, face: labelFace, color: LABEL_GREY, colorProp: "fontColor" }) } : null;
+  // shown without text of its own: Power BI's automatic subtitle ("by Mth and Year"), text: null
+  const subtitle = shown("subTitle", false) ? { text: subText ? String(subText) : null, ...text("subTitle", { size: 10, face: labelFace, color: LABEL_GREY, colorProp: "fontColor" }) } : null;
   const bgShow = shown("background", true);
   const frame = {
     background: bgShow ? get("background", "color") || (theme && theme.background) || "#FFFFFF" : null,

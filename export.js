@@ -1125,13 +1125,13 @@ function cellUnits(text, font, indent = 0) {
 
 /* The text a compact KPI format (2.52M) shows */
 /* "Numbers: As in the report": a card's value in the report's display units (Auto: as Power BI
-   picks them) and decimals (two when shortened, as Power BI's cards show 3.94M); null when it
-   shows as exported */
+   picks them) and decimals (Auto: none from ten of the unit, one below: 18K, $110M, 3.9M); null
+   when it shows as exported */
 function reportValueFormat(item, info, value, fmt) {
   if (typeof value !== "number") return null;
   const set = (info && info.valueUnits) || (VALUE_UNIT_SETTINGS[item.type] ? { units: 0, precision: null } : null);
   if (!set) return null;
-  const f = labelNumFmt(fmt || "#,##0", [value], set, 2, autoUnit);   // cards shorten from 1,000
+  const f = labelNumFmt(fmt || "#,##0", [value], set, 0, autoUnit);   // cards shorten from 1,000, Auto decimals as labels
   return f && f !== (fmt || "#,##0") ? f : null;
 }
 
@@ -2642,6 +2642,8 @@ function axisLabel(text) {
 /* Caption runs: a legend of the chart's colours, or "Table · 24 rows" */
 function captionRuns(item, colors, header, fonts, units) {
   if (item.captionText) return [[item.captionText, fonts.caption]];   // an exhibit's own note (key influencers)
+  // the visual's own subtitle first, as Power BI shows it under the title
+  if (item.subtitle) return [[item.subtitle + "  ·  ", fonts.caption], ...captionRuns({ ...item, subtitle: null }, colors, header, fonts, units)];
   const n = item.rows.length - 1;
   const plain = [[`${friendlyType(item.type)}  ·  ${n} row${n === 1 ? "" : "s"}`, fonts.caption]];
   if (!colors) return plain;
@@ -3493,6 +3495,9 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
       if (usedTitles[key] > 1) title = `${title} (${usedTitles[key]})`;
     }
     item.displayTitle = title;
+    // a table's subtitle of its own ("by profitability"), shown under its title
+    const ownSub = info && info.look && info.look.subtitle && info.look.subtitle.text;
+    if (ownSub && !item.isKpi && !hidden) item.subtitle = ownSub;
     // A trend visual's colours are on its cards; its table stays plain
     item.colors = lay.palette && !item.isKpi && !item.trend && !item.captionText ? columnColors(item, lay.palette, info) : null;
     item.tableFormat = item.gridFormat || (info && info.tableFormats && info.tableFormats.length ? info : null);
@@ -3510,6 +3515,17 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
         if (end > 0) look = { ...look, val: { ...look.val, start: look.val.start ?? 0, end } };
       }
       if (chartTitle) item.chart.title = chartTitle;
+      // A subtitle shown without its own text is Power BI's automatic one: the automatic title
+      // splits into "Orders" and "by Mth and Year"; with a title of the author's, no subtitle
+      if (look.subtitle && look.subtitle.text == null) {
+        const at = automatic && chartTitle ? chartTitle.indexOf(" by ") : -1;
+        if (at > 0) {
+          item.chart.title = chartTitle.slice(0, at);
+          look = { ...look, subtitle: { ...look.subtitle, text: chartTitle.slice(at + 1) } };
+        } else {
+          look = { ...look, subtitle: null };
+        }
+      }
       Object.assign(item.chart, { look, sizePx: item.chart.sizePx || chartSizePx(item), showTitle: !(info && info.titleHidden) && look.title.show !== false });
       item.chart = withDateAxis(withNumberAxis(withNumberOrder(item.chart)));
       // A chart Excel's part can't be written for stays a table, so the rest of the file is still made

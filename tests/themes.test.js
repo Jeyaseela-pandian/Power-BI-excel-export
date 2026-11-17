@@ -28,6 +28,38 @@ test("a chart that turns its title off keeps it off", () => {
   assert.deepStrictEqual(titles({ baseTheme: { name: "CY26SU05" } }, OFF), [false, true]);
 });
 
+test("Fluent2 base themes turn subtitles on (and axis titles off); CY themes the other way round", () => {
+  const look = (name) => json(`(() => { const tc = ${JSON.stringify(name ? { baseTheme: { name } } : null)};
+    const t = withBaseThemeAxes(namedThemeFallback(tc, null), tc);
+    const l = chartLook({ type: "lineChart", objects: {}, container: {} }, t); const a = axisSettings({}, "lineChart", t);
+    return [!!l.subtitle, a.cat.title]; })()`);
+  assert.deepStrictEqual(look("Fluent2-CY26SU08"), [true, false]);
+  assert.deepStrictEqual(look("CY26SU05"), [false, true]);
+  assert.deepStrictEqual(look(null), [false, false]);
+});
+
+test("with subtitles on, an automatic chart title splits as Power BI shows it: 'Orders' / 'by Mth and Year'", () => {
+  const titles = (subtitleOn, title) => json(`(() => {
+    const ws = { getCell: () => ({ font: {}, alignment: {}, border: {} }), getRow: () => ({ getCell: () => ({}) }), getColumn: () => ({ width: 10, letter: "A" }),
+      mergeCells() {}, mergeCellsWithoutStyle() {}, addTable() {}, addConditionalFormatting() {}, addImage() {}, properties: {}, views: [], pageSetup: {}, headerFooter: {} };
+    const look = chartLook({ type: "lineChart", objects: {}, container: {} }, ${subtitleOn ? `{ ...FALLBACK_THEME, visualStyles: [{ "*": { "*": { subTitle: [{ show: true }] } } }] }` : "null"});
+    const info = { rule: "measure", category: { ref: "month", label: "month" }, categories: [{ ref: "month", label: "month" }],
+      measures: [{ ref: "orders", label: "orders", role: "Y" }], overrides: {}, rules: [], tooltips: [], look,
+      roles: { Category: [{ ref: "month", label: "month", field: { kind: "column", entity: "Date", prop: "Month" } }], Y: [{ ref: "orders", label: "orders", field: { kind: "measure", entity: "Sales", prop: "Orders" } }] } };
+    const items = [{ type: "lineChart", title: ${JSON.stringify(title)}, name: "l1", page: "p", layout: { x: 0, y: 0, width: 500, height: 250 },
+      rows: [["Month", "Orders"], ["Jan", "2100"], ["Feb", "2000"]] }];
+    const lay = { fonts: makeFonts(), accent: { tab: "FF000000", cap: "FF000000" }, sheetName: "P", palette: ["#118DFF"], slicerFields: [], tableStyle: "TableStyleMedium2",
+      reportColors: { palette: ["#118DFF"], theme: FALLBACK_THEME, visuals: { ["p" + String.fromCharCode(1) + "l1"]: info }, byName: {} } };
+    visualInfo = () => info;
+    writePageLayout(ws, items, 10, makeWidthTracker(), { visualsAs: "charts", layout: "report", collapse: true, visibleRows: 15, chartBackground: "white", tableNumbers: "report" }, lay, (t) => t);
+    const p = lay.charts[0].plan;
+    return [p.title, p.look.subtitle && p.look.subtitle.text];
+  })()`);
+  assert.deepStrictEqual(titles(true, "lineChart (l1)"), ["Orders", "by Month"]);
+  assert.deepStrictEqual(titles(false, "lineChart (l1)"), ["Orders by Month", null], "subtitles off: one line, as before");
+  assert.deepStrictEqual(titles(true, "Monthly orders"), ["Monthly orders", null], "the author's own title: unchanged, no subtitle");
+});
+
 /* The website layout (Viewers' route) with Power BI answering as given */
 async function websiteAxes(config, explorationContent) {
   const app = loadApp();
