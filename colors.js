@@ -916,6 +916,7 @@ function chartLook(visual, theme) {
     const markers = settingFlag(g("showMarker"), false);
     const kind = String(g("lineChartType") || "").toLowerCase();
     return { width: settingNumber(g("strokeWidth"), 3), style: String(g("lineStyle") || "solid").toLowerCase(),
+      show: settingFlag(g("strokeShow"), true),   // "Show line" off: the markers alone
       markers: markers ? { shape: String(g("markerShape") || "circle"), size: settingNumber(g("markerSize"), 5), color: g("markerColor") || null } : null,
       smooth: kind === "smooth" };
   };

@@ -2335,6 +2335,17 @@ function smallMultipleItems(item, info) {
 }
 
 function splitCards(item, info) {
+  // A multi-row card with one row shows each field side by side, its value over its name: a
+  // tile per field, across the visual's place (a card with several rows stays a table)
+  if (item.type === "multiRowCard" && item.isKpi && item.rows.length === 2 && item.rows[0].length >= 2) {
+    const [header, values] = item.rows;
+    const { x, y, width, height } = item.layout || { x: 0, y: 0, width: 0, height: 0 };
+    return header.map((h, k) => ({
+      ...item, title: k === 0 ? item.title : "",
+      rows: [[h], [values[k]]],
+      layout: { ...item.layout, x: x + (width / header.length) * k, y, width: width / header.length, height },
+    }));
+  }
   if (item.type !== "cardVisual" || item.rows.length !== 2 || item.rows[0].length < 2) return [item];
   const [header, values] = item.rows;
   const data = (info && info.roles && info.roles.Data) || [];
@@ -5560,7 +5571,10 @@ function chartSeriesXml(kind, s, i, plan, ref) {
   const trend = s.trendXml || "";
   if (kind === "line") {
     const ls = s.lineLook || (look && look.lines) || DEFAULT_LINE_LOOK;
-    const sp = s.hidden ? NO_BOX : s.color ? `<c:spPr>${lineA({ color: s.color, width: ls.width, style: ls.style })}</c:spPr>` : "";
+    // the report's "Show line" off: the markers alone (when it has some)
+    const lineOff = ls.show === false && ls.markers;
+    const sp = s.hidden ? NO_BOX : lineOff ? `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr>`
+      : s.color ? `<c:spPr>${lineA({ color: s.color, width: ls.width, style: ls.style })}</c:spPr>` : "";
     const m = ls.markers && !s.hidden
       ? `<c:marker><c:symbol val="${MARKER_SYMBOLS[String(ls.markers.shape).toLowerCase()] || "circle"}"/><c:size val="${Math.max(2, Math.min(72, Math.round(ls.markers.size * 0.9)))}"/>` +
         `<c:spPr>${fillA(ls.markers.color || s.color)}${lineA({ color: ls.markers.color || s.color, width: 1 })}</c:spPr></c:marker>`
@@ -6096,7 +6110,7 @@ function treemapXml(plan, n) {
     `<cx:chart>${title}<cx:plotArea><cx:plotAreaRegion><cx:series layoutId="${layout}" uniqueId="${id}">` +
     `<cx:tx><cx:txData><cx:f>${xmlEsc(r.series[0].nameRef)}</cx:f><cx:v>${xmlEsc(s.name)}</cx:v></cx:txData></cx:tx>${points}${labels}` +
     `<cx:dataId val="0"/>${layout === "treemap" ? `<cx:layoutPr><cx:parentLabelLayout val="overlapping"/></cx:layoutPr>` : ""}</cx:series></cx:plotAreaRegion></cx:plotArea>` +
-    `</cx:chart></cx:chartSpace>`;   // no legend: the tiles name their groups, as in Power BI
+    `</cx:chart>${chartExFrame(look, "")}</cx:chartSpace>`;   // no legend: the tiles name their groups, as in Power BI
 }
 
 /* A chartEx chart's frame (a treemap, a sunburst): Excel 2016 and later show the chart, older Excel a note */
@@ -6237,6 +6251,12 @@ function chartExValueAxis(id, axis, fmt, look, title, show) {
 }
 const CHARTEX_SPACE = `<cx:chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:cx="${CHARTEX_NS}">`;
 const CHARTEX_FRAME = `<cx:spPr>${fillXml(C.WHITE)}<a:ln w="9525">${fillXml(C.HAIR)}</a:ln></cx:spPr>`;
+/* A chartEx chart's frame in its visual's background ("Chart background: As in the report");
+   white, as before, when the background is white or none ("" for a chart Excel frames itself) */
+function chartExFrame(look, plain = CHARTEX_FRAME) {
+  const bg = look && look.frame && look.frame.background ? toArgb(look.frame.background, C.WHITE) : C.WHITE;
+  return bg === C.WHITE ? plain : `<cx:spPr>${fillXml(bg)}<a:ln w="9525">${fillXml(C.HAIR)}</a:ln></cx:spPr>`;
+}
 /* A chartEx part's colours: its own, in order (a waterfall's increase, decrease and total) */
 function chartExColorsXml(colors) {
   return `<cs:colorStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" meth="cycle" id="10">` +
@@ -6279,7 +6299,7 @@ function waterfallChartExXml(plan) {
     `<cx:axis id="0"${titles.catShow ? "" : ' hidden="1"'}><cx:catScaling gapWidth="0.6"/>${chartExAxisTitle(titles.cat, look.cat.titleFont || look.cat.text)}<cx:tickLabels/>` +
     `<cx:spPr><a:ln><a:noFill/></a:ln></cx:spPr>${chartExTxPr(look.cat.text)}</cx:axis>` +
     chartExValueAxis(1, plan.showLabels ? null : plan.axis, axisNumFmt(plan.fmt, plan.axis, look.val), look, titles.val, titles.valShow) +
-    `</cx:plotArea>${legend}</cx:chart>${CHARTEX_FRAME}</cx:chartSpace>`;
+    `</cx:plotArea>${legend}</cx:chart>${chartExFrame(look)}</cx:chartSpace>`;
 }
 
 /* Excel's own box & whisker chart: a box per category, with its mean marker and outliers */
@@ -6312,7 +6332,7 @@ function boxWhiskerXml(plan) {
     `${plan.perGroup ? "" : chartExAxisTitle(titles.cat, look.cat.titleFont || look.cat.text)}<cx:tickLabels/>` +
     `<cx:spPr><a:ln><a:noFill/></a:ln></cx:spPr>${chartExTxPr(look.cat.text)}</cx:axis>` +
     chartExValueAxis(1, axis, axisNumFmt(fmt, axis, look.val, vals), look, titles.val, titles.valShow) +
-    `</cx:plotArea>${legend}</cx:chart>${CHARTEX_FRAME}</cx:chartSpace>`;
+    `</cx:plotArea>${legend}</cx:chart>${chartExFrame(look)}</cx:chartSpace>`;
 }
 
 /* A chart's alt text, for screen readers and Excel's Alt Text pane: what it shows, and its

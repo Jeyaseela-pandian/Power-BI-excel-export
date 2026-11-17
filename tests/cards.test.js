@@ -30,6 +30,17 @@ test("cards keep their usual tile by default; with the report's background, the 
   assert.strictEqual(clear.fill, "FFF3F5F8", "a transparent card background: the usual tile");
 });
 
+test("a one-row multi-row card: a tile per field, side by side; with several rows it stays a table", () => {
+  const tiles = json(`splitCards({ type: "multiRowCard", isKpi: true, title: "Sales overview", name: "m", rows: [["Sum of Sales", "Target", "Region"], ["$3937628", "$4000000", "East"]],
+    layout: { x: 0, y: 0, width: 600, height: 120 } }, null).map((t) => [t.title, t.rows, t.layout.x, t.layout.width])`);
+  assert.deepStrictEqual(tiles, [
+    ["Sales overview", [["Sum of Sales"], ["$3937628"]], 0, 200],
+    ["", [["Target"], ["$4000000"]], 200, 200],
+    ["", [["Region"], ["East"]], 400, 200],
+  ]);
+  assert.strictEqual(json(`splitCards({ type: "multiRowCard", isKpi: false, rows: [["Region", "Sales"], ["East", "5"], ["West", "3"]] }, null).length`), 1);
+});
+
 test("a card's empty values show (Blank); values that exist are unchanged", () => {
   run(`cells = {}; ws = { getCell: (r, c) => (cells[r + "," + c] = cells[r + "," + c] || {}), mergeCellsWithoutStyle() {} };
     widths = { span() {}, want() {} }; lay = { fonts: new Proxy({}, { get: () => ({}) }), reportColors: null, accent: { cap: "FF000000" } };

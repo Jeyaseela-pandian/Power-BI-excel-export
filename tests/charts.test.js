@@ -259,6 +259,23 @@ test("whole numbers on a line or area axis are spaced by value, on round steps",
   assert.strictEqual(numberAxis("clusteredColumnChart", [["Period", "Actual"], ["1", "5"], ["3", "6"]]), "category");
 });
 
+test("a line the report shows as markers only ('Show line' off) has no line; others unchanged", () => {
+  const lineXml = (lines) => {
+    ctx.T = { type: "lineChart", title: "t", rows: [["Month", "Sales"], ["Jan", "5"], ["Feb", "6"]] };
+    ctx.P = PALETTE;
+    ctx.LINES = lines;
+    run(`T.colors = columnColors(T, P, null); T.themePalette = P; var ml = chartPlan(T); var mll = chartLook({ type: T.type }, null); mll.lines = { ...mll.lines, ...LINES, series: {} };
+      Object.assign(ml, { look: mll, sizePx: { w: 400, h: 300 }, title: "t", showTitle: true });
+      ml.refs = { catRef: "D!A1:A2", series: ml.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B3" })), range: () => "D!B2" };`);
+    return (run("chartXml(ml).xml").match(/<c:lineChart>[\s\S]*?<c:ser>([\s\S]*?)<\/c:ser>/) || [])[1] || "";
+  };
+  const markersOnly = lineXml({ show: false, markers: { shape: "circle", size: 5, color: null } });
+  assert.match(markersOnly, /<c:spPr><a:ln><a:noFill\/><\/a:ln><\/c:spPr><c:marker><c:symbol val="circle"\/>/);
+  const normal = lineXml({ show: true, markers: null, smooth: true });
+  assert.doesNotMatch(normal, /<a:ln><a:noFill\/><\/a:ln><\/c:spPr><c:marker>/);
+  assert.match(normal, /<c:smooth val="1"\/>/, "smooth lines as the report sets them");
+});
+
 test("ribbon charts stay tables", () => {
   assert.strictEqual(run(`chartSpecOf("ribbonChart")`), null);
   assert.ok(run(`chartSpecOf("columnChart")`));

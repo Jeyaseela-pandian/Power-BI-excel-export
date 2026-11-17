@@ -59,6 +59,25 @@ test("the theme the export falls back on: Power BI's current colours, classic on
   assert.deepStrictEqual(colors(`namedThemeFallback({}, null)`), ["#01B8AA", "#374649", "#FD625E", "#F2C80F"]);
 });
 
+test("treemaps and box & whisker charts take the report's background; white stays as before", () => {
+  const frameOf = (type, rows, dark) => {
+    ctx.T = { type, title: "t", rows };
+    ctx.P = ["#118DFF", "#12239E"];
+    run(`T.colors = columnColors(T, P, null); T.themePalette = P; var cx = chartPlan(T); var cl = chartLook({ type: T.type }, null);
+      ${dark ? 'cl.frame.background = "#252423";' : "cl = lookOnWhite(cl);"}
+      Object.assign(cx, { look: cl, sizePx: { w: 400, h: 300 }, title: "t", showTitle: true });
+      cx.refs = { catRef: "D!A1:A3", series: cx.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B4" })), range: () => "D!B2", levels: [] };`);
+    const xml = run("cx.spec.kind") === "boxWhisker" ? run("boxWhiskerXml(cx)") : run("treemapXml(cx, 1)");
+    return ((xml.match(/<\/cx:chart>(?:<cx:spPr><a:solidFill><a:srgbClr val="(\w+)")?/) || [])[1]) || "none";
+  };
+  const treemap = [["Cat", "V"], ["A", "5"], ["B", "3"]];
+  const box = [["Group", "Sample", "Value"], ["A", "1", "5"], ["A", "2", "7"], ["A", "3", "9"], ["B", "1", "2"], ["B", "2", "4"], ["B", "3", "8"]];
+  assert.strictEqual(frameOf("treemap", treemap, true), "252423");
+  assert.strictEqual(frameOf("treemap", treemap, false), "none", "white: Excel's own frame, as before");
+  assert.strictEqual(frameOf("BoxWhiskerChart1455240051538", box, true), "252423");
+  assert.strictEqual(frameOf("BoxWhiskerChart1455240051538", box, false), "FFFFFF");
+});
+
 test("chart background: the report's dark background, or white with readable text", () => {
   run(`LF = chartLook({ type: "funnel" }, null); LF.frame.background = "#252423"; LF.title.color = "#FFFFFF"; LF.cat.text.color = "#C8C6C4";
     FP = { funnel: true, title: "Sales, Cost and Profit", categories: ["Sales", "Cost", "Profit"],
