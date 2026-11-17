@@ -194,3 +194,17 @@ test("Power BI's KPI visual as a tile: its title over the value (its own, else t
   const card = tile({ type: "card", isKpi: true, displayTitle: "Sales", rows: [["Total Sales"], ["$100"]], page: "p", name: "c" });
   assert.deepStrictEqual(card, ["Sales", "TOTAL SALES"]);
 });
+
+test("a heading text box of two lines ('Opportunity Analysis Report' over 'Opportunity detail'): a row per line, each in its own type", () => {
+  const { ctx, json } = loadApp();
+  const objects = { general: [{ properties: { paragraphs: [{ textRuns: [{ value: "Opportunity Analysis Report", textStyle: { fontSize: "16pt" } }] },
+    { textRuns: [{ value: "Opportunity detail", textStyle: { fontSize: "12pt", color: "#666666" } }] }] } }] };
+  ctx.V = { ["p" + String.fromCharCode(1) + "t"]: { visualType: "textbox", position: { x: 48, y: 8, width: 456, height: 64 }, textBox: json(`textBoxText(${JSON.stringify(objects)})`) },
+    ["p" + String.fromCharCode(1) + "m"]: { visualType: "pivotTable", position: { x: 63, y: 87, width: 1155, height: 595 } } };
+  const rows = json("pageTitleBoxes({ visuals: V }, { name: 'p' }).map((b) => [b.text, b.size, b.color])");
+  assert.deepStrictEqual(rows, [["Opportunity Analysis Report", 16, null], ["Opportunity detail", 12, "#666666"]]);
+  // a paragraph of text over the page isn't a heading
+  ctx.V["p" + String.fromCharCode(1) + "t"].textBox = json(`textBoxText(${JSON.stringify({ general: [{ properties: { paragraphs: [{ textRuns: [{ value: "Opportunity Analysis Report", textStyle: { fontSize: "16pt" } }] },
+    { textRuns: [{ value: "This page shows every open opportunity by partner.", textStyle: { fontSize: "12pt" } }] }] } }] })})`);
+  assert.deepStrictEqual(json("pageTitleBoxes({ visuals: V }, { name: 'p' })"), []);
+});
