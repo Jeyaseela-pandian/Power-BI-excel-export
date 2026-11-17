@@ -2319,19 +2319,92 @@ function smallMultipleItems(item, info) {
   const rc = header.findIndex((h) => (f.label && String(h).trim().toLowerCase() === f.label) || normalizeField(h) === f.ref);
   if (rc < 0) return [item];
   const key = (r) => String(r[rc] ?? "").trim() || "(Blank)";
-  const values = [...new Set(data.map(key))];
-  if (values.length < 2 || values.length > SMALL_MULTIPLES_MAX) return [item];
+  const exported = [...new Set(data.map(key))];
+  if (exported.length < 2 || exported.length > SMALL_MULTIPLES_MAX) return [item];
   const drop = (r) => r.filter((_, ci) => ci !== rc);
+  // In the report's order: the panels by their field, the bars in every panel in one order
+  const { panelOrder, rowOrder } = smallMultipleOrder(item, info, header, data, rc);
+  const values = panelOrder(exported);
+  const panelRows = (v) => rowOrder(data.filter((r) => key(r) === v));
   // One value axis for all panels, as Power BI shares it (bars from zero, no negatives)
   const nums = data.flatMap((r) => drop(r).map((x) => toCellValue(String(x ?? "")).value)).filter((v) => typeof v === "number");
   const sharedMax = nums.length && nums.every((v) => v >= 0) ? Math.max(...nums) : null;
   const cols = Math.ceil(Math.sqrt(values.length));
   return [{
     ...item,
-    panels: values.map((v) => ({ value: v, rows: [drop(header), ...data.filter((r) => key(r) === v).map(drop)] })),
+    panels: values.map((v) => ({ value: v, rows: [drop(header), ...panelRows(v).map(drop)] })),
     panelGrid: { cols, rows: Math.ceil(values.length / cols) },
     sharedMax,
   }];
+}
+
+/*
+ * The order Power BI draws small multiples in. Panels: by their field, A to Z (numbers by
+ * value, months and dates in calendar order) unless the visual is sorted by that field the other
+ * way. Bars: one order shared by every panel (Power BI shares the axis), from the visual's sort
+ * as shown in the session, else as saved: by the axis field's values, or by a measure's total
+ * across all panels; with no sort, the rows keep the order Power BI exported them in.
+ */
+function smallMultipleOrder(item, info, header, data, rc) {
+  const live = item.liveDrill && item.liveDrill.orderBy ? sortOf(item.liveDrill.orderBy) : null;
+  const sort = live || info.sort || [];
+  const colOf = (f) => header.findIndex((h, ci) => ci !== rc && ((f.label && String(h).trim().toLowerCase() === f.label) || normalizeField(h) === f.ref));
+  const same = (a, b) => !!a && !!b && String(a.prop || "").toLowerCase() === String(b.prop || "").toLowerCase() &&
+    (!a.entity || !b.entity || String(a.entity).toLowerCase() === String(b.entity).toLowerCase());
+  const matches = (e, f) => same(e.field, f.field) || (!f.field && normalizeField(e.field.prop) === f.ref);
+  const panelSort = sort.find((e) => matches(e, info.roles.Rows[0]));
+  const panelOrder = (values) => naturalOrder(values, !!(panelSort && panelSort.desc));
+  const keep = { panelOrder, rowOrder: (rows) => rows };
+  // the axis: the first sort entry on one of its fields or on a measure shown
+  const catFields = (info.roles.Category || info.roles.Axis || []).filter((f) => colOf(f) >= 0);
+  const catCols = catFields.map(colOf);
+  if (!catCols.length || !sort.length) return keep;
+  const text = (r, c) => String(r[c] ?? "").trim();
+  const catKey = (r) => catCols.map((c) => text(r, c)).join("\u0001");
+  const measures = ["Y", "Values", "Value", "Y2"].flatMap((role) => info.roles[role] || []).filter((f) => colOf(f) >= 0);
+  let rank = null;
+  for (const e of sort) {
+    const onCat = catFields.findIndex((f) => matches(e, f));
+    if (onCat >= 0) {
+      const c = catCols[onCat];
+      const pos = new Map(naturalOrder([...new Set(data.map((r) => text(r, c)))], e.desc).map((v, i) => [v, i]));
+      rank = (r) => pos.get(text(r, c)) ?? 1e9;
+      break;
+    }
+    const m = measures.find((f) => matches(e, f));
+    if (m) {
+      const mc = colOf(m), totals = new Map();
+      for (const r of data) {
+        const v = toCellValue(text(r, mc)).value;
+        totals.set(catKey(r), (totals.get(catKey(r)) || 0) + (typeof v === "number" ? v : 0));
+      }
+      const order = [...totals.keys()].map((k, i) => [k, i])
+        .sort((a, b) => (e.desc ? totals.get(b[0]) - totals.get(a[0]) : totals.get(a[0]) - totals.get(b[0])) || a[1] - b[1]).map(([k]) => k);
+      const pos = new Map(order.map((k, i) => [k, i]));
+      rank = (r) => pos.get(catKey(r)) ?? 1e9;
+      break;
+    }
+  }
+  if (!rank) return keep;
+  if (typeof log === "function") {
+    log(`"${item.title}": small multiples sorted as ${live ? "shown in the report now" : "saved in the report"}: ` +
+      sort.map((e) => `${e.field.prop} ${e.desc ? "descending" : "ascending"}`).join(", "));
+  }
+  return { panelOrder, rowOrder: (rows) => rows.map((r, i) => [r, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(([r]) => r) };
+}
+
+/* Values in Power BI's natural order: numbers by value, months and dates in calendar order, text A to Z */
+function naturalOrder(values, desc = false) {
+  const t = values.map((v) => String(v ?? "").trim());
+  const num = (v) => Number(v.replace(/[,$%]/g, ""));
+  const month = (v) => MONTHS.indexOf(v.slice(0, 3).toLowerCase());
+  const cmp = t.every((v) => v !== "" && isFinite(num(v))) ? (a, b) => num(a) - num(b)
+    : t.every((v) => /^[a-z]+$/i.test(v) && month(v) >= 0) ? (a, b) => month(a) - month(b)
+      : t.every((v) => parseDate(v)) ? (a, b) => parseDate(a).date - parseDate(b).date
+        : (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+  const order = values.map((_, i) => i).sort((a, b) => cmp(t[a], t[b]) || a - b);
+  if (desc) order.reverse();
+  return order.map((i) => values[i]);
 }
 
 function splitCards(item, info) {
@@ -4641,7 +4714,10 @@ function panelPlans(item, info, look, palette) {
     part.colors = palette ? columnColors(part, palette, info) : null;
     let plan = chartPlan(part);
     if (!plan) return null;
-    Object.assign(plan, { title: pn.value, look: panelLook, sizePx: { w, h }, showTitle: true });
+    // Power BI draws the panels' axes once, on the grid's outer edge: the bottom row, the left column
+    const k = plans.length, count = item.panels.length;
+    Object.assign(plan, { title: pn.value, look: panelLook, sizePx: { w, h }, showTitle: true,
+      panelEdges: { bottom: k + cols >= count, left: k % cols === 0 }, panelTop: item.sharedMax ?? null });
     plan = withDateAxis(withNumberAxis(withNumberOrder(plan)));
     if (chartBuildError(plan)) return null;
     plans.push(plan);
@@ -5499,8 +5575,8 @@ function runPrA(t, tag = "a:defRPr") {
   return `<${tag}${tag === "a:rPr" ? ' lang="en-US"' : ""} sz="${Math.round(x.size * 100)}" b="${x.bold ? 1 : 0}" i="${x.italic ? 1 : 0}">` +
     `${fillA(x.color)}<a:latin typeface="${face}"/><a:cs typeface="${face}"/></${tag}>`;
 }
-function txPrA(t, rot) {
-  return `<c:txPr><a:bodyPr${rot !== undefined ? ` rot="${rot}" vert="horz"` : ""}/><a:lstStyle/><a:p><a:pPr>${runPrA(t)}</a:pPr><a:endParaRPr lang="en-US"/></a:p></c:txPr>`;
+function txPrA(t, rot, noWrap = false) {
+  return `<c:txPr><a:bodyPr${rot !== undefined ? ` rot="${rot}" vert="horz"` : ""}${noWrap ? ' wrap="none"' : ""}/><a:lstStyle/><a:p><a:pPr>${runPrA(t)}</a:pPr><a:endParaRPr lang="en-US"/></a:p></c:txPr>`;
 }
 function paraA(text, t, align) {
   return `<a:p><a:pPr${align ? ` algn="${align}"` : ""}>${runPrA(t)}</a:pPr><a:r>${runPrA(t, "a:rPr")}<a:t>${xmlEsc(text)}</a:t></a:r></a:p>`;
@@ -5711,13 +5787,13 @@ function gridXml(grid) {
 /* A category axis, without an axis line as in Power BI. Every label is drawn (Excel otherwise
    skips some when it thinks they are crowded, so labels came and went with the chart's size);
    up to 60 categories, beyond which Excel's own spacing reads better */
-function catAxXml(id, crossId, pos, { reverse = false, hidden = false, title = null, count = 0, look = null, multi = false } = {}) {
+function catAxXml(id, crossId, pos, { reverse = false, hidden = false, title = null, count = 0, look = null, multi = false, noWrap = false } = {}) {
   const lk = look || {};
   return `<c:catAx><c:axId val="${id}"/><c:scaling><c:orientation val="${reverse ? "maxMin" : "minMax"}"/></c:scaling>` +
     `<c:delete val="${hidden && !title ? 1 : 0}"/><c:axPos val="${pos}"/>${hidden ? "" : gridXml(lk.grid)}` + (title ? axisTitleXml(title, lk.titleFont) : "") +
     `<c:numFmt formatCode="General" sourceLinked="1"/>` +
     `<c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="${hidden ? "none" : "low"}"/>` +
-    `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr>${txPrA(lk.text)}` +
+    `<c:spPr><a:ln><a:noFill/></a:ln></c:spPr>${txPrA(lk.text, noWrap ? 0 : undefined, noWrap)}` +
     `<c:crossAx val="${crossId}"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/>` +
     (count && count <= 60 && !hidden && !multi ? `<c:tickLblSkip val="1"/>` : "") + `<c:noMultiLvlLbl val="0"/></c:catAx>`;
 }
@@ -5956,6 +6032,8 @@ function chartXml(plan) {
     body = radarXml(plan, look, catLabel);
   } else {
     body = cartesianXml(plan, look, { titleH, legendOn, side, legendW, legendH, catLabel }, hidden);
+    // Small multiples: every panel's plot the same size and place, room kept for the axes
+    if (plan.panelEdges && !legendOn) plotLayout = panelPlotLayout(plan, look, titleH, catLabel, W, H);
   }
 
   const hiddenEntries = [...new Set([...hidden, ...legendCut])].sort((a, b) => a - b).map((i) => `<c:legendEntry><c:idx val="${i}"/><c:delete val="1"/></c:legendEntry>`).join("");
@@ -6012,6 +6090,33 @@ function radarXml(plan, look, catLabel) {
  * Bar, column, line, area and combo charts: their chart groups and axes. hidden collects the
  * series kept out of the legend (overlay lines, total labels, analytics lines).
  */
+/*
+ * A small multiple's plot area, the same in every panel as Power BI draws them: room on the left
+ * for the names (bars) or numbers (columns, lines) and below for the axis under it, kept in every
+ * panel, so the bars line up across the grid and a name is never cut ("Weiler,...") or wrapped
+ */
+function panelPlotLayout(plan, look, titleH, catLabel, W, H) {
+  const horizontal = plan.spec.dir === "bar";
+  const nameW = Math.max(0, ...plan.categories.map((_, i) => textPx(String(catLabel(i)), look.cat.text)));
+  const values = plan.series.flatMap((s) => s.values).filter((v) => typeof v === "number" && isFinite(v));
+  const top = plan.panelTop ?? maxAbsOf(values);   // the axis all panels share
+  const fmt = (plan.series[0] || {}).fmt;
+  const numberW = textPx(displayValue(top, fmt, autoUnit(top), 1), horizontal ? look.val.text : look.val.text) + 10;
+  // room for the names (and Excel's gap before the plot), or for the numbers
+  const left = Math.min(W * 0.55, horizontal ? nameW + 18 : numberW);
+  // the bottom axis's first and last numbers sit half outside the plot
+  const half = horizontal ? Math.max(10, numberW / 2) : 10;
+  const pw = Math.max(20, W - left - half);
+  // under the plot: one line of labels, or slanted names when they don't fit across
+  let below = lineHeightPx(horizontal ? look.val.text : look.cat.text) + 8;
+  if (!horizontal && plan.categories.length * 4 + plan.categories.reduce((a, _, i) => a + textPx(String(catLabel(i)), look.cat.text), 0) > pw) {
+    below = Math.min(H * 0.4, nameW * 0.75 + 10);
+  }
+  const y = titleH + 4, ph = Math.max(20, H - y - below);
+  const x = plan.panelEdges.left ? left : Math.min(left, half);
+  return manualLayoutA(x / W, y / H, pw / W, ph / H, true);
+}
+
 function cartesianXml(plan, look, box, hidden) {
   const { spec, series, refs } = plan;
   const kind = spec.kind;
@@ -6163,11 +6268,15 @@ function cartesianXml(plan, look, box, hidden) {
   }
 
   // Axes. A funnel hides its value axis and gridlines: the offsets would make the numbers misleading
+  // A small multiple's panel shows an axis only on the grid's outer edge (labels off, gridlines kept)
+  const edges = plan.panelEdges || null;
+  const catOut = !edges || (horizontal ? edges.left : edges.bottom), valOut = !edges || (horizontal ? edges.bottom : edges.left);
   const catXml = plan.dateAxis
-    ? dateAxXml(A1, A2, { hidden: !titles.catShow, title: titles.cat, look: look.cat, date: plan.dateAxis })
-    : catAxXml(A1, A2, horizontal ? "l" : "b", { reverse: horizontal, title: titles.cat, hidden: !titles.catShow, count: n, look: look.cat, multi: plan.multiLevel });
-  let axes = catXml + valAxXml(A2, A1, horizontal ? "b" : "l", valFmt, { crosses: horizontal ? "max" : "autoZero", grid: !spec.hideValueAxis,
-    hidden: !!spec.hideValueAxis || !titles.valShow, title: spec.hideValueAxis ? null : titles.val, axis,
+    ? dateAxXml(A1, A2, { hidden: !titles.catShow || !catOut, title: catOut ? titles.cat : null, look: look.cat, date: plan.dateAxis })
+    : catAxXml(A1, A2, horizontal ? "l" : "b", { reverse: horizontal, title: catOut ? titles.cat : null, hidden: !titles.catShow || !catOut, count: n, look: look.cat, multi: plan.multiLevel,
+        noWrap: !!edges && horizontal });   // a panel's names on one line, in the room its layout keeps
+  let axes = catXml + valAxXml(A2, A1, horizontal ? "b" : "l", valFmt, { crosses: horizontal ? "max" : "autoZero", grid: !spec.hideValueAxis, labels: valOut,
+    hidden: !!spec.hideValueAxis || !titles.valShow, title: spec.hideValueAxis || !valOut ? null : titles.val, axis,
     zero: isBar && main.every(([s]) => s.values.every((v) => v === null || v >= 0)), look: look.val });
   if (lines.length) {
     // A combo's line values on the second axis, scaled like Power BI's
