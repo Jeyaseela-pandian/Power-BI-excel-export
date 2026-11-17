@@ -4517,8 +4517,29 @@ function withDateAxis(plan) {
     categories: pick(plan.categories),
     series: plan.series.map((s) => ({ ...s, values: pick(s.values) })),
     pointColors: plan.pointColors ? pick(plan.pointColors) : null,
-    dateAxis: { serials, unit, timeUnit, fmt, days, ...(plan.monthsOnly ? { cellFmt: "mmm yyyy" } : {}) },
+    dateAxis: { serials, unit, timeUnit, days, ...alignedDateTicks(serials, unit, timeUnit, fmt), ...(plan.monthsOnly ? { cellFmt: "mmm yyyy" } : {}) },
   };
+}
+
+/*
+ * Power BI puts a date axis's labels on round dates, not on the first point: every 2 months is
+ * Jan, Mar, May, Jul, Sep, Nov (Jul 2020, Sep 2020 … for points from Jun 2020), every 3 months
+ * Jan, Apr, Jul, Oct, every 6 Jan and Jul, every n years the years divisible by n, every week
+ * Sundays. Excel labels from the axis's start, so the axis starts at the round date at or before
+ * the first point, and a label there before the first point is left blank.
+ */
+function alignedDateTicks(serials, unit, timeUnit, fmt) {
+  const first = Math.min(...serials), last = Math.max(...serials);
+  const d = new Date(Math.round((Math.floor(first) - 25569) * 86400000));
+  const y = d.getUTCFullYear(), m = d.getUTCMonth();
+  let start;
+  if (timeUnit === "years") start = Date.UTC(y - (((y % unit) + unit) % unit), 0, 1);
+  else if (timeUnit === "months") start = Date.UTC(y, m - (m % unit), 1);
+  else if (unit === 7) start = Date.UTC(y, m, d.getUTCDate() - d.getUTCDay());
+  else return { fmt };
+  const min = Math.round(start / 86400000 + 25569);
+  if (!(min < first)) return { fmt };
+  return { fmt: `[<${Math.floor(first)}]"";${fmt}`, min, max: last };
 }
 
 /*
