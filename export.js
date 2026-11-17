@@ -4023,13 +4023,13 @@ function hfText(s) {
  * fits the table width) → notes and footer → row heights, outline, print setup.
  */
 /*
- * The title the page shows, from its design: a short heading in a text box, one line in large
+ * The page's title text box, from its design: a short heading in a text box, one line in large
  * type (16pt or more), at least a fifth of the page wide, set above every chart and table on
- * the page ("Warehouse Fulfillment Dashboard"); the largest when there are several. null when the page has none (its name is
- * used, as before).
+ * the page ("Warehouse Fulfillment Dashboard"); the largest when there are several, with its
+ * alignment on the page. null when the page has none.
  */
 const PAGE_TITLE_MIN_PT = 16;
-function pageTitleText(reportColors, page) {
+function pageTitleBox(reportColors, page) {
   const visuals = (reportColors && reportColors.visuals) || {};
   const prefix = String(page && page.name) + "\u0001";
   const onPage = Object.keys(visuals).filter((k) => k.startsWith(prefix)).map((k) => visuals[k]).filter((v) => v && v.position);
@@ -4045,7 +4045,24 @@ function pageTitleText(reportColors, page) {
     isFinite(top(v)) && top(v) + Number(v.position.height || 0) <= firstData + 1);
   if (!titles.length) return null;
   titles.sort((a, b) => b.textBox.size - a.textBox.size || top(a) - top(b));
-  return titles[0].textBox.text;
+  const t = titles[0];
+  // left, centre or right, by where its middle sits across the page
+  const mid = (Number(t.position.x || 0) + Number(t.position.width || 0) / 2) / pageW;
+  return { ...t.textBox, align: mid < 0.34 ? "left" : mid > 0.66 ? "right" : "center" };
+}
+function pageTitleText(reportColors, page) {
+  const box = pageTitleBox(reportColors, page);
+  return box ? box.text : null;
+}
+
+/* The title text box across the page's width, in its own type (up to 26pt), placed as in the report */
+const PAGE_TITLE_MAX_PT = 26;
+function writeTitleBox(ws, row, c1, c2, box) {
+  if (c2 > c1) ws.mergeCellsWithoutStyle(row, c1, row, c2);
+  const c = ws.getCell(row, c1);
+  c.value = box.text;
+  c.font = { name: box.face || "Segoe UI", size: Math.round(Math.min(box.size, PAGE_TITLE_MAX_PT)), bold: !!box.bold, color: { argb: toArgb(box.color || "#252423") } };
+  c.alignment = { vertical: "middle", horizontal: box.align, indent: box.align === "center" ? 0 : 1 };
 }
 
 function writePageSheet(wb, sheetName, page, data, options, branding, logo, nameTable, ctx) {
@@ -4082,7 +4099,7 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
   heights[row++] = 15;
 
   const title = ws.getCell(row, B);
-  title.value = pageTitleText(lay.reportColors, page) || page.displayName;
+  title.value = page.displayName;
   title.font = fonts.title;
   title.alignment = { vertical: "bottom" };
   heights[row++] = 34;
@@ -4132,6 +4149,13 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
     }
   }
   heights[row++] = 18;                           // spacer
+  // The page's title text box ("Warehouse Fulfillment Dashboard"), above the visuals as in the report
+  const titleBox = data.items.length ? pageTitleBox(lay.reportColors, page) : null;
+  const titleBoxRow = titleBox ? row : null;
+  if (titleBox) {
+    heights[row++] = Math.round(Math.min(titleBox.size, PAGE_TITLE_MAX_PT) * 1.6);
+    heights[row++] = 8;                          // spacer
+  }
   const layoutStart = row;
 
   // 2. Visuals
@@ -4149,10 +4173,12 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
   }
 
   // 3. Column widths; the page is at least as wide as its masthead text
-  const titleUnits = Math.ceil(String(title.value).length * (branding.titleFont === "Georgia" ? 2.3 : 2.1)) + 6;
+  const titleUnits = Math.ceil(String(page.displayName).length * (branding.titleFont === "Georgia" ? 2.3 : 2.1)) + 6;
   const minPage = Math.max(MIN_PAGE_W, titleUnits, Math.ceil(eyebrowText.length * 0.95) + 6,
     Math.ceil(metaText.length * 0.9) + 6, Math.ceil(longestFilterLine * 0.9) + 6);
   const { contentEnd, bandEnd } = widths.apply(ws, Math.max(layout.lastCol, B), minPage);
+
+  if (titleBox) writeTitleBox(ws, titleBoxRow, B, contentEnd, titleBox);
 
   // 4. Rules and fills
   paintRange(ws, 1, 1, bandEnd, { fill: solidFill(accent.rule) });

@@ -85,7 +85,7 @@ test("Viewers: theme names in a newer-format layout are found (an empty theme en
   assert.deepStrictEqual(await websiteAxes("{}", content({})), [false, false]);
 });
 
-test("the page's title is its heading text box ('Warehouse Fulfillment Dashboard'), else its name", () => {
+test("the page's title text box is found ('Warehouse Fulfillment Dashboard'); other text boxes aren't", () => {
   const { json } = loadApp();
   const box = (text, size, pos) => ({ visualType: "textbox", textBox: { text, lines: 1, size }, position: pos });
   const chart = { visualType: "clusteredColumnChart", position: { x: 0, y: 142, width: 768, height: 365 } };
@@ -102,6 +102,20 @@ test("the page's title is its heading text box ('Warehouse Fulfillment Dashboard
 test("a text box's text and type size are read from the report (classic layout)", () => {
   const { json } = loadApp();
   const objects = { general: [{ properties: { paragraphs: [{ textRuns: [{ value: "Warehouse Fulfillment Dashboard", textStyle: { fontWeight: "bold", fontSize: "28pt" } }] }] } }] };
-  assert.deepStrictEqual(json(`textBoxText(${JSON.stringify(objects)})`), { text: "Warehouse Fulfillment Dashboard", lines: 1, size: 28 });
+  assert.deepStrictEqual(json(`textBoxText(${JSON.stringify(objects)})`), { text: "Warehouse Fulfillment Dashboard", lines: 1, size: 28, bold: true, color: null, face: null });
   assert.strictEqual(json(`textBoxText({})`), null);
+});
+
+test("the title text box gets its own row above the visuals, centred as in the report; the heading keeps the page's name", () => {
+  const { ctx, run, json } = loadApp();
+  const box = { visualType: "textbox", textBox: { text: "Warehouse Fulfillment Dashboard", lines: 1, size: 28, bold: true, color: null, face: null }, position: { x: 384, y: 0, width: 616, height: 77 } };
+  const chart = { visualType: "clusteredColumnChart", position: { x: 0, y: 142, width: 1440, height: 365 } };
+  assert.strictEqual(json(`pageTitleBox({ visuals: { ["p" + String.fromCharCode(1) + "t"]: ${JSON.stringify(box)}, ["p" + String.fromCharCode(1) + "c"]: ${JSON.stringify(chart)} } }, { name: "p" }).align`), "center");
+  // written: one merged row, the text in its own bold type
+  const cells = {};
+  ctx.WS = { mergeCellsWithoutStyle: (r1, c1, r2, c2) => { cells.merged = [r1, c1, r2, c2]; }, getCell: (r, c) => (cells[r + "," + c] = cells[r + "," + c] || {}) };
+  run(`writeTitleBox(WS, 9, 2, 20, ${JSON.stringify({ ...box.textBox, align: "center" })})`);
+  assert.deepStrictEqual(cells.merged, [9, 2, 9, 20]);
+  assert.strictEqual(cells["9,2"].value, "Warehouse Fulfillment Dashboard");
+  assert.deepStrictEqual([cells["9,2"].font.size, cells["9,2"].font.bold, cells["9,2"].alignment.horizontal], [26, true, "center"]);
 });

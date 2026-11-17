@@ -1113,11 +1113,13 @@ function pbirVisual(json) {
     sort: sortOf(v.query && v.query.sortDefinition && v.query.sortDefinition.sort), position: json.position || null };
 }
 
-/* A text box's text and its largest font size in points: { text, size }, or null when empty */
+/* A text box's text, its largest font size in points and that text's look:
+   { text, lines, size, bold, color, face }, or null when empty */
 function textBoxText(objects) {
   const general = ((objects || {}).general || [])[0];
   const paragraphs = (general && general.properties && general.properties.paragraphs) || [];
   const lines = [], sizes = [];
+  let main = null;   // the run in the largest type: its look is the text box's
   for (const p of Array.isArray(paragraphs) ? paragraphs : []) {
     const runs = p.textRuns || [];
     const line = runs.map((r) => String(r.value ?? "")).join("").replace(/\s+/g, " ").trim();
@@ -1125,11 +1127,18 @@ function textBoxText(objects) {
     for (const r of runs) {
       const size = parseFloat(String((r.textStyle || {}).fontSize || ""));
       const px = /px/i.test(String((r.textStyle || {}).fontSize || ""));
-      if (isFinite(size) && String(r.value ?? "").trim()) sizes.push(px ? size * 0.75 : size);
+      if (isFinite(size) && String(r.value ?? "").trim()) {
+        const pt = px ? size * 0.75 : size;
+        if (!sizes.length || pt > Math.max(...sizes)) main = r.textStyle || {};
+        sizes.push(pt);
+      }
     }
   }
   if (!lines.length) return null;
-  return { text: lines.join("\n"), lines: lines.length, size: sizes.length ? Math.max(...sizes) : null };
+  const st = main || {};
+  const face = String(st.fontFamily || "").split(",")[0].replace(/['"]/g, "").trim() || null;
+  return { text: lines.join("\n"), lines: lines.length, size: sizes.length ? Math.max(...sizes) : null,
+    bold: /bold|[6-9]00/i.test(String(st.fontWeight || "")), color: /^#[0-9a-f]{6}$/i.test(String(st.color || "")) ? st.color : null, face };
 }
 
 /* Icon rules ("fx" icons): each case's lower bound (a threshold) and its icon */
