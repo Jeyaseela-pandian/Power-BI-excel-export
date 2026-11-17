@@ -3589,11 +3589,14 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     item.tableFormat = item.gridFormat || (info && info.tableFormats && info.tableFormats.length ? info : null);
     item.colorInfo = info;
     item.themePalette = lay.palette && lay.palette.length ? lay.palette : null;   // colours for charts without their own settings
-    item.chart =options.visualsAs === "charts" && !item.trend ? chartPlan(item) : null;   // charts mode only
+    // charts mode only; a Dual KPI's trend cards become its two area charts (dualKpiChart)
+    item.chart = options.visualsAs !== "charts" ? null
+      : item.trend ? ((customVisual(item.type) || {}).layout === "trend" ? dualKpiChart(item) : null) : chartPlan(item);
     if (item.chart) {
       // The visual's format settings (Power BI's defaults without the report file)
       const reportLook = (info && info.look) || chartLook({ type: item.type }, null);
       let look = options.chartBackground === "report" ? reportLook : lookOnWhite(reportLook);   // white unless asked otherwise
+      look = tornadoLook(look, item, info);
       // Small multiples share one value axis, rounded as the chart's own would be
       if (item.sharedMax !== null && item.sharedMax !== undefined && look.val && look.val.end == null) {
         const shared = valueScale([item.sharedMax], 200, 75, { zero: true });
@@ -3621,6 +3624,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
         item.chart = null;
       }
       if (item.chart && item.panels) item.chart.panels = panelPlans(item, info, look, lay.palette);
+      if (item.chart && item.chart.dualKpi) item.chart.panels = dualKpiPanels(item, look);
       if (item.chart && !item.chart.panels) item.chart = growForLegend(item.chart);
     }
     if (item.chart && item.chart.note) colorNotes.push(item.chart.note);
@@ -4572,6 +4576,21 @@ function unsignedNumFmt(fmt) {
   return `${first};${first}`;
 }
 
+/*
+ * The Tornado visual as it draws itself (its own defaults, else the report's settings): the
+ * values inside each bar, the names on the left, a legend without a title, and no value axis,
+ * gridlines or axis titles (it has none). Other charts: their look unchanged.
+ */
+function tornadoLook(look, item, info) {
+  if (!(chartSpecOf(item.type) || {}).mirror || !item.chart) return look;
+  const set = (key) => customSetting(item.type, info, key);
+  const axes = item.chart.axes || {};
+  item.chart.axes = { ...axes, cat: { ...(axes.cat || {}), title: false, show: set("categories") !== false }, val: { ...(axes.val || {}), show: false, title: false } };
+  return { ...look,
+    labels: { ...look.labels, show: set("labels") !== false, position: "InsideCenter" },
+    legend: { ...look.legend, title: set("legendTitle") === true } };
+}
+
 /* Tornado: its first two sides (legend values or measures), the first drawn to the left as
    negative bars, both labelled without a minus. One side only: a plain bar chart. */
 function mirrorPlan(plan, spec) {
@@ -4579,7 +4598,7 @@ function mirrorPlan(plan, spec) {
   if (sides.length < 2) return plan;
   const [left, right] = sides;
   return {
-    ...plan, spec,
+    ...plan, spec: { ...spec, hideValueAxis: true },   // the Tornado draws no value axis or gridlines
     series: [
       { ...left, values: left.values.map((v) => (typeof v === "number" ? -v : v)), fmt: unsignedNumFmt(left.fmt) },
       { ...right, fmt: unsignedNumFmt(right.fmt) },
@@ -4775,6 +4794,51 @@ function withNumberOrder(plan) {
   const pick = (list) => (Array.isArray(list) ? order.map((i) => list[i]) : list);
   return { ...plan, categories: pick(plan.categories), catText: pick(plan.catText), pointColors: pick(plan.pointColors),
     series: plan.series.map((s) => ({ ...s, values: pick(s.values) })) };
+}
+
+/*
+ * Charts mode: a Dual KPI as the visual draws it: its two fields (top, then bottom) as area
+ * charts over the dates, stacked, each in its colour with its axis labelled at its lowest and
+ * highest value (or the axis range set in the visual), the field's name, change and latest value
+ * over its middle ("Total Sales (+27.2%)", "$1,192"), and "Last 670 days" under them. The data
+ * is the trend cards' (dualKpiTrend), in date order.
+ */
+const DUAL_KPI_FOOT_PX = 18;
+function dualKpiChart(item) {
+  const t = item.trend;
+  if (!t || !t.cards.length || t.points < 2) return null;
+  const [header, ...rows] = item.rows;
+  const pts = rows.slice(0, t.points);
+  const series = t.cards.map((card) => ({ name: card.label, values: pts.map((r) => { const v = toCellValue(String(r[card.col] ?? "")).value; return typeof v === "number" ? v : null; }),
+    fmt: (pts.map((r) => toCellValue(String(r[card.col] ?? ""))).find((c) => typeof c.value === "number") || {}).numFmt || "#,##0", color: card.color ? toArgb(card.color) : null }));
+  return { spec: { kind: "area", grouping: "standard" }, title: item.displayTitle || item.title, catName: header[t.dateCol],
+    categories: pts.map((r) => String(r[t.dateCol] ?? "")), series, pointColors: null, axes: null, dualKpi: true };
+}
+function dualKpiPanels(item, look) {
+  const base = item.chart, t = item.trend;
+  const total = base.sizePx || chartSizePx(item);
+  const head = base.showTitle && base.title ? PANEL_TITLE_PX : 0;
+  const foot = DUAL_KPI_FOOT_PX;
+  const n = t.cards.length;
+  const w = total.w, h = Math.floor((total.h - head - foot) / n);
+  const plainLook = { ...look, title: { ...look.title, show: false }, legend: { ...look.legend, show: false }, labels: { ...look.labels, show: false },
+    cat: { ...look.cat, grid: null }, val: { ...look.val, grid: null }, frame: { ...look.frame, border: null, shadow: null }, refLines: [], trend: null, totals: { ...look.totals, show: false },
+    areaOpacity: 0.3, lines: { ...look.lines, width: 0.75, style: "solid", show: true, markers: null, series: {} } };
+  const valueFont = { ...LOOK_TEXT, size: 20, color: "#252423" };
+  const labelFont = { ...LOOK_TEXT, size: 10, color: "#252423" };
+  const plans = t.cards.map((card, k) => {
+    const s = base.series[k];
+    const vals = s.values.filter((v) => typeof v === "number");
+    const lo = card.min ?? Math.min(...vals), hi = card.max ?? Math.max(...vals);
+    return { spec: base.spec, title: card.label, catName: base.catName, categories: base.categories, pointColors: null,
+      series: [s], look: plainLook, sizePx: { w, h }, showTitle: false,
+      axes: { cat: { show: false, title: false }, val: { show: true, title: false } },
+      axisEnds: hi > lo ? { min: lo, max: hi } : null,
+      overlay: { height: 44, lines: [{ text: card.change ? `${card.label} (${card.change})` : card.label, font: labelFont }, { text: card.text, font: valueFont }] } };
+  });
+  const c = t.caption || {};
+  const footer = c.days !== undefined ? { text: `Last ${c.days} days`, align: "right", font: { ...LOOK_TEXT, size: 9, italic: true, color: "#605E5C" } } : null;
+  return { plans, cols: 1, rows: n, w, h, head, foot: footer ? foot : 0, footer, title: head ? base.title : null, look };
 }
 
 /* Small multiples: each panel's chart (its own colours, the visual's look, centred value as its
@@ -6288,6 +6352,7 @@ function cartesianXml(plan, look, box, hidden) {
     : pct ? valueScale([0, 1], axisPx, gapPx, { zero: true, round: true, start: 0, end: 1 })
       : valueScale([...mainVals, ...refConst], axisPx, gapPx, { zero: isBar, round: roomForLabels, start: look.val.start, end: look.val.end });
   if (spec.mirror && axis) { axis.max = Math.max(axis.max, -axis.min); axis.min = -axis.max; }
+  if (plan.axisEnds && axis) Object.assign(axis, plan.axisEnds, { step: plan.axisEnds.max - plan.axisEnds.min || 1 });
   const fmt0 = (main[0] ? main[0][0] : series[0]).fmt;
   // Display units "Auto" for the labels on the main axis follow where the axis ends: the
   // gridline at or above the largest value (8,468 under a 10K gridline shows 8.5K; 2,128 under
@@ -6545,10 +6610,24 @@ function panelGroupXml(ch, rids, id) {
       `<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${W}" cy="${Math.round(g.head * E)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></xdr:spPr>` +
       `<xdr:txBody><a:bodyPr wrap="none" lIns="76200" tIns="0" rIns="76200" bIns="0" anchor="ctr"/><a:lstStyle/>${paraA(g.title, T, T.align === "center" ? "ctr" : T.align === "right" ? "r" : "l")}</xdr:txBody></xdr:sp>`
     : "";
+  // Text over a panel's middle (a Dual KPI's label, change and value), and a line under the grid
+  const textBox = (sid, x, y, w, h, paras, anchor = "ctr") =>
+    `<xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="${sid}" name="Text ${sid}"/><xdr:cNvSpPr txBox="1"/></xdr:nvSpPr>` +
+    `<xdr:spPr><a:xfrm><a:off x="${Math.round(x * E)}" y="${Math.round(y * E)}"/><a:ext cx="${Math.round(w * E)}" cy="${Math.round(h * E)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></xdr:spPr>` +
+    `<xdr:txBody><a:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="${anchor}"/><a:lstStyle/>${paras}</xdr:txBody></xdr:sp>`;
+  const overlays = g.plans.map((p, k) => {
+    const o = p.overlay;
+    if (!o) return "";
+    const x = (k % g.cols) * g.w, y = g.head + Math.floor(k / g.cols) * g.h;
+    return textBox(id + 200 + k, x + g.w * 0.2, y + g.h / 2 - o.height / 2, g.w * 0.6, o.height, o.lines.map((l) => paraA(l.text, l.font, "ctr")).join(""));
+  }).join("");
+  const foot = g.footer
+    ? textBox(id + 300, 0, H / E - g.foot, W / E, g.foot, paraA(g.footer.text, g.footer.font, g.footer.align === "right" ? "r" : "l"))
+    : "";
   return `<xdr:oneCellAnchor><xdr:from><xdr:col>${ch.col - 1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${ch.row - 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>` +
     `<xdr:ext cx="${W}" cy="${H}"/><xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="${id + 100}" name="Small multiples ${id}"/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>` +
     `<xdr:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${W}" cy="${H}"/><a:chOff x="0" y="0"/><a:chExt cx="${W}" cy="${H}"/></a:xfrm></xdr:grpSpPr>` +
-    `${title}${g.plans.map((_, k) => frame(k)).join("")}</xdr:grpSp><xdr:clientData/></xdr:oneCellAnchor>`;
+    `${title}${g.plans.map((_, k) => frame(k)).join("")}${overlays}${foot}</xdr:grpSp><xdr:clientData/></xdr:oneCellAnchor>`;
 }
 
 /* A chart's frame on the page sheet: its top-left cell and its size */

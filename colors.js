@@ -173,7 +173,9 @@ const CUSTOM_VISUALS = {
   // Tornado: one fixed colour per side, purple then teal (the AppSource build; its newest source
   // switches to theme colours), whether the sides are legend values or two measures
   TornadoChart1452517688218: { name: "Tornado chart", rule: "auto", roles: { Category: "Category", Series: "Series", Values: "Values" },
-    palette: ["#800080", "#008080"] },
+    palette: ["#800080", "#008080"],
+    // its own defaults: values inside the bars, region names on, no legend title; it has no value axis
+    settings: { labels: ["dataLabels", "show", true], categories: ["categoryAxis", "show", true], legendTitle: ["legend", "showTitle", false] } },
   // Box and whisker (Jan Pieter Posthuma): a theme colour per category box, in order (a colour set
   // per category kept); every box one colour when "one colour" is on (its own, else the first)
   BoxWhiskerChart1455240051538: { name: "Box and whisker chart", rule: "item", roles: { Groups: "Category", Samples: "Samples", Values: "Values" },
