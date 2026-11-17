@@ -302,3 +302,26 @@ test("ribbon charts stay tables", () => {
   assert.strictEqual(run(`chartSpecOf("ribbonChart")`), null);
   assert.ok(run(`chartSpecOf("columnChart")`));
 });
+
+test("a Year › Month hierarchy on a line chart's continuous axis is drawn as dates (Jul 2020), as Power BI does", () => {
+  const axis = (outer, inner, continuous = true) => json(`(() => {
+    const p = { spec: { kind: "line" }, multiLevel: true, categories: ${JSON.stringify(inner.map((m, i) => outer[i] + " " + m))},
+      catText: ${JSON.stringify(inner)}, catLevels: [{ name: "Year", values: ${JSON.stringify(outer)}, starts: [] }],
+      series: [{ name: "Revenue Won", values: ${JSON.stringify(inner.map((_, i) => 100 + i))}, fmt: "#,##0" }], pointColors: null,
+      look: { cat: { continuous: ${continuous} } }, sizePx: { w: 600, h: 300 } };
+    const r = withDateAxis(p);
+    return { multi: !!r.multiLevel, fmt: r.dateAxis ? r.dateAxis.fmt : null, first: r.categories[0], values: r.series[0].values };
+  })()`);
+  const months = ["June", "July", "August", "September", "October", "November", "December", "January", "February", "March", "April", "May"];
+  const years = months.map((_, i) => (i < 7 ? "2020" : "2021"));
+  const d = axis(years, months);
+  assert.deepStrictEqual([d.multi, d.fmt, d.first], [false, "mmm yyyy", "2020-06-01"]);
+  // rows out of date order are put in date order, values with them
+  const shuffled = axis(["2021", "2020"], ["January", "December"]);
+  assert.deepStrictEqual([shuffled.first, shuffled.values], ["2020-12-01", [101, 100]]);
+  // month numbers too
+  assert.strictEqual(axis(["2020", "2020"], ["11", "12"]).first, "2020-11-01");
+  // the report sets the axis to Categorical, or the hierarchy isn't dates: levels of labels, as before
+  assert.strictEqual(axis(years, months, false).multi, true);
+  assert.strictEqual(axis(["East", "West"], ["Store 1", "Store 2"]).multi, true);
+});

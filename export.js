@@ -4496,8 +4496,11 @@ function boxPlan(item) {
 const DATE_STEPS = [[1, "days", 1], [7, "days", 7], [1, "months", 30.44], [2, "months", 60.9], [3, "months", 91.3], [6, "months", 182.6],
   [1, "years", 365.25], [2, "years", 730.5], [5, "years", 1826], [10, "years", 3652]];
 function withDateAxis(plan) {
-  if (!plan || !["line", "area"].includes(plan.spec.kind) || plan.multiLevel || plan.dateAxis) return plan;
+  if (!plan || !["line", "area"].includes(plan.spec.kind) || plan.dateAxis) return plan;
   if (plan.look && plan.look.cat.continuous === false) return plan;
+  // A Year › Month (› Day) hierarchy on a continuous axis: Power BI draws it as dates
+  // ("Jul 2020"); any other hierarchy keeps its levels of labels
+  if (plan.multiLevel && !(plan = hierarchyDates(plan))) return arguments[0];
   const parsed = plan.categories.map((c) => { const t = String(c ?? "").trim(); return t ? parseDate(t) : null; });
   const blank = plan.categories.map((c) => !String(c ?? "").trim());
   if (parsed.filter(Boolean).length < 2 || parsed.some((p, i) => !p && !blank[i])) return plan;
@@ -4505,15 +4508,50 @@ function withDateAxis(plan) {
   const serials = pick(parsed).map((p) => Math.round((p.date.getTime() / 86400000 + 25569) * 1e6) / 1e6);
   const span = Math.max(...serials) - Math.min(...serials);
   const most = Math.max(2, ((plan.sizePx ? plan.sizePx.w : 400) - 70) / 85);
-  const [unit, timeUnit, days] = DATE_STEPS.find(([, , d]) => span / d <= most) || DATE_STEPS[DATE_STEPS.length - 1];
+  // a year › month hierarchy steps by whole months at least, and its points read "Jul 2020"
+  const steps = plan.monthsOnly ? DATE_STEPS.filter(([, t]) => t !== "days") : DATE_STEPS;
+  const [unit, timeUnit, days] = steps.find(([, , d]) => span / d <= most) || steps[steps.length - 1];
   const fmt = timeUnit === "years" ? "yyyy" : timeUnit === "months" ? "mmm yyyy" : "d mmm";
   return {
     ...plan,
     categories: pick(plan.categories),
     series: plan.series.map((s) => ({ ...s, values: pick(s.values) })),
     pointColors: plan.pointColors ? pick(plan.pointColors) : null,
-    dateAxis: { serials, unit, timeUnit, fmt, days },
+    dateAxis: { serials, unit, timeUnit, fmt, days, ...(plan.monthsOnly ? { cellFmt: "mmm yyyy" } : {}) },
   };
+}
+
+/*
+ * A hierarchy whose levels are a year, a month (name or number) and optionally a quarter or a
+ * day, as dates in date order: the plan with one date per point; null for any other hierarchy
+ */
+function hierarchyDates(plan) {
+  const levels = [...(plan.catLevels || []).map((l) => l.values), plan.catText || []];
+  const n = plan.categories.length;
+  if (levels.length < 2 || levels.some((l) => l.length !== n)) return null;
+  const kinds = levels.map((vals) => {
+    const t = vals.map((v) => String(v ?? "").trim());
+    if (t.every((v) => /^\d{4}$/.test(v) && v >= 1900 && v <= 2100)) return "year";
+    if (t.every((v) => MONTHS.includes(v.slice(0, 3).toLowerCase()) && /^[a-z]+$/i.test(v))) return "month";
+    if (t.every((v) => /^(q|qtr|quarter)\s*[1-4]$/i.test(v))) return "quarter";
+    if (t.every((v) => /^\d{1,2}$/.test(v) && v >= 1 && v <= 31)) return "number";
+    return null;
+  });
+  const year = kinds.indexOf("year");
+  // a number level is the month right after the year (or quarter), else the day after the month
+  let month = kinds.indexOf("month");
+  const nums = kinds.map((k, i) => (k === "number" ? i : -1)).filter((i) => i >= 0);
+  if (month < 0 && nums.length && levels[nums[0]].every((v) => Number(v) <= 12)) month = nums.shift();
+  const day = nums.length === 1 && nums[0] > month ? nums[0] : -1;
+  if (year < 0 || month < 0 || month < year || nums.length > (day >= 0 ? 1 : 0) || kinds.some((k) => k === null)) return null;
+  const monthOf = (v) => (/^\d+$/.test(String(v).trim()) ? Number(v) : MONTHS.indexOf(String(v).trim().slice(0, 3).toLowerCase()) + 1);
+  const pad = (x) => String(x).padStart(2, "0");
+  const dates = plan.categories.map((_, i) => `${levels[year][i]}-${pad(monthOf(levels[month][i]))}-${pad(day >= 0 ? Number(levels[day][i]) : 1)}`);
+  if (dates.some((d) => !parseDate(d)) || new Set(dates).size !== n) return null;
+  const order = dates.map((_, i) => i).sort((a, b) => (dates[a] < dates[b] ? -1 : dates[a] > dates[b] ? 1 : 0));
+  const pick = (list) => (Array.isArray(list) ? order.map((i) => list[i]) : list);
+  return { ...plan, multiLevel: false, catLevels: null, catText: null, categories: pick(dates), pointColors: pick(plan.pointColors),
+    series: plan.series.map((s) => ({ ...s, values: pick(s.values) })), monthsOnly: day < 0 };
 }
 
 /*
