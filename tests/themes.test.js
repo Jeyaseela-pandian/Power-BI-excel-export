@@ -162,3 +162,35 @@ test("a pie labelled by category shows the names, as Power BI does (Female, Male
     var pl = chartLook({ type: "pieChart" }, null); pl.labels.show = true; pl.labels.style = "Category"; pp.look = pl; pp.sizePx = { w: 300, h: 250 };`);
   assert.deepStrictEqual(json("pieLabelPoints(pp, pl).map((p) => p.text)"), ["Female", "Male"]);
 });
+
+test("a page's heading text boxes, every one top to bottom, from 14pt, dark on the white sheet ('REGIONAL SALES', 'Sales Overview')", () => {
+  const { ctx, run, json } = loadApp();
+  const box = (text, y, color, bold) => ({ visualType: "textbox", position: { x: 195, y, width: 439, height: 37 },
+    textBox: { text, lines: 1, size: 14, bold, color, face: "Segoe UI", runs: [{ text, size: 14, bold, color, face: "Segoe UI" }] } });
+  const kpi = { visualType: "kpi", position: { x: 17, y: 91, width: 300, height: 68 } };
+  const visuals = { ["p" + String.fromCharCode(1) + "a"]: box("Sales Overview", 37, "#FFFFFF", false), ["p" + String.fromCharCode(1) + "b"]: box("REGIONAL SALES", 0, "#FFFFFF", true),
+    ["p" + String.fromCharCode(1) + "c"]: kpi, ["p" + String.fromCharCode(1) + "d"]: { ...box("WHAT IF the qualified forecast was adjusted by", 171, "#000000", false) } };
+  ctx.V = visuals;
+  assert.deepStrictEqual(json("pageTitleBoxes({ visuals: V }, { name: 'p' }).map((b) => b.text)"), ["REGIONAL SALES", "Sales Overview"]);
+  // white type made for a dark banner: written dark
+  const cells = {};
+  ctx.WS = { mergeCellsWithoutStyle() {}, getCell: (r, c) => (cells[r + "," + c] = cells[r + "," + c] || {}) };
+  run("writeTitleBox(WS, 9, 2, 20, { ...pageTitleBoxes({ visuals: V }, { name: 'p' })[0] })");
+  const argb = cells["9,2"].font ? cells["9,2"].font.color.argb : cells["9,2"].value.richText[0].font.color.argb;
+  assert.strictEqual(argb, "FF252423");
+});
+
+test("Power BI's KPI visual as a tile: its title over the value (its own, else the measure's name), no title row above", () => {
+  const { ctx, run } = loadApp();
+  const cells = {};
+  ctx.WS = { getCell: (r, c) => (cells[r + "," + c] = cells[r + "," + c] || { r, c, font: {}, alignment: {}, border: {} }), mergeCellsWithoutStyle() {}, getRow: () => ({}), getColumn: () => ({ width: 10, letter: "A" }) };
+  run(`LAY = { fonts: makeFonts(), accent: { tab: "FF000000", cap: "FF000000" }, reportColors: null };`);
+  const tile = (item) => { Object.keys(cells).forEach((k) => delete cells[k]); ctx.ITEM = item; run("writeKpiBlock(WS, 5, 2, ITEM, makeWidthTracker(), LAY, false, null)"); return [cells["5,2"] && cells["5,2"].value, cells["6,2"] && cells["6,2"].value]; };
+  // the KPI visual with its own title: the title is the label, the value under it
+  assert.deepStrictEqual(tile({ type: "kpi", isKpi: true, displayTitle: "Qualified Pipeline", rows: [["Qualified Rev in Pipeline"], ["$19900360"]], page: "p", name: "k" }), ["Qualified Pipeline", 19900360]);
+  // its automatic title: the measure's name
+  assert.deepStrictEqual(tile({ type: "kpi", isKpi: true, displayTitle: null, rows: [["Revenue Won"], ["$11429826"]], page: "p", name: "k" }), ["Revenue Won", 11429826]);
+  // a card: its title row, then the measure's name as its label, as before
+  const card = tile({ type: "card", isKpi: true, displayTitle: "Sales", rows: [["Total Sales"], ["$100"]], page: "p", name: "c" });
+  assert.deepStrictEqual(card, ["Sales", "TOTAL SALES"]);
+});
