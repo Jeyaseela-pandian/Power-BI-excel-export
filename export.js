@@ -7692,7 +7692,8 @@ async function loadTableTotals(collected, options) {
         const fmt = formats[ci] || (cells.find((r) => typeof r[ci].value === "number") || [])[ci]?.numFmt;
         if (totalKind(field, header[ci], fmt)) continue;   // adds up: Excel's own total, as before
         const res = await groupedMeasure([], field, filters);
-        const v = res.rows && res.rows[0] ? toCellValue(String(res.rows[0][0] ?? "")).value : null;
+        let v = res.rows && res.rows[0] ? toCellValue(String(res.rows[0][0] ?? "")).value : null;
+        if (typeof v === "number") v = onRowsScale(v, cells.map((r) => r[ci].value), fmt);
         if (typeof v === "number") totals[normalizeField(header[ci])] = v;
         else log(`"${item.title}": the total of ${header[ci]} wasn't given by Power BI${res.error ? ` (${res.error})` : ""}; left blank`);
       }
@@ -7702,6 +7703,21 @@ async function loadTableTotals(collected, options) {
       }
     }
   }
+}
+
+/*
+ * Power BI's own value on the scale of the exported cells. A percentage column's cells hold
+ * fractions ("10.4%" is 0.104), but a measure that returns 10.76 and only shows a "%" sign (a
+ * format such as 0.0"%") comes back from Power BI as 10.76: when the value is a hundred times
+ * the cells' size and a hundredth of it sits among them, it is that hundredth (0.1076, 10.8%).
+ */
+function onRowsScale(v, values, fmt) {
+  if (!/%/.test(String(fmt || ""))) return v;
+  const nums = values.filter((x) => typeof x === "number" && x !== 0).map(Math.abs);
+  if (!nums.length || v === 0) return v;
+  const lo = Math.min(...nums), hi = Math.max(...nums);
+  const near = (x) => Math.abs(x) >= lo / 10 && Math.abs(x) <= hi * 10;
+  return !near(v) && near(v / 100) ? v / 100 : v;
 }
 
 /* A measure grouped by some columns (none: one total) under the filters: { rows: [[...values, measure]] } or { error } */

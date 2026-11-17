@@ -181,3 +181,15 @@ test("a Viewer's table totals: asked of the query service, its single-total answ
   assert.deepStrictEqual(json("ITEM.reportTotals"), { "readmission rate": 0.108 });
   assert.deepStrictEqual(json("totalsPlan(ITEM, INFO).kinds"), [null, "report"]);
 });
+
+test("a total from Power BI on the rows' scale: a measure returning 10.76 with a '%' sign is 10.8%, not 1076%", () => {
+  const { json } = loadApp();
+  const rows = [0.104, 0.104, 0.083, 0.125, 0.125, 0.104];
+  assert.strictEqual(json(`onRowsScale(10.764, ${JSON.stringify(rows)}, "0.0%")`), 0.10764);
+  // a measure returning a fraction: unchanged
+  assert.strictEqual(json(`onRowsScale(0.108, ${JSON.stringify(rows)}, "0.0%")`), 0.108);
+  // a share well outside the rows (-42% … 201%), a total 6.78%: unchanged
+  assert.strictEqual(json(`onRowsScale(0.0678, [-0.4291, 2.0163, 0.0531], "0.00%")`), 0.0678);
+  // not a percentage: unchanged
+  assert.strictEqual(json(`onRowsScale(1076, [10, 12], "#,##0")`), 1076);
+});
