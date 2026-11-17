@@ -4084,8 +4084,11 @@ function isPageHeading(v, onPage, pageW) {
   const dataTops = onPage.filter((x) => x.visualType && !NON_DATA_TYPES.includes(x.visualType) && x.visualType !== "slicer").map(top).filter(isFinite);
   const firstData = dataTops.length ? Math.min(...dataTops) : Infinity;
   const W = pageW || Math.max(...onPage.map((x) => Number(x.position.x || 0) + Number(x.position.width || 0)).filter(isFinite), 1);
-  return !!(v.visualType === "textbox" && v.textBox && v.textBox.lines === 1 && v.textBox.size >= PAGE_TITLE_MIN_PT &&
-    v.textBox.text.length <= 70 && !/[.!?]$/.test(v.textBox.text) && Number(v.position.width || 0) >= W * 0.2 &&
+  // a heading, not a paragraph: one to three short lines ("Opportunity Analysis Report" over
+  // "Opportunity detail"), none a sentence
+  const lines = v.textBox ? String(v.textBox.text).split("\n") : [];
+  return !!(v.visualType === "textbox" && v.textBox && lines.length >= 1 && lines.length <= 3 && v.textBox.size >= PAGE_TITLE_MIN_PT &&
+    lines.every((l) => l.length <= 70 && !/[.!?]$/.test(l)) && Number(v.position.width || 0) >= W * 0.2 &&
     isFinite(top(v)) && isFinite(firstData) && top(v) + Number(v.position.height || 0) <= firstData + 1);
 }
 function pageTitleBox(reportColors, page) {
@@ -4100,9 +4103,7 @@ function pageTitleBox(reportColors, page) {
   // a title spans a good part of the page (a small badge such as "Free" isn't one)
   const pageW = Math.max(...onPage.map((v) => Number(v.position.x || 0) + Number(v.position.width || 0)).filter(isFinite), 1);
   // a heading, not a sentence: short, and not ending in a full stop
-  const titles = onPage.filter((v) => v.visualType === "textbox" && v.textBox && v.textBox.lines === 1 && v.textBox.size >= PAGE_TITLE_MIN_PT &&
-    v.textBox.text.length <= 70 && !/[.!?]$/.test(v.textBox.text) && Number(v.position.width || 0) >= pageW * 0.2 &&
-    isFinite(top(v)) && top(v) + Number(v.position.height || 0) <= firstData + 1);
+  const titles = onPage.filter((v) => isPageHeading(v, onPage, pageW));
   if (!titles.length) return null;
   titles.sort((a, b) => b.textBox.size - a.textBox.size || top(a) - top(b));
   return asTitle(titles[0], pageW);
@@ -4118,7 +4119,18 @@ function pageTitleBoxes(reportColors, page) {
   const pageW = Math.max(...onPage.map((v) => Number(v.position.x || 0) + Number(v.position.width || 0)).filter(isFinite), 1);
   const heads = onPage.filter((v) => isPageHeading(v, onPage, pageW));
   heads.sort((a, b) => Number(a.position.y) - Number(b.position.y) || Number(a.position.x) - Number(b.position.x));
-  return heads.slice(0, 3).map((v) => asTitle(v, pageW));
+  return heads.flatMap((v) => headingLines(asTitle(v, pageW))).slice(0, 4);
+}
+/* A heading box of several lines as one title per line, each in its own type */
+function headingLines(box) {
+  if (box.lines <= 1 || !box.runs) return [box];
+  const lines = [[]];
+  for (const r of box.runs) { if (r.text === "\n") lines.push([]); else lines[lines.length - 1].push(r); }
+  return lines.filter((runs) => runs.some((r) => r.text.trim())).map((runs) => {
+    const sizes = runs.map((r) => r.size ?? TEXT_BOX_DEFAULT_PT);
+    const main = runs[sizes.indexOf(Math.max(...sizes))];
+    return { ...box, text: runs.map((r) => r.text).join("").trim(), lines: 1, size: Math.max(...sizes), bold: main.bold, color: main.color, face: main.face, runs };
+  });
 }
 function asTitle(t, pageW) {
   // left, centre or right, by where its middle sits across the page
