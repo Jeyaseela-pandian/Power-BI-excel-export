@@ -5973,6 +5973,15 @@ function cartesianXml(plan, look, box, hidden) {
       overlays.push({ ...t.s, name: t.s.name, values: t.values, literal: true, noLegend: true, lineLook: lineLookOf(t.s),
         labelsXml: labelsOn && grouping === "standard" ? seriesLabelsXml("line", grouping, t.s.color, labelNumFmt(t.s.fmt, labelVals, look.labels), look.labels) : "" });
     }
+    // Total labels over a stacked area (Power BI's "Total labels"): an unseen line along the
+    // stacks' tops, labelled with each total above it
+    if (stacked && look.totals.show) {
+      const sums = plan.categories.map((_, ci) => main.reduce((a, [s]) => a + (typeof s.values[ci] === "number" ? s.values[ci] : 0), 0));
+      const unit = look.totals.units > 0 ? look.totals.units : labelAutoUnit(maxAbsOf(sums));
+      const dec = look.totals.precision !== null && look.totals.precision !== undefined ? look.totals.precision : null;
+      const pts = sums.map((v, idx) => ({ idx, text: displayValue(v, fmt0, unit, dec), pos: "t" }));
+      overlays.push({ name: "Total", values: sums, fmt: fmt0, literal: true, hidden: true, noLegend: true, labelsXml: textLabelsXml(pts, look.totals.text) });
+    }
   }
   if (combineTrend) {
     // One trend over the series together (Power BI's "combine series"): through their average

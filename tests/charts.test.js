@@ -217,6 +217,21 @@ test("labels past the bar's end get room: the axis runs on to a whole step until
   assert.strictEqual(Number((run("chartXml(ax).xml").match(/<c:valAx>[\s\S]*?<c:max val="([^"]+)"/) || [])[1]), 0.35);
 });
 
+test("a stacked area's total labels, when the report turns them on, sit above each stack", () => {
+  const totals = (on) => {
+    ctx.T = { type: "stackedAreaChart", title: "t", rows: [["Period", "Area", "Actual"], ["1", "BU", "$600000"], ["1", "RD", "$1400000"], ["2", "BU", "$1500000"], ["2", "RD", "$3500000"], ["3", "BU", "$2600000"], ["3", "RD", "$5400000"]] };
+    ctx.I = { rule: "legend", series: { ref: "area", label: "area" }, category: { ref: "period", label: "period" }, categories: [{ ref: "period", label: "period" }],
+      measures: [{ ref: "actual", label: "actual", role: "Y" }], overrides: {}, rules: [], tooltips: [], roles: {} };
+    ctx.P = PALETTE;
+    run(`T.colorInfo = I; T.colors = columnColors(T, P, I); T.themePalette = P; var sa = chartPlan(T); var sal = chartLook({ type: T.type }, null); sal.totals.show = ${on};
+      Object.assign(sa, { look: sal, sizePx: { w: 520, h: 320 }, title: "t", showTitle: true });
+      sa.refs = { catRef: "D!A1:A2", series: sa.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B3" })), range: () => "D!B2" };`);
+    return [...run("chartXml(sa).xml").matchAll(/<c:dLbl><c:idx val="\d+"\/><c:tx><c:rich>[\s\S]*?<a:t>([^<]*)<\/a:t>/g)].map((m) => m[1]);
+  };
+  assert.deepStrictEqual(totals(true), ["$2M", "$5M", "$8M"]);
+  assert.deepStrictEqual(totals(false), [], "no totals unless the report turns them on");
+});
+
 test("ribbon charts stay tables", () => {
   assert.strictEqual(run(`chartSpecOf("ribbonChart")`), null);
   assert.ok(run(`chartSpecOf("columnChart")`));
