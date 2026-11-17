@@ -232,6 +232,33 @@ test("a stacked area's total labels, when the report turns them on, sit above ea
   assert.deepStrictEqual(totals(false), [], "no totals unless the report turns them on");
 });
 
+/* A line or area chart's axis: "category" (evenly spaced) or { min, max, step, fmt } (spaced by value) */
+function numberAxis(type, rows) {
+  ctx.T = { type, title: "t", rows };
+  ctx.I = { rule: "measure", category: { ref: rows[0][0].toLowerCase(), label: rows[0][0].toLowerCase() }, categories: [{ ref: rows[0][0].toLowerCase(), label: rows[0][0].toLowerCase() }],
+    measures: rows[0].slice(1).map((h) => ({ ref: h.toLowerCase(), label: h.toLowerCase(), role: "Y" })), overrides: {}, rules: [], tooltips: [], roles: {} };
+  ctx.P = PALETTE;
+  run(`T.colorInfo = I; T.colors = columnColors(T, P, I); T.themePalette = P; var na = chartPlan(T);
+    Object.assign(na, { look: chartLook({ type: T.type }, null), sizePx: { w: 420, h: 300 }, title: "t", showTitle: true });
+    na = withDateAxis(withNumberAxis(withNumberOrder(na)));
+    na.refs = { catRef: "D!A1:A2", series: na.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B3" })), range: () => "D!B2" };`);
+  const ax = (run("chartXml(na).xml").match(/<c:dateAx>[\s\S]*?<\/c:dateAx>/) || [""])[0];
+  if (!ax) return "category";
+  const val = (tag) => (ax.match(new RegExp(`<c:${tag} val="([^"]+)"`)) || [])[1];
+  return { min: Number(val("min")), max: Number(val("max")), step: Number(val("majorUnit")), fmt: (ax.match(/formatCode="([^"]+)"/) || [])[1] };
+}
+
+test("whole numbers on a line or area axis are spaced by value, on round steps", () => {
+  assert.deepStrictEqual(numberAxis("lineChart", [["RecoveryDay", "Score"], ["1", "2"], ["3", "3.5"], ["7", "5"], ["14", "6"], ["30", "7"], ["60", "8"]]),
+    { min: 0, max: 60, step: 20, fmt: "#,##0" });
+  assert.deepStrictEqual(numberAxis("lineChart", [["Year", "Sales"], ["2019", "5"], ["2020", "6"], ["2022", "7"], ["2024", "9"]]),
+    { min: 2019, max: 2024, step: 1, fmt: "0" }, "years read 2019, not 2,019");
+  // text, decimals and column charts keep their evenly spaced axis
+  assert.strictEqual(numberAxis("lineChart", [["Month", "Sales"], ["Jan", "5"], ["Feb", "6"]]), "category");
+  assert.strictEqual(numberAxis("lineChart", [["Score", "Count"], ["0.5", "5"], ["1.5", "6"]]), "category");
+  assert.strictEqual(numberAxis("clusteredColumnChart", [["Period", "Actual"], ["1", "5"], ["3", "6"]]), "category");
+});
+
 test("ribbon charts stay tables", () => {
   assert.strictEqual(run(`chartSpecOf("ribbonChart")`), null);
   assert.ok(run(`chartSpecOf("columnChart")`));

@@ -3500,7 +3500,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
       }
       if (chartTitle) item.chart.title = chartTitle;
       Object.assign(item.chart, { look, sizePx: item.chart.sizePx || chartSizePx(item), showTitle: !(info && info.titleHidden) && look.title.show !== false });
-      item.chart = withDateAxis(withNumberOrder(item.chart));
+      item.chart = withDateAxis(withNumberAxis(withNumberOrder(item.chart)));
       // A chart Excel's part can't be written for stays a table, so the rest of the file is still made
       const broken = chartBuildError(item.chart);
       if (broken) {
@@ -4469,7 +4469,7 @@ function boxPlan(item) {
 const DATE_STEPS = [[1, "days", 1], [7, "days", 7], [1, "months", 30.44], [2, "months", 60.9], [3, "months", 91.3], [6, "months", 182.6],
   [1, "years", 365.25], [2, "years", 730.5], [5, "years", 1826], [10, "years", 3652]];
 function withDateAxis(plan) {
-  if (!plan || !["line", "area"].includes(plan.spec.kind) || plan.multiLevel) return plan;
+  if (!plan || !["line", "area"].includes(plan.spec.kind) || plan.multiLevel || plan.dateAxis) return plan;
   if (plan.look && plan.look.cat.continuous === false) return plan;
   const parsed = plan.categories.map((c) => { const t = String(c ?? "").trim(); return t ? parseDate(t) : null; });
   const blank = plan.categories.map((c) => !String(c ?? "").trim());
@@ -4521,7 +4521,7 @@ function panelPlans(item, info, look, palette) {
     let plan = chartPlan(part);
     if (!plan) return null;
     Object.assign(plan, { title: pn.value, look: panelLook, sizePx: { w, h }, showTitle: true });
-    plan = withDateAxis(withNumberOrder(plan));
+    plan = withDateAxis(withNumberAxis(withNumberOrder(plan)));
     if (chartBuildError(plan)) return null;
     plans.push(plan);
   }
@@ -4564,6 +4564,28 @@ function chartBuildError(plan) {
   } catch (e) {
     return e;
   }
+}
+
+/*
+ * Whole numbers on a line or area chart's axis (RecoveryDay 1, 3, 7, 14, 30, 60) are spaced by
+ * value, as on Power BI's continuous axis: Excel's date axis takes the numbers as its positions
+ * and shows them as numbers, on round steps up to the highest (0, 20, 40, 60). Negative or
+ * fractional numbers, or an axis the report sets to Categorical, keep the category axis.
+ */
+function withNumberAxis(plan) {
+  if (!plan || !["line", "area"].includes(plan.spec.kind) || plan.multiLevel || plan.dateAxis) return plan;
+  if (plan.look && plan.look.cat.continuous === false) return plan;
+  const nums = plan.categories.map((c) => { const t = String(c ?? "").trim().replace(/,/g, ""); return /^\d+$/.test(t) ? Number(t) : null; });
+  if (nums.length < 2 || nums.some((n) => n === null || n > 2958465)) return plan;
+  const plotPx = Math.max(120, ((plan.sizePx && plan.sizePx.w) || 400) - 90);
+  const scale = valueScale(nums, plotPx, 90, { zero: false, round: true });
+  if (!scale || !(scale.step > 0)) return plan;
+  // from the step at or below the lowest number (ticks then fall on round numbers) to the highest
+  const lo = Math.max(0, Math.floor(Math.min(...nums) / scale.step) * scale.step);
+  const hi = Math.max(...nums);
+  const years = nums.every((n) => n >= 1900 && n <= 2100);
+  return { ...plan, dateAxis: { serials: nums, unit: scale.step, timeUnit: "days", fmt: years ? "0" : "#,##0", cellFmt: years ? "0" : "#,##0",
+    min: lo, max: hi > lo ? hi : lo + scale.step, numbers: true } };
 }
 
 /* Shared helpers for the chart builders below */
@@ -5288,7 +5310,7 @@ function writeChartDataSheet(wb, name, charts) {
       const cat = ws.getCell(hr + 1 + ri, 2 + off);
       if (p.dateAxis) {
         cat.value = p.dateAxis.serials[ri];
-        cat.numFmt = "m/d/yyyy";
+        cat.numFmt = p.dateAxis.cellFmt || "m/d/yyyy";
       } else {
         cat.value = p.catText ? p.catText[ri] : axisLabel(c);   // a date reads "1/15/2023" on the axis, an empty one "(Blank)"
       }
@@ -5574,7 +5596,8 @@ function catAxXml(id, crossId, pos, { reverse = false, hidden = false, title = n
 /* A date axis: dates spaced by time, labelled every few months or years ("Jul 2023") */
 function dateAxXml(id, crossId, { hidden = false, title = null, look = null, date }) {
   const lk = look || {};
-  return `<c:dateAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/></c:scaling>` +
+  const range = date.min !== undefined && date.max !== undefined ? `<c:max val="${date.max}"/><c:min val="${date.min}"/>` : "";
+  return `<c:dateAx><c:axId val="${id}"/><c:scaling><c:orientation val="minMax"/>${range}</c:scaling>` +
     `<c:delete val="${hidden && !title ? 1 : 0}"/><c:axPos val="b"/>${hidden ? "" : gridXml(lk.grid)}` + (title ? axisTitleXml(title, lk.titleFont) : "") +
     `<c:numFmt formatCode="${xmlEsc(date.fmt)}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/>` +
     `<c:tickLblPos val="${hidden ? "none" : "low"}"/><c:spPr><a:ln><a:noFill/></a:ln></c:spPr>${txPrA(lk.text)}` +
