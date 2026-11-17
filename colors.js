@@ -865,7 +865,8 @@ function chartLook(visual, theme) {
     ...text("title", { ...titleClass, colorProp: "fontColor" }), align: String(get("title", "alignment") || "left").toLowerCase(),
     background: get("title", "background") || null };
   const subText = get("subTitle", "text");
-  const subtitle = shown("subTitle", false) && subText ? { text: String(subText), ...text("subTitle", { size: 10, face: labelFace, color: LABEL_GREY, colorProp: "fontColor" }) } : null;
+  // shown without text of its own: Power BI's automatic subtitle ("by Mth and Year"), text: null
+  const subtitle = shown("subTitle", false) ? { text: subText ? String(subText) : null, ...text("subTitle", { size: 10, face: labelFace, color: LABEL_GREY, colorProp: "fontColor" }) } : null;
   const bgShow = shown("background", true);
   const frame = {
     background: bgShow ? get("background", "color") || (theme && theme.background) || "#FFFFFF" : null,
