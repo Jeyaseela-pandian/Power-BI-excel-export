@@ -193,3 +193,28 @@ test("a total from Power BI on the rows' scale: a measure returning 10.76 with a
   // not a percentage: unchanged
   assert.strictEqual(json(`onRowsScale(1076, [10, 12], "#,##0")`), 1076);
 });
+
+test("a condition filter for the query service in Power BI's own words ('RELATIVE MONTH ≥ -19 and is not blank')", () => {
+  const { json } = loadApp();
+  const filter = { target: { table: "Opportunity Calendar", column: "RELATIVE MONTH" }, logicalOperator: "And",
+    conditions: [{ operator: "GreaterThanOrEqual", value: -19 }, { operator: "IsNotBlank" }] };
+  const where = json(`semanticWhere(${JSON.stringify([filter])}, (entity, prop) => ({ Column: { Expression: { SourceRef: { Source: "o11" } }, Property: prop } }))`);
+  // exactly as the Regional Sales report writes this filter in its own queries
+  const col = { Column: { Expression: { SourceRef: { Source: "o11" } }, Property: "RELATIVE MONTH" } };
+  assert.deepStrictEqual(where, [{ Condition: { And: {
+    Left: { Comparison: { ComparisonKind: 2, Left: col, Right: { Literal: { Value: "-19L" } } } },
+    Right: { Not: { Expression: { Comparison: { ComparisonKind: 0, Left: col, Right: { Literal: { Value: "null" } } } } } } } } }]);
+  // an operator Power BI's query can't take: the query isn't made (as before)
+  assert.throws(() => json(`semanticWhere(${JSON.stringify([{ target: filter.target, conditions: [{ operator: "Unknown", value: 1 }] }])}, () => ({}))`));
+});
+
+test("a renamed matrix column takes the report's units by its field ('Qualified Pipeline' in K), and a fixed unit stays on its total", () => {
+  const { ctx, json } = loadApp();
+  const f = (kind, entity, prop, label) => ({ ref: prop.toLowerCase(), label, queryRef: `${entity}.${prop}`, field: { kind, entity, prop } });
+  ctx.INFO = { roles: { Values: [f("measure", "Opportunities", "Revenue Won", null), f("measure", "Opportunities", "Revenue In Pipeline", "qualified pipeline")] },
+    columnUnits: { "m:revenue won": { units: 1000, precision: null }, "m:revenue in pipeline": { units: 1000, precision: null } } };
+  ctx.ITEM = { type: "pivotTable", rows: [["Product", "Revenue Won", "Qualified Pipeline"], ["Black cover 7\"", "$1512090.00", "$2259504.00"], ["E-reader pen", "$1509290.00", "$2717228.00"]] };
+  const fmts = json("reportFormats(ITEM, INFO)");
+  assert.ok(/,"K"/.test(fmts[1]) && /,"K"/.test(fmts[2]), JSON.stringify(fmts));
+  assert.deepStrictEqual(json("ITEM.fixedUnits"), [false, true, true]);
+});

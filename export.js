@@ -995,14 +995,24 @@ function reportFormats(item, info) {
   const { header, data } = classifyColumns(item.rows);
   const cells = data.map((row) => header.map((_, ci) => toCellValue(row[ci])));
   const readable = readableFormats(header, cells);
+  // a column renamed in the visual ("Qualified Pipeline") has its settings under its field
+  // ("Opportunities.Revenue In Pipeline")
+  const entries = info.roles ? fieldsByColumn(header, Object.values(info.roles).flat()) : header.map(() => null);
+  const settingFor = (name, ci) => {
+    const e = entries[ci];
+    const keys = [name, e && e.queryRef, e && e.field && e.field.prop].filter(Boolean).map((k) => "m:" + normalizeField(k));
+    return keys.map((k) => set[k]).find(Boolean) || null;
+  };
   let changed = false;
+  item.fixedUnits = header.map(() => false);
   const out = header.map((name, ci) => {
-    const s = set["m:" + normalizeField(name)];
+    const s = settingFor(name, ci);
     const nums = cells.map((r) => r[ci].value).filter((v) => typeof v === "number");
     if (!s || !nums.length) return own[ci] || null;
     const base = own[ci] || readable[ci] || (cells.map((r) => r[ci]).find((c) => c.numFmt) || {}).numFmt || "#,##0";
     if (/[dmyhs]/i.test(base.replace(/"[^"]*"/g, ""))) return own[ci] || null;   // dates
     changed = true;
+    item.fixedUnits[ci] = s.units > 1;   // the column's unit set in the report: its total keeps it
     // a table's "Auto" units show the full number, as Power BI's tables do
     return labelNumFmt(base, nums, { units: s.units > 0 ? s.units : 1, precision: s.precision });
   });
@@ -1703,7 +1713,8 @@ function writeTotalsRow(ws, row, col, item, hr, n, lay, table) {
       return;
     }
     cell.value = { formula: `SUBTOTAL(${SUBTOTAL_FN[kind]},${colRange(ws, col + ci, hr + 1, hr + n)})`, result: subtotalOf(kind, values) };
-    if (fmt) cell.numFmt = unitForTotal(fmt, cell.value.result);
+    // a unit the report sets for the column (thousands: $11,429.83K) stays on its total
+    if (fmt) cell.numFmt = item.fixedUnits && item.fixedUnits[ci] ? fmt : unitForTotal(fmt, cell.value.result);
     cell.alignment = { vertical: "middle", horizontal: "right", indent: 2 };
   });
   if (!kinds[0]) {
@@ -7557,8 +7568,28 @@ function semanticWhere(filters, column) {
   for (const f of filters || []) {
     const t = f && f.target;
     if (t && t.measure) continue;
-    if (!t || !t.table || !t.column || f.timeUnitType !== undefined || f.itemCount !== undefined || f.hierarchyData || f.conditions) {
+    if (!t || !t.table || !t.column || f.timeUnitType !== undefined || f.itemCount !== undefined || f.hierarchyData) {
       throw new Error(`filter on ${targetName(t)} can't be applied to the query`);
+    }
+    if (f.conditions) {
+      // "≥ -19 and is not blank": each condition as Power BI writes it (a comparison, 0 =, 1 >,
+      // 2 ≥, 3 ≤, 4 <; blank as null), joined with And / Or
+      if (!f.conditions.length) continue;
+      const col = () => column(t.table, t.column);
+      const cmp = (kind, v) => ({ Comparison: { ComparisonKind: kind, Left: col(), Right: literal(v) } });
+      const not = (e) => ({ Not: { Expression: e } });
+      const text = (op, v) => ({ [op]: { Left: col(), Right: literal(v) } });
+      const SEMANTIC = { Is: (v) => cmp(0, v), IsNot: (v) => not(cmp(0, v)), GreaterThan: (v) => cmp(1, v), GreaterThanOrEqual: (v) => cmp(2, v),
+        LessThanOrEqual: (v) => cmp(3, v), LessThan: (v) => cmp(4, v), IsBlank: () => cmp(0, null), IsNotBlank: () => not(cmp(0, null)),
+        Contains: (v) => text("Contains", v), DoesNotContain: (v) => not(text("Contains", v)), StartsWith: (v) => text("StartsWith", v), DoesNotStartWith: (v) => not(text("StartsWith", v)) };
+      const parts = f.conditions.map((x) => {
+        const fn = SEMANTIC[x.operator];
+        if (!fn) throw new Error(`filter "${x.operator}" on ${t.column} can't be applied to the query`);
+        return fn(x.value);
+      });
+      const joined = parts.reduce((a, b) => ({ [f.logicalOperator === "Or" ? "Or" : "And"]: { Left: a, Right: b } }));
+      out.push({ Condition: joined });
+      continue;
     }
     if (!f.values || !f.values.length || f.operator === "All") continue;
     if (f.values.some(Array.isArray)) throw new Error(`filter on ${targetName(t)} can't be applied to the query`);
