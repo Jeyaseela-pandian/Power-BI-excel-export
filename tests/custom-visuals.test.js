@@ -63,3 +63,18 @@ test("a Dual KPI in tables mode: its trend cards, as before", () => {
   const { run } = layout({ type: DUAL_KPI, title: "DK1", rows: DK_ROWS }, DK_INFO, "tables");
   assert.ok(!run("(LAY.charts || []).length"), "no charts in tables mode");
 });
+
+test("the KPI visual in charts mode: its area chart, the value in its status colour with the goal under it, no axis", () => {
+  const rows = [["Date", "Sales Amount", "Sales Target"], ["1/1/2024", "20000", "22000"], ["2/1/2024", "60000", "66000"], ["12/1/2025", "114654.73", "126120.20"]];
+  const f = (kind, entity, prop) => ({ ref: prop.toLowerCase(), label: null, field: { kind, entity, prop } });
+  const info = loadApp().json(`visualColorInfo(${JSON.stringify({ type: "kpi", objects: {}, container: {}, dataPoint: [], bubbles: [], values: [],
+    roles: { Indicator: [f("measure", "Detail", "Sales Amount")], TrendLine: [f("column", "Detail", "Date")], Goal: [f("measure", "Detail", "Sales Target")] } })}, null)`);
+  const { run } = layout({ type: "kpi", title: "AV27 KPI with trend and goal", rows }, info);
+  const g = JSON.parse(run("JSON.stringify(LAY.charts[0].plan.panels, (k, v) => (k === 'look' ? undefined : v))"));
+  assert.strictEqual(g.plans.length, 1);
+  assert.deepStrictEqual(g.plans[0].overlay.lines.map((l) => l.text), ["114.65K !", "Goal: 126.12K (-9.09%)"]);
+  assert.strictEqual(g.plans[0].axes.val.show, false, "no axis, as the KPI visual");
+  assert.ok(!run("(LAY.sparklines || []).length"), "no sparkline");
+  // tables mode: its trend card, as before
+  assert.ok(!layout({ type: "kpi", title: "AV27", rows }, info, "tables").run("(LAY.charts || []).length"));
+});

@@ -1600,6 +1600,9 @@ function kpiTrend(item, info, colorsOn) {
       text: typeof actual === "number" ? (compact ? compactText(actual, fmt) : displayText(actual, fmt)) : "(Blank)",
       note, color: colorsOn ? statusHex : null, valueColor: colorsOn && status ? statusHex : null,
       noSpark: b.showTrend === false, min: null, max: null,
+      // for the KPI drawn as a chart (charts mode): its numbers as the visual shows them
+      kpi: { actual, goals, goalText: b.showGoal !== false ? b.goalText || "Goal" : null, fmt, status,
+        distance: note.length > (goals.length && b.showGoal !== false ? 1 : 0) ? note[note.length - 1][0].trim() : null },
     }],
     captionRuns: [
       [`${header[trendCol]}  ${label(cells[order[0]][trendCol].value)} – ${label(last[trendCol].value)}`, "plain"],
@@ -3589,9 +3592,9 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
     item.tableFormat = item.gridFormat || (info && info.tableFormats && info.tableFormats.length ? info : null);
     item.colorInfo = info;
     item.themePalette = lay.palette && lay.palette.length ? lay.palette : null;   // colours for charts without their own settings
-    // charts mode only; a Dual KPI's trend cards become its two area charts (dualKpiChart)
-    item.chart = options.visualsAs !== "charts" ? null
-      : item.trend ? ((customVisual(item.type) || {}).layout === "trend" ? dualKpiChart(item) : null) : chartPlan(item);
+    // charts mode only; a trend visual (Dual KPI, the KPI visual) is drawn as its area charts
+    // (trendChart), never as trend cards there; tables mode keeps the cards
+    item.chart = options.visualsAs !== "charts" ? null : item.trend ? trendChart(item) : chartPlan(item);
     if (item.chart) {
       // The visual's format settings (Power BI's defaults without the report file)
       const reportLook = (info && info.look) || chartLook({ type: item.type }, null);
@@ -3624,7 +3627,7 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
         item.chart = null;
       }
       if (item.chart && item.panels) item.chart.panels = panelPlans(item, info, look, lay.palette);
-      if (item.chart && item.chart.dualKpi) item.chart.panels = dualKpiPanels(item, look);
+      if (item.chart && item.chart.trendCards) item.chart.panels = trendPanels(item, look);
       if (item.chart && !item.chart.panels) item.chart = growForLegend(item.chart);
     }
     if (item.chart && item.chart.note) colorNotes.push(item.chart.note);
@@ -4804,17 +4807,26 @@ function withNumberOrder(plan) {
  * is the trend cards' (dualKpiTrend), in date order.
  */
 const DUAL_KPI_FOOT_PX = 18;
-function dualKpiChart(item) {
+function trendChart(item) {
   const t = item.trend;
-  if (!t || !t.cards.length || t.points < 2) return null;
+  // a card without its trend (the KPI visual's "Trend axis" off) stays a card
+  if (!t || !t.cards.length || t.points < 2 || t.cards.some((c) => c.noSpark)) return null;
   const [header, ...rows] = item.rows;
   const pts = rows.slice(0, t.points);
   const series = t.cards.map((card) => ({ name: card.label, values: pts.map((r) => { const v = toCellValue(String(r[card.col] ?? "")).value; return typeof v === "number" ? v : null; }),
     fmt: (pts.map((r) => toCellValue(String(r[card.col] ?? ""))).find((c) => typeof c.value === "number") || {}).numFmt || "#,##0", color: card.color ? toArgb(card.color) : null }));
   return { spec: { kind: "area", grouping: "standard" }, title: item.displayTitle || item.title, catName: header[t.dateCol],
-    categories: pts.map((r) => String(r[t.dateCol] ?? "")), series, pointColors: null, axes: null, dualKpi: true };
+    categories: pts.map((r) => String(r[t.dateCol] ?? "")), series, pointColors: null, axes: null, trendCards: true };
 }
-function dualKpiPanels(item, look) {
+/* The KPI visual's numbers: display units Auto, two decimals (114.65K, $1.20M) */
+function kpiShort(v, fmt) {
+  if (typeof v !== "number") return "(Blank)";
+  const unit = autoUnit(Math.abs(v));
+  if (unit <= 1) return displayText(v, fmt);
+  const prefix = fmtPrefix(String(fmt || "")).replace(/^"|"$/g, "").replace(/^\\/, "");
+  return `${v < 0 ? "-" : ""}${prefix}${(Math.abs(v) / unit).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${PBI_UNITS[unit] ? PBI_UNITS[unit][0] : ""}`;
+}
+function trendPanels(item, look) {
   const base = item.chart, t = item.trend;
   const total = base.sizePx || chartSizePx(item);
   const head = base.showTitle && base.title ? PANEL_TITLE_PX : 0;
@@ -4830,11 +4842,17 @@ function dualKpiPanels(item, look) {
     const s = base.series[k];
     const vals = s.values.filter((v) => typeof v === "number");
     const lo = card.min ?? Math.min(...vals), hi = card.max ?? Math.max(...vals);
+    // The KPI visual: no axis; its value in the status colour with the status mark, the goal under it
+    const kpi = card.kpi;
+    const lines = kpi
+      ? [{ text: kpiShort(kpi.actual, kpi.fmt) + (kpi.status === "bad" ? " !" : kpi.status === "good" ? " \u2713" : ""), font: { ...valueFont, color: card.valueColor || valueFont.color } },
+        ...(kpi.goalText && kpi.goals.length ? [{ text: `${kpi.goalText}: ${kpi.goals.map((g) => kpiShort(g, kpi.fmt)).join(", ")}${kpi.distance ? ` ${kpi.distance}` : ""}`, font: { ...labelFont, size: 9 } }] : [])]
+      : [{ text: card.change ? `${card.label} (${card.change})` : card.label, font: labelFont }, { text: card.text, font: valueFont }];
     return { spec: base.spec, title: card.label, catName: base.catName, categories: base.categories, pointColors: null,
-      series: [s], look: plainLook, sizePx: { w, h }, showTitle: false,
-      axes: { cat: { show: false, title: false }, val: { show: true, title: false } },
+      series: [kpi && card.color ? { ...s, color: toArgb(card.color) } : s], look: plainLook, sizePx: { w, h }, showTitle: false,
+      axes: { cat: { show: false, title: false }, val: { show: !kpi, title: false } },
       axisEnds: hi > lo ? { min: lo, max: hi } : null,
-      overlay: { height: 44, lines: [{ text: card.change ? `${card.label} (${card.change})` : card.label, font: labelFont }, { text: card.text, font: valueFont }] } };
+      overlay: { height: 44, lines } };
   });
   const c = t.caption || {};
   const footer = c.days !== undefined ? { text: `Last ${c.days} days`, align: "right", font: { ...LOOK_TEXT, size: 9, italic: true, color: "#605E5C" } } : null;
