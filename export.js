@@ -5462,6 +5462,11 @@ function labelNumFmt(fmt, values, cfg, minDecimals = 0, auto = labelAutoUnit) {
   if (s.includes("%")) return precision !== null ? unitFormat(s, 1, precision) : s;
   const unit = cfg && cfg.units > 0 ? cfg.units : auto(maxAbsOf(values));
   if (unit <= 1 && precision === null) return s;
+  // A whole-number measure shortened (data labels): Power BI shows one decimal below ten of the
+  // unit and none from there (6.8K, 33K, $11M), label by label, as Excel's conditional format does
+  if (unit > 1 && precision === null && minDecimals === 0 && fmtDecimals(s) === 0 && values.every((v) => typeof v !== "number" || v >= 0)) {
+    return `[>=${9.95 * unit}]${unitFormat(s, unit, 0)};${unitFormat(s, unit, 1)}`;
+  }
   return unitFormat(s, unit, precision !== null ? precision : unit > 1 ? Math.max(minDecimals, fmtDecimals(s)) : null);
 }
 /* A number as label text, for labels written as text (pie slices, analytics lines) */

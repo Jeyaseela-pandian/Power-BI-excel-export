@@ -276,6 +276,16 @@ test("a line the report shows as markers only ('Show line' off) has no line; oth
   assert.match(normal, /<c:smooth val="1"\/>/, "smooth lines as the report sets them");
 });
 
+test("shortened labels of a whole-number measure: one decimal below ten of the unit (6.8K), none from there (33K)", () => {
+  const fmt = (f, values) => { ctx.F = f; ctx.V = values; return run("labelNumFmt(F, V, { units: 0, precision: null })"); };
+  assert.strictEqual(fmt("#,##0", [6800, 6400, 2200, 13200]), '[>=9950]#,##0,"K";#,##0.0,"K"');
+  assert.strictEqual(fmt('"$"#,##0', [11000000, 5200000]), '[>=9950000]"$"#,##0,,"M";"$"#,##0.0,,"M"');
+  // the measure's own decimals, numbers below 10,000 and percentages: unchanged
+  assert.strictEqual(fmt('"$"#,##0.00', [11520000]), '"$"#,##0.00,,"M"');
+  assert.strictEqual(fmt("#,##0", [2128, 701]), "#,##0");
+  assert.strictEqual(fmt("0.0%", [0.309]), "0.0%");
+});
+
 test("ribbon charts stay tables", () => {
   assert.strictEqual(run(`chartSpecOf("ribbonChart")`), null);
   assert.ok(run(`chartSpecOf("columnChart")`));
