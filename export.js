@@ -5960,6 +5960,11 @@ function cartesianXml(plan, look, box, hidden) {
       : valueScale([...mainVals, ...refConst], axisPx, gapPx, { zero: isBar, round: roomForLabels, start: look.val.start, end: look.val.end });
   if (spec.mirror && axis) { axis.max = Math.max(axis.max, -axis.min); axis.min = -axis.max; }
   const fmt0 = (main[0] ? main[0][0] : series[0]).fmt;
+  // Display units "Auto" for the labels on the main axis follow where the axis ends: the
+  // gridline at or above the largest value (8,468 under a 10K gridline shows 8.5K; 2,128 under
+  // 2,500 stays 2,128), taken before any room added for the labels themselves
+  const gridTop = axis && !pct && axis.step > 0 ? Math.ceil(maxAbsOf(mainVals) / axis.step - 1e-9) * axis.step : 0;
+  const labelAuto = (m) => labelAutoUnit(m > 0 ? Math.max(m, gridTop) : m);
   // Labels past the bar's end need room before the axis ends: as Power BI, the axis runs on a
   // step at a time until the largest label fits (not when the report sets the axis's end)
   const outside = roomForLabels && !pct && !spec.mirror && !/inside|center|base/i.test(String(look.labels.position || ""));
@@ -5970,8 +5975,10 @@ function cartesianXml(plan, look, box, hidden) {
     const top = Math.max(0, ...tops);
     if (top > 0) {
       const L = stacked && look.totals.show ? look.totals : look.labels;
-      const unit = L.units > 0 ? L.units : labelAutoUnit(maxAbsOf(tops));
-      const text = displayValue(top, fmt0, unit, L.precision ?? null);
+      const unit = L.units > 0 ? L.units : labelAuto(maxAbsOf(tops));
+      // the widest label as it shows: shortened labels take a decimal below ten of the unit (8.5K)
+      const dec = L.precision ?? (unit > 1 && fmtDecimals(String(fmt0 || "")) === 0 ? (top >= 9.95 * unit ? 0 : 1) : null);
+      const text = displayValue(top, fmt0, unit, dec);
       const labelPx = horizontal ? textPx(text, L.text) + 10 : lineHeightPx(L.text) + 6;
       const fits = () => ((top - axis.min) / (axis.max - axis.min)) * axisPx + labelPx <= axisPx;
       // first to the next whole step (the axis ends on a gridline), then a step more at a time
@@ -5998,13 +6005,13 @@ function cartesianXml(plan, look, box, hidden) {
     let sers = main.map(([s, i]) => chartSeriesXml("bar", {
       ...s,
       labelsXml: labelsOn && !s.hidden ? seriesLabelsXml("bar", grouping, s.color || (plan.pointColors || []).find(Boolean),
-        spec.mirror ? unsignedNumFmt(labelNumFmt(s.fmt, labelVals, look.labels)) : labelNumFmt(s.fmt, labelVals, look.labels), look.labels) : "",
+        spec.mirror ? unsignedNumFmt(labelNumFmt(s.fmt, labelVals, look.labels, 0, labelAuto)) : labelNumFmt(s.fmt, labelVals, look.labels, 0, labelAuto), look.labels) : "",
       trendXml: trendOn && !combineTrend && !s.hidden ? trendlineXml(look.trend) : "",
     }, i, plan, refs.series[i])).join("");
     // Total labels over each stack: an empty last segment labelled with the stack's total
     if (stacked && look.totals.show && !spec.hideValueAxis) {
       const totals = plan.categories.map((_, ci) => shown.reduce((a, s) => a + (typeof s.values[ci] === "number" ? s.values[ci] : 0), 0));
-      const unit = look.totals.units > 0 ? look.totals.units : labelAutoUnit(maxAbsOf(totals));
+      const unit = look.totals.units > 0 ? look.totals.units : labelAuto(maxAbsOf(totals));
       const dec = look.totals.precision !== null && look.totals.precision !== undefined ? look.totals.precision : null;
       const pts = totals.map((v, idx) => ({ idx, text: displayValue(v, fmt0, unit, dec), pos: "inBase" }));
       const idx = nextIdx++;
@@ -6025,17 +6032,17 @@ function cartesianXml(plan, look, box, hidden) {
     }
     groups += `<c:areaChart><c:grouping val="${grouping}"/><c:varyColors val="0"/>` +
       main.map(([s, i]) => chartSeriesXml("area", { ...s, alpha: look.areaOpacity,
-        labelsXml: labelsOn && grouping !== "standard" ? seriesLabelsXml("area", grouping, s.color, labelNumFmt(s.fmt, labelVals, look.labels), look.labels) : "" }, i, plan, refs.series[i])).join("") +
+        labelsXml: labelsOn && grouping !== "standard" ? seriesLabelsXml("area", grouping, s.color, labelNumFmt(s.fmt, labelVals, look.labels, 0, labelAuto), look.labels) : "" }, i, plan, refs.series[i])).join("") +
       `<c:axId val="${A1}"/><c:axId val="${A2}"/></c:areaChart>`;
     for (const t of tops) {
       overlays.push({ ...t.s, name: t.s.name, values: t.values, literal: true, noLegend: true, lineLook: lineLookOf(t.s),
-        labelsXml: labelsOn && grouping === "standard" ? seriesLabelsXml("line", grouping, t.s.color, labelNumFmt(t.s.fmt, labelVals, look.labels), look.labels) : "" });
+        labelsXml: labelsOn && grouping === "standard" ? seriesLabelsXml("line", grouping, t.s.color, labelNumFmt(t.s.fmt, labelVals, look.labels, 0, labelAuto), look.labels) : "" });
     }
     // Total labels over a stacked area (Power BI's "Total labels"): an unseen line along the
     // stacks' tops, labelled with each total above it
     if (stacked && look.totals.show) {
       const sums = plan.categories.map((_, ci) => main.reduce((a, [s]) => a + (typeof s.values[ci] === "number" ? s.values[ci] : 0), 0));
-      const unit = look.totals.units > 0 ? look.totals.units : labelAutoUnit(maxAbsOf(sums));
+      const unit = look.totals.units > 0 ? look.totals.units : labelAuto(maxAbsOf(sums));
       const dec = look.totals.precision !== null && look.totals.precision !== undefined ? look.totals.precision : null;
       const pts = sums.map((v, idx) => ({ idx, text: displayValue(v, fmt0, unit, dec), pos: "t" }));
       overlays.push({ name: "Total", values: sums, fmt: fmt0, literal: true, hidden: true, noLegend: true, labelsXml: textLabelsXml(pts, look.totals.text) });
@@ -6050,7 +6057,7 @@ function cartesianXml(plan, look, box, hidden) {
     groups += `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>` +
       main.map(([s, i]) => chartSeriesXml("line", {
         ...s, lineLook: lineLookOf(s),
-        labelsXml: labelsOn ? seriesLabelsXml("line", "standard", s.color, labelNumFmt(s.fmt, labelVals, look.labels), look.labels) : "",
+        labelsXml: labelsOn ? seriesLabelsXml("line", "standard", s.color, labelNumFmt(s.fmt, labelVals, look.labels, 0, labelAuto), look.labels) : "",
         trendXml: trendOn && !combineTrend ? trendlineXml(look.trend) : "",
       }, i, plan, refs.series[i])).join("") +
       overlays.map((s) => { const idx = nextIdx++; hidden.push(idx); return chartSeriesXml("line", s, idx, plan, null); }).join("") +

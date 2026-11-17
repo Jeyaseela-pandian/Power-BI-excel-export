@@ -204,6 +204,18 @@ test("data labels: full numbers below 10,000, K from there, as Power BI's Auto u
   assert.ok(big.every((f) => /,,"M"/.test(f)), `millions: ${big}`);
 });
 
+test("data labels follow where the axis ends: bars up to 8,468 under a 10K gridline show 8.5K, and the axis stays at 10K", () => {
+  ctx.T = { type: "clusteredBarChart", title: "t", rows: [["Region", "Opportunity Count"], ["North America", "8468"], ["LATAM", "1315"], ["EMEA", "1149"], ["APAC", "488"]] };
+  ctx.P = PALETTE;
+  run(`T.colors = columnColors(T, P, null); T.themePalette = P; var oc = chartPlan(T); var ocl = chartLook({ type: T.type }, null); ocl.labels.show = true;
+    Object.assign(oc, { look: ocl, sizePx: { w: 385, h: 315 }, title: "t", showTitle: true });
+    oc.refs = { catRef: "D!A1:A4", series: oc.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B5" })), range: () => "D!B2" };`);
+  const xml = run("chartXml(oc).xml");
+  const fmt = ((xml.match(/<c:dLbls><c:numFmt formatCode="([^"]*)"/) || [])[1] || "").replace(/&quot;/g, '"');
+  assert.ok(/,"K"/.test(fmt) && /0\.0,"K"/.test(fmt), `8.5K, 0.5K: ${fmt}`);
+  assert.strictEqual(Number((xml.match(/<c:valAx>[\s\S]*?<c:max val="([^"]+)"/) || [])[1]), 10000, "8.5K fits before 10K");
+});
+
 test("labels past the bar's end get room: the axis runs on to a whole step until they fit", () => {
   ctx.T = { type: "clusteredBarChart", title: "t", rows: [["AgeGroup", "BadHire%ofActives"], ["<30", "30.90%"], ["30-49", "11.37%"], ["50+", "5.39%"]] };
   ctx.P = PALETTE;
