@@ -154,3 +154,30 @@ test("the totals row writes Power BI's value in the column's format, and Excel's
   assert.match(cells["9,4"].value.formula, /^SUBTOTAL\(9,/);
   assert.strictEqual(cells["9,2"].value, "Total");
 });
+
+test("Power BI's query service answers read right: a single total ({ M0 }) as well as rows (C)", () => {
+  const { json } = loadApp();
+  const descriptor = { Select: [{ Value: "M0", Name: "f0" }] };
+  // one total, nothing to group by: the value under its name, with or without a schema
+  assert.deepStrictEqual(json(`dsrRows({ PH: [{ DM0: [{ S: [{ N: "M0", T: 3 }], M0: 0.108 }] }] }, ${JSON.stringify(descriptor)}, 1)`), [[0.108]]);
+  assert.deepStrictEqual(json(`dsrRows({ PH: [{ DM0: [{ M0: 0.153 }] }] }, ${JSON.stringify(descriptor)}, 1)`), [[0.153]]);
+  // rows grouped by a column: values in C, repeats and dictionaries as before
+  const rows = json(`dsrRows({ ValueDicts: { D0: ["Europe", "Asia"] }, PH: [{ DM0: [{ S: [{ N: "G0", T: 1, DN: "D0" }, { N: "M0", T: 3 }], C: [0, 5] }, { C: [1, 7] }] }] },
+    { Select: [{ Value: "G0", Name: "f0" }, { Value: "M0", Name: "f1" }] }, 2)`);
+  assert.deepStrictEqual(rows, [["Europe", 5], ["Asia", 7]]);
+});
+
+test("a Viewer's table totals: asked of the query service, its single-total answer written in the Total row", async () => {
+  const { ctx, run, json } = loadApp();
+  const f = (kind, entity, prop) => ({ ref: prop.toLowerCase(), label: null, field: { kind, entity, prop } });
+  ctx.INFO = json(`visualColorInfo(${JSON.stringify({ type: "tableEx", objects: {}, container: {}, dataPoint: [], bubbles: [], values: [],
+    roles: { Values: [f("column", "Surgeons", "SurgeonName"), f("measure", "Metrics", "Readmission Rate")] } })}, null)`);
+  ctx.ITEM = { type: "tableEx", title: "t", page: "p", name: "t", rows: [["SurgeonName", "Readmission Rate"], ["Dr. A. Sharma", "10.4%"], ["Dr. C. Patel", "8.3%"]] };
+  // no model permission (a Viewer); the query service answers { M0: 0.108 }
+  run(`visualInfo = () => INFO;
+    executeDaxQuery = async () => ({ error: "no Build permission" });
+    websiteQuery = async (fields) => dsrRows({ PH: [{ DM0: [{ S: [{ N: "M0", T: 3 }], M0: 0.108 }] }] }, { Select: [{ Value: "M0", Name: "f0" }] }, fields.length);`);
+  await run("loadTableTotals([{ data: { items: [ITEM], queryFilters: [] } }], { reportColors: {} })");
+  assert.deepStrictEqual(json("ITEM.reportTotals"), { "readmission rate": 0.108 });
+  assert.deepStrictEqual(json("totalsPlan(ITEM, INFO).kinds"), [null, "report"]);
+});

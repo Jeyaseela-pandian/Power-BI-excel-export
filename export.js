@@ -7492,11 +7492,16 @@ function dsrRows(ds, descriptor, count) {
   for (const ph of ds.PH || []) {
     for (const r of ph.DM0 || []) {
       if (r.S) schema = r.S;
+      // A total with nothing to group by ("Readmission Rate" for all rows) comes as the value
+      // under its own name ({ "M0": 0.108 }), with or without a schema, rather than in C
+      const named = Object.keys(r).filter((k) => /^[MG]\d+$/.test(k));
+      if (!schema && named.length) schema = named.map((N) => ({ N }));
       if (!schema) continue;
       const c = [...(r.C || [])], repeat = r.R || 0, empty = r["Ø"] || 0;
       const vals = schema.map((col, i) => {
         if (repeat & (1 << i)) return prev[i];
         if (empty & (1 << i)) return null;
+        if (col.N in r && !Array.isArray(r[col.N])) return r[col.N];
         const v = c.shift();
         return col.DN && typeof v === "number" && dicts[col.DN] ? dicts[col.DN][v] : v;
       });
