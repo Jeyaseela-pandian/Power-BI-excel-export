@@ -2559,6 +2559,7 @@ function writeTrendSheet(wb, sheet) {
 
 /* KPI tiles show a title row only when the title adds something beyond the field name */
 function kpiHasTitle(item) {
+  if (item.type === "kpi") return false;   // the KPI visual's title is its tile's label (writeKpiBlock)
   return !!item.displayTitle && item.displayTitle.toLowerCase() !== String(item.rows[0][0] || "").toLowerCase();
 }
 
@@ -2648,8 +2649,12 @@ function writeKpiBlock(ws, r, col, item, widths, lay, divider, strip) {
     top = r + 1;
   }
 
-  // Merges keep each cell's own style, so the cap / rule borders survive on every cell
-  const labelText = String(header[0] ?? "").toLocaleUpperCase();
+  // Merges keep each cell's own style, so the cap / rule borders survive on every cell. The KPI
+  // visual shows its title over the value (its own, else the measure's name; none when hidden),
+  // not the measure's name as a card does
+  const kpiVisual = item.type === "kpi";
+  const kpiTitle = info && info.titleHidden ? "" : String(item.displayTitle || header[0] || "");
+  const labelText = kpiVisual ? kpiTitle : String(header[0] ?? "").toLocaleUpperCase();
   ws.mergeCellsWithoutStyle(top, col, top, col + 1);
   const label = ws.getCell(top, col);
   label.value = labelText;
@@ -4060,7 +4065,18 @@ function hfText(s) {
  * the page ("Warehouse Fulfillment Dashboard"); the largest when there are several, with its
  * alignment on the page. null when the page has none.
  */
-const PAGE_TITLE_MIN_PT = 16;
+const PAGE_TITLE_MIN_PT = 14;
+/* A text box that heads the page: one short line in large type (14pt or more), a fifth of the
+   page wide or more, above every chart and table */
+function isPageHeading(v, onPage, pageW) {
+  const top = (x) => Number(x.position.y);
+  const dataTops = onPage.filter((x) => x.visualType && !NON_DATA_TYPES.includes(x.visualType) && x.visualType !== "slicer").map(top).filter(isFinite);
+  const firstData = dataTops.length ? Math.min(...dataTops) : Infinity;
+  const W = pageW || Math.max(...onPage.map((x) => Number(x.position.x || 0) + Number(x.position.width || 0)).filter(isFinite), 1);
+  return !!(v.visualType === "textbox" && v.textBox && v.textBox.lines === 1 && v.textBox.size >= PAGE_TITLE_MIN_PT &&
+    v.textBox.text.length <= 70 && !/[.!?]$/.test(v.textBox.text) && Number(v.position.width || 0) >= W * 0.2 &&
+    isFinite(top(v)) && isFinite(firstData) && top(v) + Number(v.position.height || 0) <= firstData + 1);
+}
 function pageTitleBox(reportColors, page) {
   const visuals = (reportColors && reportColors.visuals) || {};
   const prefix = String(page && page.name) + "\u0001";
@@ -4069,6 +4085,7 @@ function pageTitleBox(reportColors, page) {
   const dataTops = onPage.filter((v) => v.visualType && !NON_DATA_TYPES.includes(v.visualType) && v.visualType !== "slicer").map(top).filter(isFinite);
   const firstData = dataTops.length ? Math.min(...dataTops) : Infinity;
   if (!isFinite(firstData)) return null;   // a page of text only: no heading over a chart or table
+  if (!onPage.some((v) => isPageHeading(v, onPage))) return null;
   // a title spans a good part of the page (a small badge such as "Free" isn't one)
   const pageW = Math.max(...onPage.map((v) => Number(v.position.x || 0) + Number(v.position.width || 0)).filter(isFinite), 1);
   // a heading, not a sentence: short, and not ending in a full stop
@@ -4077,7 +4094,22 @@ function pageTitleBox(reportColors, page) {
     isFinite(top(v)) && top(v) + Number(v.position.height || 0) <= firstData + 1);
   if (!titles.length) return null;
   titles.sort((a, b) => b.textBox.size - a.textBox.size || top(a) - top(b));
-  const t = titles[0];
+  return asTitle(titles[0], pageW);
+}
+/* Every heading box over the page's visuals, top to bottom ("REGIONAL SALES", then "Sales
+   Overview"), at most three */
+function pageTitleBoxes(reportColors, page) {
+  const first = pageTitleBox(reportColors, page);
+  if (!first) return [];
+  const visuals = (reportColors && reportColors.visuals) || {};
+  const prefix = String(page && page.name) + "\u0001";
+  const onPage = Object.keys(visuals).filter((k) => k.startsWith(prefix)).map((k) => visuals[k]).filter((v) => v && v.position);
+  const pageW = Math.max(...onPage.map((v) => Number(v.position.x || 0) + Number(v.position.width || 0)).filter(isFinite), 1);
+  const heads = onPage.filter((v) => isPageHeading(v, onPage, pageW));
+  heads.sort((a, b) => Number(a.position.y) - Number(b.position.y) || Number(a.position.x) - Number(b.position.x));
+  return heads.slice(0, 3).map((v) => asTitle(v, pageW));
+}
+function asTitle(t, pageW) {
   // left, centre or right, by where its middle sits across the page
   const mid = (Number(t.position.x || 0) + Number(t.position.width || 0) / 2) / pageW;
   return { ...t.textBox, align: mid < 0.34 ? "left" : mid > 0.66 ? "right" : "center" };
@@ -4096,7 +4128,8 @@ function writeTitleBox(ws, row, c1, c2, box) {
   const c = ws.getCell(row, c1);
   const scale = box.size > PAGE_TITLE_MAX_PT ? PAGE_TITLE_MAX_PT / box.size : 1;
   const fontOf = (r) => ({ name: r.face || box.face || "Segoe UI", size: Math.max(6, Math.round((r.size ?? TEXT_BOX_DEFAULT_PT) * scale)),
-    bold: !!r.bold, italic: !!r.italic, color: { argb: toArgb(r.color || "#252423") } });
+    // white or pale type (made for a dark banner the export doesn't draw) reads dark on the sheet
+    bold: !!r.bold, italic: !!r.italic, color: { argb: ((c) => (luminance(c) > 0.6 ? toArgb("#252423") : readableOnWhite(c)))(toArgb(r.color || "#252423")) } });
   const runs = (box.runs || []).filter((r) => r.text !== "\n");
   if (runs.length > 1) {
     c.value = { richText: runs.map((r) => ({ text: r.text, font: fontOf(r) })) };
@@ -4192,12 +4225,9 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
   }
   heights[row++] = 18;                           // spacer
   // The page's title text box ("Warehouse Fulfillment Dashboard"), above the visuals as in the report
-  const titleBox = data.items.length ? pageTitleBox(lay.reportColors, page) : null;
-  const titleBoxRow = titleBox ? row : null;
-  if (titleBox) {
-    heights[row++] = Math.round(Math.min(titleBox.size, PAGE_TITLE_MAX_PT) * 1.6);
-    heights[row++] = 8;                          // spacer
-  }
+  const titleBoxes = data.items.length ? pageTitleBoxes(lay.reportColors, page) : [];
+  const titleBoxRows = titleBoxes.map((b) => { const at = row; heights[row++] = Math.round(Math.min(b.size, PAGE_TITLE_MAX_PT) * 1.6); return at; });
+  if (titleBoxes.length) heights[row++] = 8;     // spacer
   const layoutStart = row;
 
   // 2. Visuals
@@ -4220,7 +4250,7 @@ function writePageSheet(wb, sheetName, page, data, options, branding, logo, name
     Math.ceil(metaText.length * 0.9) + 6, Math.ceil(longestFilterLine * 0.9) + 6);
   const { contentEnd, bandEnd } = widths.apply(ws, Math.max(layout.lastCol, B), minPage);
 
-  if (titleBox) writeTitleBox(ws, titleBoxRow, B, contentEnd, titleBox);
+  titleBoxes.forEach((b, k) => writeTitleBox(ws, titleBoxRows[k], B, contentEnd, b));
 
   // 4. Rules and fills
   paintRange(ws, 1, 1, bandEnd, { fill: solidFill(accent.rule) });
