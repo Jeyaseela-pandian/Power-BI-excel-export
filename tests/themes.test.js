@@ -138,3 +138,27 @@ test("a title text box in two looks is written in both: big and bold, then small
   const rich = cells["9,2"].value.richText;
   assert.deepStrictEqual(rich.map((r) => [r.text, r.font.size, r.font.bold]), [["CORPORATE SPEND SAMPLE PBIX ", 18, true], ["YTD IT Spend Trend Analysis", 10, false]]);
 });
+
+test("pie labels: the theme's style (value and share from CY19SU12, Fluent2), else Power BI's default, the category", () => {
+  const { json } = loadApp();
+  const style = (tc) => json(`(() => { const tc = ${JSON.stringify(tc)}; const t = withBaseThemeAxes(namedThemeFallback(tc, null), tc);
+    return chartLook({ type: "pieChart", objects: {}, container: {} }, t).labels.style; })()`);
+  // no theme (the HR sample) or the oldest base theme: the category ("Female", "Male")
+  assert.strictEqual(style(null), "Category");
+  assert.strictEqual(style({ baseTheme: { name: "CY18SU07" } }), "Category");
+  // newer base themes, by their name when the theme file can't be read (Viewers)
+  for (const name of ["CY19SU12", "CY24SU10", "CY26SU05", "Fluent2-CY26SU08"]) assert.strictEqual(style({ baseTheme: { name } }), "Data value, percent of total", name);
+  // the visual's own style wins
+  const own = { labels: [{ properties: { labelStyle: { expr: { Literal: { Value: "'Percent of total'" } } } } }] };
+  assert.strictEqual(json(`chartLook({ type: "pieChart", objects: ${JSON.stringify(own)}, container: {} }, withBaseThemeAxes(namedThemeFallback(null, null), null)).labels.style`), "Percent of total");
+  // the report's design not read: as before (value and share)
+  assert.strictEqual(json(`chartLook({ type: "pieChart", objects: {}, container: {} }, null).labels.style`), null);
+});
+
+test("a pie labelled by category shows the names, as Power BI does (Female, Male)", () => {
+  const { ctx, run, json } = loadApp();
+  ctx.T = { type: "pieChart", title: "t", rows: [["Gender", "BadHires"], ["Female", "15000"], ["Male", "17000"]] };
+  run(`T.colors = columnColors(T, ["#01B8AA", "#374649"], null); T.themePalette = ["#01B8AA", "#374649"]; var pp = chartPlan(T);
+    var pl = chartLook({ type: "pieChart" }, null); pl.labels.show = true; pl.labels.style = "Category"; pp.look = pl; pp.sizePx = { w: 300, h: 250 };`);
+  assert.deepStrictEqual(json("pieLabelPoints(pp, pl).map((p) => p.text)"), ["Female", "Male"]);
+});

@@ -651,14 +651,19 @@ async function websiteTheme(themeCollection, embedTheme) {
 }
 
 /* Power BI's base themes (CY24SU02, CY26SU05 …) turn every visual's axis titles on; its Fluent2
-   ones (Fluent2-CY26SU08 …) turn subtitles on instead. Their JSON is only in the report file, so
+   ones (Fluent2-CY26SU08 …) turn subtitles on instead; both label pie slices by value and share. Their JSON is only in the report file, so
    when it can't be read the export applies that setting by the base theme's name, under every
    other layer (an unknown base theme adds none) */
 function baseThemeAxisStyles(themeCollection) {
   const name = String(((themeCollection || {}).baseTheme || {}).name || "");
-  if (/^Fluent2-/i.test(name)) return { "*": { "*": { subTitle: [{ show: true }] } } };
+  // From CY19SU12 (and every Fluent2 theme) pie and donut slices read "Data value, percent of
+  // total"; older themes leave Power BI's default, the slice's category
+  const v = name.match(/CY(\d{2})SU(\d{2})/i);
+  const pieStyle = { "*": { labels: [{ labelStyle: "Data value, percent of total" }] } };
+  const pies = /^Fluent2-/i.test(name) || (v && Number(v[1]) * 100 + Number(v[2]) >= 1912) ? { pieChart: pieStyle, donutChart: pieStyle } : {};
+  if (/^Fluent2-/i.test(name)) return { "*": { "*": { subTitle: [{ show: true }] } }, ...pies };
   if (!/^CY\d{2}SU\d{2}/i.test(name)) return null;
-  return { "*": { "*": { categoryAxis: [{ showAxisTitle: true }], valueAxis: [{ showAxisTitle: true }] } } };
+  return { "*": { "*": { categoryAxis: [{ showAxisTitle: true }], valueAxis: [{ showAxisTitle: true }] } }, ...pies };
 }
 function withBaseThemeAxes(theme, themeCollection) {
   const styles = baseThemeAxisStyles(themeCollection);
@@ -913,7 +918,9 @@ function chartLook(visual, theme) {
     ? { color: get("labels", "backgroundColor") || "#FFFFFF", transparency: settingNumber(get("labels", "backgroundTransparency"), 0) } : null;
   const labels = { show: get("labels", "show"), text: labelText("labels", "color"), units: settingNumber(get("labels", "labelDisplayUnits"), 0),
     precision: settingNumber(get("labels", "labelPrecision")), position: String(get("labels", "labelPosition") || "Auto"),
-    style: get("labels", "labelStyle") || null, percentPrecision: settingNumber(get("labels", "percentageLabelPrecision")), background: labelBack };
+    // a pie's labels: the visual's or its theme's style, else Power BI's own default (the slice's
+    // category) when the report's design is known; unknown design: null (as before)
+    style: get("labels", "labelStyle") || (theme ? "Category" : null), percentPrecision: settingNumber(get("labels", "percentageLabelPrecision")), background: labelBack };
   const totals = { show: settingFlag(get("totals", "show"), false), text: labelText("totals", "color"), units: settingNumber(get("totals", "labelDisplayUnits"), 0),
     precision: settingNumber(get("totals", "labelPrecision")) };
   const lineOf = (entry) => {
