@@ -1663,9 +1663,12 @@ function totalsPlan(item, info) {
     if (item.columnKinds) return item.columnKinds[ci] || null;
     if (!numeric[ci] || helper[ci] || /\byear\b/i.test(h)) return null;
     const fmt = formats[ci] || (cells.find((r) => typeof r[ci].value === "number") || [])[ci]?.numFmt;
-    return totalKind(info && entries[ci] ? entries[ci].field || null : null, h, fmt);
+    const kind = totalKind(info && entries[ci] ? entries[ci].field || null : null, h, fmt);
+    // a rate, share or average: Power BI's own total, asked of it (loadTableTotals), else blank
+    if (!kind && item.reportTotals && typeof item.reportTotals[normalizeField(h)] === "number") return "report";
+    return kind;
   });
-  return kinds.some(Boolean) ? { kinds } : null;
+  return kinds.some(Boolean) ? { kinds, report: item.reportTotals || null } : null;
 }
 
 /* The total of numbers as Excel's SUBTOTAL would give it */
@@ -1691,8 +1694,15 @@ function writeTotalsRow(ws, row, col, item, hr, n, lay, table) {
     cell.font = font;
     if (!kind) return;
     const values = table.data.map((r) => r[ci].value);
-    cell.value = { formula: `SUBTOTAL(${SUBTOTAL_FN[kind]},${colRange(ws, col + ci, hr + 1, hr + n)})`, result: subtotalOf(kind, values) };
     const fmt = table.formats[ci] || (table.data.find((r) => typeof r[ci].value === "number") || [])[ci]?.numFmt;
+    if (kind === "report") {
+      // Power BI's own total (10.8% for all surgeons together): a value, not a formula
+      cell.value = item.totals.report[normalizeField(item.rows[0][ci])];
+      if (fmt) cell.numFmt = fmt;
+      cell.alignment = { vertical: "middle", horizontal: "right", indent: 2 };
+      return;
+    }
+    cell.value = { formula: `SUBTOTAL(${SUBTOTAL_FN[kind]},${colRange(ws, col + ci, hr + 1, hr + n)})`, result: subtotalOf(kind, values) };
     if (fmt) cell.numFmt = unitForTotal(fmt, cell.value.result);
     cell.alignment = { vertical: "middle", horizontal: "right", indent: 2 };
   });
@@ -7650,6 +7660,45 @@ async function loadTreeValues(collected, options) {
   }
 }
 
+/*
+ * A table's or matrix's Total row for the columns that don't add up from its rows (a rate, a
+ * share, an average: Readmission Rate 10.8% for all surgeons together, not the rows' sum):
+ * each asked of Power BI, the measure over all the rows under the same report, page and visual
+ * filters (Build permission, else the query service, as loadTreeValues). item.reportTotals:
+ * { column (normalized name): value }; a column Power BI doesn't answer for stays blank.
+ */
+async function loadTableTotals(collected, options) {
+  for (const { data } of collected) {
+    for (const item of data.items) {
+      if (!TABLE_VISUAL_TYPES.includes(item.type) || item.isKpi || item.columnKinds || !item.rows || item.rows.length < 2) continue;
+      const info = visualInfo(options.reportColors, item.page, item.name);
+      if (!info || !info.roles) continue;
+      const b = info.builtin || {};
+      if ((item.type === "tableEx" && b.totals === false) || (item.type === "pivotTable" && b.rowSubtotals === false)) continue;
+      const { header, data: rows, numeric, helper } = classifyColumns(item.rows);
+      const cells = rows.map((row) => header.map((_, ci) => toCellValue(row[ci])));
+      const formats = readableFormats(header, cells);
+      const entries = fieldsByColumn(header, [...(info.roles.Values || []), ...(info.roles.Rows || [])]);
+      const filters = [...(data.queryFilters || []), ...(item.visualFilters || [])];
+      const totals = {};
+      for (let ci = 0; ci < header.length; ci++) {
+        const field = entries[ci] && entries[ci].field;
+        if (!numeric[ci] || helper[ci] || !field || !["measure", "agg"].includes(field.kind)) continue;
+        const fmt = formats[ci] || (cells.find((r) => typeof r[ci].value === "number") || [])[ci]?.numFmt;
+        if (totalKind(field, header[ci], fmt)) continue;   // adds up: Excel's own total, as before
+        const res = await groupedMeasure([], field, filters);
+        const v = res.rows && res.rows[0] ? toCellValue(String(res.rows[0][0] ?? "")).value : null;
+        if (typeof v === "number") totals[normalizeField(header[ci])] = v;
+        else log(`"${item.title}": the total of ${header[ci]} wasn't given by Power BI${res.error ? ` (${res.error})` : ""}; left blank`);
+      }
+      if (Object.keys(totals).length) {
+        item.reportTotals = totals;
+        log(`"${item.title}": ${Object.keys(totals).length} total(s) from Power BI`);
+      }
+    }
+  }
+}
+
 /* A measure grouped by some columns (none: one total) under the filters: { rows: [[...values, measure]] } or { error } */
 async function groupedMeasure(columns, measure, filters) {
   let daxError = null;
@@ -7777,6 +7826,7 @@ async function exportToExcel(pages, options, branding, onProgress, isCancelled) 
     await loadSparklines(collected, options);
     await loadKeyInfluencers(collected, options);
     await loadTreeValues(collected, options);
+    await loadTableTotals(collected, options);
   }
 
   // "Match the report" accent: the report theme's main colour, else a neutral navy

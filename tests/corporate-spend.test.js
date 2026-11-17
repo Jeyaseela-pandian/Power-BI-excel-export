@@ -113,3 +113,44 @@ test("the anomaly detection on a line chart is read from the report, for its not
   assert.strictEqual(json(`visualColorInfo(${JSON.stringify(visual("true"))}, null).anomalies`), true);
   assert.strictEqual(json(`visualColorInfo(${JSON.stringify(visual("false"))}, null).anomalies`), false);
 });
+
+/* A table of rates (Readmission & Complication by Surgeon) with Power BI answering the totals as given */
+async function rateTable(answer) {
+  const { ctx, run, json } = loadApp();
+  const f = (kind, entity, prop) => ({ ref: prop.toLowerCase(), label: null, field: { kind, entity, prop } });
+  ctx.INFO = json(`visualColorInfo(${JSON.stringify({ type: "tableEx", objects: {}, container: {}, dataPoint: [], bubbles: [], values: [],
+    roles: { Values: [f("column", "Surgeons", "SurgeonName"), f("measure", "Metrics", "Readmission Rate"), f("measure", "Metrics", "Complication Rate"), f("measure", "Metrics", "Revenue")] } })}, null)`);
+  ctx.ITEM = { type: "tableEx", title: "Readmission & Complication by Surgeon", page: "p", name: "t",
+    rows: [["SurgeonName", "Readmission Rate", "Complication Rate", "Revenue"], ["Dr. A. Sharma", "10.4%", "14.6%", "$1000"], ["Dr. C. Patel", "8.3%", "14.6%", "$500"], ["Dr. E. Johnson", "12.5%", "16.7%", "$250"]] };
+  ctx.ANSWER = answer;
+  ctx.ASKED = [];
+  run(`visualInfo = () => INFO;
+    executeDaxQuery = async (q) => { ASKED.push(q); const m = q.match(/(Readmission Rate|Complication Rate)/); return m && ANSWER[m[1]] !== undefined ? { rows: [{ "[v]": ANSWER[m[1]] }] } : { error: "no answer" }; };
+    websiteQuery = async () => { throw new Error("not reached"); };`);
+  await run("loadTableTotals([{ data: { items: [ITEM], queryFilters: [] } }], { reportColors: {} })");
+  run("ITEM.totals = totalsPlan(ITEM, INFO)");
+  return { kinds: json("ITEM.totals && ITEM.totals.kinds"), report: json("ITEM.reportTotals || null"), asked: json("ASKED.length") };
+}
+
+test("a table's Total row: Power BI's own totals for rates (10.8%, 15.3%), sums as Excel formulas as before", async () => {
+  const t = await rateTable({ "Readmission Rate": 0.108, "Complication Rate": 0.153 });
+  assert.strictEqual(t.asked, 2, "asked only for the two rates (Revenue adds up)");
+  assert.deepStrictEqual(t.kinds, [null, "report", "report", "sum"]);
+  assert.deepStrictEqual(t.report, { "readmission rate": 0.108, "complication rate": 0.153 });
+  // Power BI doesn't answer: blank, as before (never a guess)
+  const none = await rateTable({});
+  assert.deepStrictEqual(none.kinds, [null, null, null, "sum"]);
+});
+
+test("the totals row writes Power BI's value in the column's format, and Excel's formula where it adds up", () => {
+  const { ctx, run } = loadApp();
+  const cells = {};
+  ctx.WS = { getCell: (r, c) => (cells[r + "," + c] = cells[r + "," + c] || {}), getColumn: (c) => ({ letter: "ABCDEFG"[c - 1] }) };
+  ctx.ITEM = { rows: [["SurgeonName", "Readmission Rate", "Revenue"]], totals: { kinds: [null, "report", "sum"], report: { "readmission rate": 0.108 } } };
+  ctx.TABLE = { data: [[{ value: "A" }, { value: 0.104, numFmt: "0.0%" }, { value: 1000, numFmt: "#,##0" }]], formats: [null, "0.0%", "#,##0"] };
+  run("writeTotalsRow(WS, 9, 2, ITEM, 3, 1, { fonts: makeFonts() }, TABLE)");
+  assert.strictEqual(cells["9,3"].value, 0.108);
+  assert.strictEqual(cells["9,3"].numFmt, "0.0%");
+  assert.match(cells["9,4"].value.formula, /^SUBTOTAL\(9,/);
+  assert.strictEqual(cells["9,2"].value, "Total");
+});
