@@ -4579,10 +4579,18 @@ function chartPlan(item) {
     const vc = valueCols.find((ci) => !lines.includes(ci)) ?? valueCols[0];
     const byKey = colors && colors.rowKey && colors.rowKey.col === legendCol ? colors.rowKey.colorOf : null;
     const legends = byKey ? Object.keys(byKey) : legendOrder(data, legendCol, [catCol], vc);
-    const once = (ci) => categories.map((c) => {
-      const r = data.find((x) => catOf(x) === c && num(x[ci]) !== null);
-      return r ? num(r[ci]) : null;
-    });
+    // A line value is either the same on every legend row of a category (read once), or one per
+    // legend value (Seps SPLY per separation reason: Power BI's line is the month's, their total
+    // when the measure adds up; otherwise read once, as before)
+    const lineEntries = info && info.roles ? fieldsByColumn(header, info.roles.Y2 || []) : header.map(() => null);
+    const perLegend = (ci) => categories.some((c) => new Set(data.filter((x) => catOf(x) === c).map((x) => num(x[ci])).filter((v) => v !== null)).size > 1);
+    const once = (ci) => {
+      const add = perLegend(ci) && totalKind((lineEntries[ci] && lineEntries[ci].field) || null, header[ci], formatOf(ci)) === "sum";
+      return categories.map((c) => {
+        const vals = data.filter((x) => catOf(x) === c).map((x) => num(x[ci])).filter((v) => v !== null);
+        return !vals.length ? null : add ? vals.reduce((a, b) => a + b, 0) : vals[0];
+      });
+    };
     // A colour rule per legend value (fx on the series): each legend value's colour from the rule
     const byRule = !byKey && colors && colors.dot && colors.dot.keyCol === legendCol ? colors.dot.colorOf : null;
     // No legend colours worked out (colors): each value's colour set by hand, else the theme's in order
@@ -4592,6 +4600,7 @@ function chartPlan(item) {
       ...base,
       valueName: header[vc],
       legendName: header[legendCol],
+      legendSplit: lines.length > 0,   // a combo split by a legend: Power BI draws its line on the columns' scale
       series: [
         ...legends.map((name, i) => ({
           name,
@@ -6403,7 +6412,8 @@ function cartesianXml(plan, look, box, hidden) {
   const lineSeries = indexed.filter(([s]) => s.line);
   // A combo whose Y-axis the report turns off: Power BI draws no second axis either, and its line
   // on the columns' own scale (Plan's $13.9M just under Actual's $15.2M)
-  const shareScale = lineSeries.length > 0 && kind !== "line" && !!(plan.axes && plan.axes.val && plan.axes.val.show === false);
+  // (also a combo whose columns a legend splits: Power BI draws no second axis for its line then)
+  const shareScale = lineSeries.length > 0 && kind !== "line" && (!!(plan.axes && plan.axes.val && plan.axes.val.show === false) || !!plan.legendSplit);
   const lines = shareScale ? [] : lineSeries;
   const sameScaleLines = shareScale ? lineSeries : [];
   const horizontal = spec.dir === "bar";
