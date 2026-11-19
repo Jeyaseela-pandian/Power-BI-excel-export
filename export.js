@@ -5566,8 +5566,8 @@ function axisFormat(fmt, values) {
   const max = nums.length ? Math.max(...nums.map((v) => Math.abs(v))) : 0;
   if (f.includes("%")) return max >= 0.05 ? "0%" : "0.0%";
   const prefix = (f.match(/^"[^"]*"/) || [""])[0];
-  if (max >= 1e9) return `${prefix}#,##0.0,,,"B"`;
-  if (max >= 1e6) return `${prefix}#,##0.0,,"M"`;
+  if (max >= 1e8) return `${prefix}#,##0.0,,,"B"`;
+  if (max >= 1e5) return `${prefix}#,##0.0,,"M"`;   // axes switch a step early, as Power BI's: $0.4M
   if (max >= 1e4) return `${prefix}#,##0.0,"K"`;
   return f;
 }
@@ -5896,6 +5896,11 @@ function unitFormat(f, unit, dec) {
   const body = `${fmtPrefix(s)}#,##0${d ? "." + "0".repeat(d) : ""}`;
   return PBI_UNITS[unit] ? `${body}${PBI_UNITS[unit][1]}"${PBI_UNITS[unit][0]}"` : body;
 }
+/* An axis's Auto unit as Power BI picks it: the next unit a step early, "0.1M, 0.2M … rather
+   than 100K, 200K" (millions from 100,000, billions from 100 million, trillions from 100 billion) */
+function axisAutoUnit(maxAbs) {
+  return maxAbs >= 1e11 ? 1e12 : maxAbs >= 1e8 ? 1e9 : maxAbs >= 1e5 ? 1e6 : maxAbs >= 1e3 ? 1e3 : 1;
+}
 function autoUnit(maxAbs) {
   return maxAbs >= 1e12 ? 1e12 : maxAbs >= 1e9 ? 1e9 : maxAbs >= 1e6 ? 1e6 : maxAbs >= 1e3 ? 1e3 : 1;
 }
@@ -5988,10 +5993,10 @@ function axisNumFmt(fmt, axis, cfg, values) {
   if (!axis) return axisFormat(fmt, values || []);
   if (s.includes("%")) return precision !== null ? unitFormat(s, 1, precision) : stepFormat(s, axis, values || []);
   const step = axis.step || Math.abs(axis.max - axis.min) || 1;
-  // Power BI's auto units: from the axis's largest value once it reaches 10,000 ($20K, 1.0M);
+  // Power BI's auto units: from the axis's largest value once it reaches 10,000 ($20K, $0.4M);
   // below that, thousands only when the steps are whole thousands ($2K, but $1,500)
   const top = Math.max(Math.abs(axis.min), Math.abs(axis.max));
-  const unit = cfg && cfg.units > 0 ? cfg.units : top >= 1e4 ? autoUnit(top) : autoUnit(step);
+  const unit = cfg && cfg.units > 0 ? cfg.units : top >= 1e4 ? axisAutoUnit(top) : autoUnit(step);
   const dec = precision !== null ? precision : Math.max(0, Math.min(4, -Math.floor(Math.log10(step / unit) + 1e-9)));
   return unitFormat(s, unit, dec);
 }
