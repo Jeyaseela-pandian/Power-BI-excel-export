@@ -1655,7 +1655,18 @@ function fieldsByColumn(header, entries) {
   const lower = header.map((h) => String(h ?? "").trim().toLowerCase());
   const norm = header.map((h) => normalizeField(h));
   const out = header.map(() => null), taken = new Set();
+  // Two different fields shown under one name (Seps YoY and Actives YoY, both renamed "YoY"):
+  // which column is which can't be told from the export, so those columns stay unmatched and
+  // nothing (a total, units, a colour rule) is worked out for them on a guess
+  const fieldsByLabel = {};
   for (const e of entries || []) {
+    if (e && e.label) (fieldsByLabel[e.label] = fieldsByLabel[e.label] || new Set()).add(e.queryRef || e.ref || JSON.stringify(e.field));
+  }
+  const ambiguous = new Set(Object.keys(fieldsByLabel).filter((l) => fieldsByLabel[l].size > 1));
+  const sameName = (h, l) => h === l || h.startsWith(l + " (") && /^\(\d+\)$/.test(h.slice(l.length + 1));
+  lower.forEach((h, c) => { if ([...ambiguous].some((l) => sameName(h, l))) taken.add(c); });
+  for (const e of entries || []) {
+    if (e && e.label && ambiguous.has(e.label)) continue;
     let ci = e.label ? lower.findIndex((h, c) => !taken.has(c) && h === e.label) : -1;
     if (ci < 0) ci = norm.findIndex((h, c) => !taken.has(c) && h === e.ref);
     if (ci >= 0) { out[ci] = e; taken.add(ci); }
@@ -3660,6 +3671,16 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
       if (item.chart && !item.chart.panels) item.chart = growForLegend(item.chart);
     }
     if (item.chart && item.chart.note) colorNotes.push(item.chart.note);
+    // Two columns under one name in the report (two measures both renamed "YoY"): the second is
+    // "YoY (2)" here, as an Excel table can't repeat a column name
+    if (!item.chart && !item.isKpi && item.rows && item.rows[0]) {
+      const names = item.rows[0].map((h) => String(h ?? "").trim()).filter(Boolean);
+      const twice = [...new Set(names.filter((h, i) => names.findIndex((x) => x.toLowerCase() === h.toLowerCase()) !== i))];
+      for (const name of twice) {
+        colorNotes.push(`"${item.displayTitle || item.title}": two columns are named "${name}" in the report (two different fields); ` +
+          `the second is "${name} (2)" here, as an Excel table can't repeat a column name. Their totals aren't worked out, as the export can't tell the two apart.`);
+      }
+    }
     // The anomaly band and expected values: Power BI's AI works them out on screen only
     if (info && info.anomalies) colorNotes.push(`Not included: the anomaly detection on "${item.displayTitle || item.title}" (its expected range and values) – Power BI's AI works it out on screen. The values themselves are exported.`);
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);

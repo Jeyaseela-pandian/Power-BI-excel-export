@@ -237,3 +237,33 @@ test("a combo split by a legend: its line is the category's total (Seps SPLY per
   run("var c2 = chartPlan(T);");
   assert.deepStrictEqual(json("c2.series.find((s) => s.line).values"), [900]);
 });
+
+test("two fields shown under one name (Seps YoY and Actives YoY, both 'YoY'): their columns aren't matched on a guess", () => {
+  const { json } = loadApp();
+  const e = (ref, label, queryRef) => ({ ref, label, queryRef, field: { kind: "measure", entity: "Employee", prop: queryRef.split(".")[1] } });
+  const entries = [e("seps", null, "Employee.Seps"), e("seps yoy % change", "yoy", "Employee.Seps YoY % Change"), e("actives", null, "Employee.Actives"),
+    e("actives yoy % change", "yoy", "Employee.Actives YoY % Change")];
+  for (const header of [["Seps", "YoY", "Actives", "YoY"], ["Seps", "YoY", "Actives", "YoY (2)"]]) {
+    const m = json(`fieldsByColumn(${JSON.stringify(header)}, ${JSON.stringify(entries)}).map((x) => x && x.queryRef)`);
+    assert.deepStrictEqual(m, ["Employee.Seps", null, "Employee.Actives", null], header.join(", "));
+  }
+  // one field under its own new name: matched, as before
+  assert.deepStrictEqual(json(`fieldsByColumn(["Act SPLY"], [${JSON.stringify(e("actives sply", "act sply", "Employee.Actives SPLY"))}]).map((x) => x && x.queryRef)`), ["Employee.Actives SPLY"]);
+});
+
+test("a table with two columns of one name gets a note: 'YoY (2)' is the report's second 'YoY'", () => {
+  const { ctx, run, json } = loadApp();
+  ctx.ITEM = { type: "pivotTable", title: "Region, VP, Seps +6", page: "p", name: "m", layout: { x: 0, y: 0, width: 600, height: 300 },
+    rows: [["Region", "Seps", "YoY", "Actives", "YoY"], ["North", "620", "55.0%", "", ""], ["North", "", "", "1625", "8.2%"]] };
+  run(`visualInfo = () => null;
+    LAY = { fonts: makeFonts(), accent: { tab: "FF000000", cap: "FF000000" }, sheetName: "P", palette: null, slicerFields: [], tableStyle: "TableStyleMedium2", reportColors: null };
+    WS = { getCell: () => ({ font: {}, alignment: {}, border: {} }), getRow: () => ({ getCell: () => ({}) }), getColumn: () => ({ width: 10, letter: "A" }),
+      mergeCells() {}, mergeCellsWithoutStyle() {}, addTable() {}, addConditionalFormatting() {}, addImage() {}, properties: {}, views: [], pageSetup: {}, headerFooter: {} };
+    OUT = writePageLayout(WS, [ITEM], 10, makeWidthTracker(), { visualsAs: "tables", layout: "report", collapse: true, visibleRows: 15, chartBackground: "white", tableNumbers: "report" }, LAY, (t) => t);`);
+  const notes = json("OUT.colorNotes");
+  assert.ok(notes.some((n) => /two columns are named "YoY"/.test(n) && /"YoY \(2\)"/.test(n)), JSON.stringify(notes));
+  // no repeated names: no note
+  ctx.ITEM2 = { ...json("ITEM"), rows: [["Region", "Seps"], ["North", "620"]] };
+  run(`OUT2 = writePageLayout(WS, [ITEM2], 10, makeWidthTracker(), { visualsAs: "tables", layout: "report", collapse: true, visibleRows: 15, chartBackground: "white", tableNumbers: "report" }, LAY, (t) => t);`);
+  assert.ok(!json("OUT2.colorNotes").some((n) => /two columns are named/.test(n)));
+});
