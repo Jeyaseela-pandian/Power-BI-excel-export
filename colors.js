@@ -489,8 +489,20 @@ async function downloadDesignFile(report, signal) {
  * serve.py's /pbi-proxy, or straight to Power BI where no proxy is running.
  */
 
+/* Whether the export may use the website's own services for Viewers (config.js viewerRoute):
+   on unless set to false. Off, Viewers' exports use only Microsoft's documented APIs and fall
+   back to the theme, as when the website layout can't be read. */
+function websiteRouteAllowed() {
+  const config = typeof window !== "undefined" ? window.APP_CONFIG : null;
+  return !(config && config.viewerRoute === false);
+}
+function checkWebsiteRoute() {
+  if (!websiteRouteAllowed()) throw new Error("WEBSITE_OFF the Viewer route is turned off (config.js viewerRoute: false)");
+}
+
 /* The Power BI cluster that serves this report, from the embed address's config */
 async function clusterUrl(report) {
+  checkWebsiteRoute();
   try {
     const config = new URL(report.embedUrl).searchParams.get("config");
     if (config) {
@@ -507,6 +519,7 @@ async function clusterUrl(report) {
 
 /* GET with the user's token: through serve.py, else straight to Power BI. { res, route } */
 async function fetchAsUser(url, signal) {
+  checkWebsiteRoute();
   const headers = { Authorization: `Bearer ${await getToken()}` };
   const proxied = await fetch(`/pbi-proxy?url=${encodeURIComponent(url)}`, { headers, signal }).catch((e) => {
     if (e && e.name === "AbortError") throw e;
@@ -519,6 +532,7 @@ async function fetchAsUser(url, signal) {
 
 /* POST JSON with the user's token, as fetchAsUser */
 async function postAsUser(url, body, signal) {
+  checkWebsiteRoute();
   const id = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
   const headers = { Authorization: `Bearer ${await getToken()}`, "Content-Type": "application/json", ActivityId: id(), RequestId: id() };
   const text = JSON.stringify(body);
