@@ -409,3 +409,13 @@ test("a column-and-line combo chart over dates gets the date axis too (May 2021 
   assert.strictEqual((xml.match(/<c:dateAx>/g) || []).length, 2, "the columns' axis and the line's (hidden) both by date");
   assert.ok(!/<c:catAx>/.test(xml));
 });
+
+test("axes switch to millions a step early, as Power BI's: $0.0M, $0.2M, $0.4M rather than $0K, $200K, $400K", () => {
+  const fmt = (axis) => { ctx.AX = axis; return run(`axisNumFmt('"$"#,##0', AX, { units: 0, precision: null }, [])`); };
+  assert.strictEqual(fmt({ min: 0, max: 500000, step: 200000 }), '"$"#,##0.0,,"M"', "an axis to $0.5M in steps of $0.2M");
+  assert.strictEqual(fmt({ min: 0, max: 500000, step: 100000 }), '"$"#,##0.0,,"M"');
+  // below 100,000: thousands, as before (0K, 5K, 10K); millions and up as before
+  assert.strictEqual(fmt({ min: 0, max: 10000, step: 5000 }), '"$"#,##0,"K"');
+  assert.strictEqual(fmt({ min: 0, max: 6000000, step: 2000000 }), '"$"#,##0,,"M"');
+  assert.strictEqual(fmt({ min: 0, max: 200000000, step: 50000000 }), '"$"#,##0.00,,,"bn"');
+});
