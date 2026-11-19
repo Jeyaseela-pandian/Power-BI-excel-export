@@ -7,18 +7,24 @@ A browser app that exports Power BI report pages to a clean, branded Excel workb
 - **Whole pages, one file.** Each report page becomes a sheet. Visuals keep their place on the page, or can be stacked one under another.
 - **Two ways to show visuals:**
   - **Data tables:** each visual's data as an Excel table.
-  - **Charts:** bar, column, line, area, combo, pie, donut, scatter, waterfall, funnel and treemap visuals become real Excel charts. So do common AppSource charts: radar, sunburst, histogram, tornado and box & whisker. Every chart carries alt text for screen readers.
+  - **Charts:** bar, column, line, area, combo, pie, donut, scatter, waterfall, funnel and treemap visuals become real Excel charts. So do common AppSource charts: radar, sunburst, histogram, tornado and box & whisker. KPI and Dual KPI visuals become trend charts. Every chart carries alt text for screen readers.
+  - In data tables mode, KPI and Dual KPI visuals show their trend as a card plus a table of the values.
 - **Charts that look like the report.**
   - Series and legend colours in Power BI's order, the visual's background (or white), titles and axis titles as Power BI shows them.
   - Line values on a second axis, and whole-number axes (days, periods, years) spaced by value.
   - Data labels in Power BI's display units and decimals (1,037 · 6.8K · 33K · $11M), placed past the bar's end with room before the axis ends, and total labels on stacked charts.
-  - Long legends get the room they need. Pie and donut labels appear only where they fit.
+  - Axis units chosen the way Power BI chooses them (an axis up to 400,000 reads 0.1M–0.4M, not 100K–400K), and date axes that show the same months as the report.
+  - Stepped lines, combo lines split by a legend, and tornado charts without the value axis, as in the report.
+  - Long legends get the room they need. Pie and donut labels appear only where they fit, with the label style the report's theme uses (category, value, percent).
+  - Small multiples show axis values only on the outer panels, as Power BI does, and axis labels never get cut off.
 - **Numbers as in the report.** Cards, KPIs and table columns use the report's display units and decimals ($3.94M on a card). Every cell keeps its exact value for sums and formulas.
 - **Report formatting carried over.** Colour scales, rules, data bars, icons, theme and hand-set colours, live totals rows and sparklines.
+- **Totals as in Power BI.** Table and matrix totals rows show the totals Power BI itself works out, read from the report for every role, so averages, percentages and ratios total correctly. When they can't be read, sums are worked out from the rows.
+- **Page headings.** A page's heading text box (one to three lines, in its own size, weight and colour) appears at the top of the sheet, along with the page title.
 - **Cards and KPIs as tiles.** KPI tiles show their goal, status and trend. A one-row multi-row card shows its fields side by side, and an empty value reads "(Blank)".
 - **AI and special visuals:**
   - Key influencers become a table of the exact shares behind them ("Status is Won: 91.4% for Customer Follow-up, 64.4% for the others").
-  - A decomposition tree becomes an indented table of the branches opened in the report.
+  - A decomposition tree becomes an indented table of the branches opened in the report, with each branch's value.
   - Small multiples become one grouped Excel object: a chart per panel in a grid, on a shared axis.
 - **Filters on record.** Slicers, active filters and what you clicked in the report (a bar, a slice) appear in each sheet's filter bar.
 - **Drill level kept.** Each visual is exported at the level shown in the report, or in the app at the moment of export.
@@ -93,7 +99,8 @@ The support panel has **Check viewer access** and **Check visuals**, which show 
 - Key influencers show exact shares; Power BI's "× more likely" figures come from its own model and aren't exported.
 - Anomaly bands, smart narratives and Q&A visuals are worked out by Power BI on screen and aren't exported. The sheet's notes name them.
 - R, Python, paginated report and Power Apps visuals give no data to export. The sheet's notes name them.
-- Totals of percentages, averages and distinct counts are left blank, because they can't be added up from the rows.
+- When Power BI's own totals can't be read, totals of percentages, averages and distinct counts are left blank, because they can't be added up from the rows.
+- Excel can't repeat a column name in a table. When two columns share a name in the report (two different fields both called "YoY"), the second becomes "YoY (2)" and its total is left blank. The sheet's notes explain it.
 - Table sparklines need Build permission on the dataset.
 
 ## Checks
@@ -122,3 +129,7 @@ Run them after every change. See [tests/README.md](tests/README.md) for details.
 | `tests/` | Automatic checks (`node --test tests/*.test.js`) |
 
 Libraries are loaded from public CDNs: MSAL for sign-in, the Power BI JavaScript client, ExcelJS and JSZip. There is no build step.
+
+## Releases
+
+- **v1.0** (November 2026): first complete release. Tested in Viewer and edit roles across the sample reports, with 86 automatic checks passing.
