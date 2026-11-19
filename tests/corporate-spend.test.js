@@ -218,3 +218,22 @@ test("a renamed matrix column takes the report's units by its field ('Qualified 
   assert.ok(/,"K"/.test(fmts[1]) && /,"K"/.test(fmts[2]), JSON.stringify(fmts));
   assert.deepStrictEqual(json("ITEM.fixedUnits"), [false, true, true]);
 });
+
+test("a combo split by a legend: its line is the category's total (Seps SPLY per month), on the columns' scale with no second axis", () => {
+  const { ctx, run, json } = loadApp();
+  const f = (kind, entity, prop) => ({ ref: prop.toLowerCase(), label: null, field: { kind, entity, prop } });
+  ctx.INFO = json(`visualColorInfo(${JSON.stringify({ type: "lineStackedColumnComboChart", objects: {}, container: {}, dataPoint: [], bubbles: [], values: [],
+    roles: { Category: [f("column", "Date", "Month")], Series: [f("column", "Separation Reasons", "SeparationReason")], Y: [f("measure", "Employee", "Seps")], Y2: [f("measure", "Employee", "Seps SPLY")] } })}, null)`);
+  ctx.T = { type: "lineStackedColumnComboChart", title: "t", rows: [["Month", "SeparationReason", "Seps", "Seps SPLY"],
+    ["Jan", "Involuntary", "374", "280"], ["Jan", "Voluntary", "690", "620"], ["Feb", "Involuntary", "278", "208"], ["Feb", "Voluntary", "710", "600"]] };
+  run(`T.colorInfo = INFO; T.colors = columnColors(T, ["#118DFF", "#12239E"], INFO); T.themePalette = ["#118DFF"]; var cl = chartPlan(T);
+    Object.assign(cl, { look: chartLook({ type: T.type }, null), sizePx: { w: 600, h: 300 }, title: "t", showTitle: true });
+    cl.refs = { catRef: "D!A2:A3", series: cl.series.map(() => ({ nameRef: "D!B1", valRef: "D!B2:B3" })), range: () => "D!B2" };`);
+  assert.deepStrictEqual(json("cl.series.find((s) => s.line).values"), [900, 808], "Jan 280 + 620, Feb 208 + 600");
+  const xml = run("chartXml(cl).xml");
+  assert.ok(!/<c:axId val="50030"\/>/.test(xml), "no second axis");
+  // a line value repeated on every legend row: read once, as before
+  ctx.T.rows = [["Month", "SeparationReason", "Seps", "Seps SPLY"], ["Jan", "Involuntary", "374", "900"], ["Jan", "Voluntary", "690", "900"]];
+  run("var c2 = chartPlan(T);");
+  assert.deepStrictEqual(json("c2.series.find((s) => s.line).values"), [900]);
+});
