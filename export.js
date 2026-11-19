@@ -3671,6 +3671,16 @@ function writePageLayout(ws, items, startRow, widths, options, lay, nameTable) {
       if (item.chart && !item.chart.panels) item.chart = growForLegend(item.chart);
     }
     if (item.chart && item.chart.note) colorNotes.push(item.chart.note);
+    // Two columns under one name in the report (two measures both renamed "YoY"): the second is
+    // "YoY (2)" here, as an Excel table can't repeat a column name
+    if (!item.chart && !item.isKpi && item.rows && item.rows[0]) {
+      const names = item.rows[0].map((h) => String(h ?? "").trim()).filter(Boolean);
+      const twice = [...new Set(names.filter((h, i) => names.findIndex((x) => x.toLowerCase() === h.toLowerCase()) !== i))];
+      for (const name of twice) {
+        colorNotes.push(`"${item.displayTitle || item.title}": two columns are named "${name}" in the report (two different fields); ` +
+          `the second is "${name} (2)" here, as an Excel table can't repeat a column name. Their totals aren't worked out, as the export can't tell the two apart.`);
+      }
+    }
     // The anomaly band and expected values: Power BI's AI works them out on screen only
     if (info && info.anomalies) colorNotes.push(`Not included: the anomaly detection on "${item.displayTitle || item.title}" (its expected range and values) – Power BI's AI works it out on screen. The values themselves are exported.`);
     if (item.colors && item.colors.note) colorNotes.push(item.colors.note);
