@@ -237,3 +237,16 @@ test("a combo split by a legend: its line is the category's total (Seps SPLY per
   run("var c2 = chartPlan(T);");
   assert.deepStrictEqual(json("c2.series.find((s) => s.line).values"), [900]);
 });
+
+test("two fields shown under one name (Seps YoY and Actives YoY, both 'YoY'): their columns aren't matched on a guess", () => {
+  const { json } = loadApp();
+  const e = (ref, label, queryRef) => ({ ref, label, queryRef, field: { kind: "measure", entity: "Employee", prop: queryRef.split(".")[1] } });
+  const entries = [e("seps", null, "Employee.Seps"), e("seps yoy % change", "yoy", "Employee.Seps YoY % Change"), e("actives", null, "Employee.Actives"),
+    e("actives yoy % change", "yoy", "Employee.Actives YoY % Change")];
+  for (const header of [["Seps", "YoY", "Actives", "YoY"], ["Seps", "YoY", "Actives", "YoY (2)"]]) {
+    const m = json(`fieldsByColumn(${JSON.stringify(header)}, ${JSON.stringify(entries)}).map((x) => x && x.queryRef)`);
+    assert.deepStrictEqual(m, ["Employee.Seps", null, "Employee.Actives", null], header.join(", "));
+  }
+  // one field under its own new name: matched, as before
+  assert.deepStrictEqual(json(`fieldsByColumn(["Act SPLY"], [${JSON.stringify(e("actives sply", "act sply", "Employee.Actives SPLY"))}]).map((x) => x && x.queryRef)`), ["Employee.Actives SPLY"]);
+});

@@ -1655,7 +1655,18 @@ function fieldsByColumn(header, entries) {
   const lower = header.map((h) => String(h ?? "").trim().toLowerCase());
   const norm = header.map((h) => normalizeField(h));
   const out = header.map(() => null), taken = new Set();
+  // Two different fields shown under one name (Seps YoY and Actives YoY, both renamed "YoY"):
+  // which column is which can't be told from the export, so those columns stay unmatched and
+  // nothing (a total, units, a colour rule) is worked out for them on a guess
+  const fieldsByLabel = {};
   for (const e of entries || []) {
+    if (e && e.label) (fieldsByLabel[e.label] = fieldsByLabel[e.label] || new Set()).add(e.queryRef || e.ref || JSON.stringify(e.field));
+  }
+  const ambiguous = new Set(Object.keys(fieldsByLabel).filter((l) => fieldsByLabel[l].size > 1));
+  const sameName = (h, l) => h === l || h.startsWith(l + " (") && /^\(\d+\)$/.test(h.slice(l.length + 1));
+  lower.forEach((h, c) => { if ([...ambiguous].some((l) => sameName(h, l))) taken.add(c); });
+  for (const e of entries || []) {
+    if (e && e.label && ambiguous.has(e.label)) continue;
     let ci = e.label ? lower.findIndex((h, c) => !taken.has(c) && h === e.label) : -1;
     if (ci < 0) ci = norm.findIndex((h, c) => !taken.has(c) && h === e.ref);
     if (ci >= 0) { out[ci] = e; taken.add(ci); }
