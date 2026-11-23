@@ -51,6 +51,7 @@ A browser app that exports Power BI report pages to a clean, branded Excel workb
    - `tenantId`: your organization's tenant ID, or `"organizations"` to allow any work account.
    - `redirectUri`: must match the redirect URI on the app registration.
    - `edition`: `"trial"` adds a "Created with" footer to every sheet; `"pro"` removes it.
+   - `viewerRoute`: `true` (default) lets Viewers' exports read the report's design and Power BI's own totals from the services Power BI's website uses (internal and undocumented; see [How roles are handled](#how-roles-are-handled)). `false` uses only Microsoft's documented APIs: Viewers still get correct data, with theme colours and totals worked out from the rows.
 3. Start the app:
 
    ```bash

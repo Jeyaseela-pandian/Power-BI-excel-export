@@ -324,6 +324,23 @@ $("viewerCheckRun").addEventListener("click", () => runViewerCheck().catch((e) =
   $("viewerCheckOut").textContent = "The check failed: " + errorText(e);
   $("viewerCheckRun").disabled = false;
 }));
+/* The Viewer route switch, for testing: starts as config.js sets it and lasts until the page
+   reloads. Turning it either way forgets the open report's design, so the next export reads it
+   again by the route now chosen. */
+{
+  const toggle = $("viewerRouteToggle");
+  if (toggle && window.APP_CONFIG) {
+    toggle.checked = websiteRouteAllowed();
+    toggle.addEventListener("change", () => {
+      window.APP_CONFIG.viewerRoute = toggle.checked;
+      if (typeof currentReport !== "undefined" && currentReport) forgetReportColors(currentReport.id);
+      log(`Viewer route turned ${toggle.checked ? "on" : "off"} (until the page reloads)`);
+      toast(toggle.checked ? "Viewer route on" : "Viewer route off",
+        toggle.checked ? "Viewers' exports use Power BI's website services, as set in config.js." : "Viewers' exports use Microsoft's documented APIs only, until the page reloads.", "success");
+    });
+  }
+}
+
 $("viewerCheckCopy").addEventListener("click", () => {
   navigator.clipboard.writeText($("viewerCheckOut").textContent)
     .then(() => toast("Copied", "Paste the result into the chat.", "success"))

@@ -17,4 +17,10 @@ window.APP_CONFIG = {
   // NOT ENFORCED – a client-side flag only. Phase 2 replaces it with a licence check
   // (Azure Function mapping the customer's tenant ID to trial / pro).
   edition: "trial",
+
+  // Viewers (who can't download the report file) get the report's design and Power BI's own
+  // totals from the services Power BI's website uses to draw the report. Those services are
+  // internal and undocumented. true (default): used. false: Viewers' exports use only
+  // Microsoft's documented APIs (correct data, theme colours, totals from the rows).
+  viewerRoute: true,
 };
