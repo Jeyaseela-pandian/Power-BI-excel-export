@@ -93,6 +93,10 @@ input[type="color"] { width: 56px; height: 36px; padding: 2px; border: 1px solid
 .ms-logo { width: 18px; height: 18px; stroke: none; }
 .privacy { color: var(--text-muted); font-size: 13px; margin-top: 16px; }
 .startup-message { margin-top: 16px; padding: 10px 14px; border-radius: var(--radius-sm); background: var(--danger-soft); color: var(--danger); }
+.startup-message.ok { background: var(--accent-soft); color: var(--accent-strong); }
+.startup-message .admin-link { display: block; margin-top: 8px; color: var(--text); }
+.startup-message a { color: var(--accent-strong); font-weight: 600; }
+.link-button { border: 0; background: none; padding: 0; font: inherit; color: var(--accent-strong); text-decoration: underline; cursor: pointer; }
 .features { max-width: 960px; margin: 48px auto 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
 .feature { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; box-shadow: var(--shadow); }
 .feature h3 { font-size: 16px; margin-bottom: 8px; }
