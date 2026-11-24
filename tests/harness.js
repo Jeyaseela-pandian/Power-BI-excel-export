@@ -16,7 +16,7 @@ const REPORTS_DIR = process.env.REPORTS_DIR || path.join(os.homedir(), "Download
 /* A sandbox with the app's scripts loaded: { ctx, run(code), json(code) } */
 function loadApp() {
   const ctx = {
-    console, URL, TextDecoder, structuredClone, atob, btoa, encodeURIComponent,
+    console, URL, URLSearchParams, TextDecoder, structuredClone, atob, btoa, encodeURIComponent,
     performance: { now: () => 0 },
     APP_CONFIG: {},
     msal: {

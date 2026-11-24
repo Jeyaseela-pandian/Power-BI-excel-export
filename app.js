@@ -61,7 +61,9 @@ function errorText(e) {
 /* Messages a business user can act on, instead of raw API errors */
 function friendlyError(e) {
   const t = errorText(e);
-  if (/AADSTS65001|AADSTS90094|consent/i.test(t)) return "Your organisation's IT admin needs to approve this app before it can read Power BI reports.";
+  if (/AADSTS500200|personal Microsoft account/i.test(t)) return PERSONAL_ACCOUNT_MESSAGE;
+  if (/AADSTS65004|declined to consent/i.test(t)) return "You didn't approve the app's access to Power BI. Sign in again and choose Accept to continue.";
+  if (needsAdminApproval(t)) return "Your organisation's IT admin needs to approve this app before it can read Power BI reports.";
   if (/\b401\b/.test(t)) return "Your session has expired, or your account has no Power BI licence. Sign out and sign in again.";
   if (/\b403\b/.test(t)) return "You don't have permission to open this content in Power BI.";
   if (/\b404\b/.test(t)) return "That report wasn't found, or you don't have access to it.";
@@ -70,6 +72,40 @@ function friendlyError(e) {
 }
 
 /* ── Sign-in and tokens (MSAL) ─────────────────────────────────────────── */
+// Personal Microsoft accounts (Outlook.com, Hotmail…) all sign in under this tenant ID
+const PERSONAL_ACCOUNTS_TENANT = "9188040d-6c67-4c5b-b112-36a304b66dad";
+const PERSONAL_ACCOUNT_MESSAGE = "Power BI needs a work or school account. You signed in with a personal Microsoft account: sign in again and choose your work account.";
+
+function isPersonalAccount(account) {
+  if (!account) return false;
+  const tid = account.tenantId || (account.idTokenClaims && account.idTokenClaims.tid);
+  return tid === PERSONAL_ACCOUNTS_TENANT;
+}
+
+// The organisation's IT admin must approve the app (users there may not approve apps themselves)
+function needsAdminApproval(text) {
+  return /AADSTS65001|AADSTS90094|AADSTS90095|consent/i.test(String(text || ""));
+}
+
+/* The link an organisation's IT admin opens to approve the app for everyone there; Microsoft
+   then returns to the app with ?admin_consent=True (or ?error=…) */
+function adminConsentUrl() {
+  const tenant = cfg.tenantId && !/^(common|consumers)$/i.test(cfg.tenantId) ? cfg.tenantId : "organizations";
+  return `https://login.microsoftonline.com/${encodeURIComponent(tenant)}/adminconsent`
+    + `?client_id=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(cfg.redirectUri)}`;
+}
+
+/* The answer to an admin approval, when Microsoft has just returned from one:
+   { ok: true } or { ok: false, detail }, else null */
+function adminConsentResult(search) {
+  const params = new URLSearchParams(search || "");
+  if (/^true$/i.test(params.get("admin_consent") || "")) return { ok: true };
+  if (params.has("admin_consent") || (params.has("error") && params.has("tenant"))) {
+    return { ok: false, detail: params.get("error_description") || params.get("error") || "" };
+  }
+  return null;
+}
+
 function currentAccount() {
   return msalApp.getActiveAccount() || msalApp.getAllAccounts()[0] || null;
 }
@@ -108,7 +144,10 @@ function grantDesignAccess(returnUrl) {
 }
 
 function signIn() {
-  return msalApp.loginRedirect({ scopes: PBI_SCOPES });
+  // After a personal account, Microsoft asks which account to use instead of reusing it
+  const request = { scopes: PBI_SCOPES };
+  if (isPersonalAccount(currentAccount())) request.prompt = "select_account";
+  return msalApp.loginRedirect(request);
 }
 
 function signOut() {
@@ -371,16 +410,29 @@ async function startApp() {
     $("signIn").disabled = true;
     return;
   }
+  const approval = adminConsentResult(window.location.search);
+  if (approval) {
+    // Back from an IT admin's approval: say how it went and tidy the address
+    window.history.replaceState(null, "", window.location.pathname);
+    log(`Admin approval: ${approval.ok ? "granted" : "not granted " + approval.detail}`);
+    if (approval.ok) showStartupMessage("Thank you. The app is approved for your organisation: everyone there can now sign in.", { ok: true });
+    else showStartupMessage("The app wasn't approved." + (approval.detail ? " " + friendlyError(approval.detail) : ""));
+  }
   try {
     await msalApp.initialize();
     const result = await msalApp.handleRedirectPromise();
     if (result && result.account) msalApp.setActiveAccount(result.account);
   } catch (e) {
     log("Sign-in error: " + errorText(e));
-    showStartupMessage(friendlyError(e));
+    showStartupMessage(friendlyError(e), { adminLink: needsAdminApproval(errorText(e)) });
   }
   const account = currentAccount();
   if (!account) return;
+  if (isPersonalAccount(account)) {
+    log("Signed in with a personal Microsoft account: Power BI needs a work or school account");
+    showStartupMessage(PERSONAL_ACCOUNT_MESSAGE);
+    return;
+  }
 
   showSignedIn(account);
   try {
@@ -392,8 +444,32 @@ async function startApp() {
   }
 }
 
-function showStartupMessage(text) {
+/* A message under the sign-in button. ok: shown as good news. adminLink: adds the approval
+   link to send to the organisation's IT admin. */
+function showStartupMessage(text, { ok = false, adminLink = false } = {}) {
   const el = $("startupMessage");
   el.textContent = text;
+  el.classList.toggle("ok", ok);
+  if (adminLink) {
+    const url = adminConsentUrl();
+    const line = document.createElement("span");
+    line.className = "admin-link";
+    line.append("Send this approval link to your IT admin: ");
+    const a = document.createElement("a");
+    a.href = url;
+    a.textContent = "Approve NeenOpal Export for Power BI";
+    a.target = "_blank";
+    a.rel = "noopener";
+    line.append(a, " ");
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "link-button";
+    copy.textContent = "Copy link";
+    copy.addEventListener("click", () => {
+      navigator.clipboard.writeText(url).then(() => { copy.textContent = "Copied"; }, () => {});
+    });
+    line.append(copy);
+    el.append(line);
+  }
   el.hidden = false;
 }

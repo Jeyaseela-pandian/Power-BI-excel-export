@@ -48,7 +48,8 @@ A browser app that exports Power BI report pages to a clean, branded Excel workb
 1. Clone the repository.
 2. Open `config.js` and fill in:
    - `clientId`: the app registration's Application (client) ID.
-   - `tenantId`: your organization's tenant ID, or `"organizations"` to allow any work account.
+   - `tenantId`: `"common"` (default) to allow any organization's work accounts (personal Microsoft accounts are told Power BI needs a work account), `"organizations"` for work accounts only, or one organization's tenant ID.
+   - Where an organization's IT admin must approve apps, users see that message with an approval link to send to the admin.
    - `redirectUri`: must match the redirect URI on the app registration.
    - `edition`: `"trial"` adds a "Created with" footer to every sheet; `"pro"` removes it.
    - `viewerRoute`: `true` (default) lets Viewers' exports read the report's design and Power BI's own totals from the services Power BI's website uses (internal and undocumented; see [How roles are handled](#how-roles-are-handled)). `false` uses only Microsoft's documented APIs: Viewers still get correct data, with theme colours and totals worked out from the rows.
